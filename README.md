@@ -16,9 +16,9 @@ Project goals:
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync                                  # install deps into .venv
-export OPENAI_API_KEY=sk-...             # your provider key
-uv run imp                           # start the REPL (python -m imp.cli also works)
+uv sync                         # install deps into .venv
+export OPENAI_API_KEY=sk-...    # your provider key
+uv run imp                      # start the REPL (python -m imp.cli also works)
 ```
 
 Any OpenAI-compatible endpoint works:
@@ -26,6 +26,14 @@ Any OpenAI-compatible endpoint works:
 ```bash
 export OPENAI_BASE_URL=https://api.groq.com/openai/v1
 export OPENAI_MODEL=llama-3.3-70b-versatile
+```
+
+Useful with OpenRouter:
+
+```bash
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1/
+export OPENAI_API_KEY=sk-or...
+export OPENAI_MODEL=minimax/minimax-m3:free
 ```
 
 ### Docker
@@ -98,7 +106,7 @@ user prompt ─▶ model ─▶ tool calls ─▶ tool results ─▶ model ─�
 
 ### Skills
 
-Drop a directory under `.imp/skills/<name>/SKILL.md` with YAML frontmatter:
+Drop a directory under `<workspace>/.imp/skills/<name>/SKILL.md` with YAML frontmatter:
 
 ```markdown
 ---
@@ -140,7 +148,8 @@ Environment only (see `.env.example`); no config files to parse.
 `ToolResult(ok, content, diff=None)` with error text the model can act on —
 never raise across the tool boundary.
 
-**Add a skill** — no code: just a directory with `SKILL.md` (see above).
+**Add a skill** — no code: just a directory with `SKILL.md` (see above)
+within the workspace.
 
 **Add a setting** — env-only: add the field to `Config` and read it in
 `Config.from_env` (`config.py`).
@@ -178,5 +187,5 @@ uv run python -m pytest                 # test suite
 
 ## Potential features
 
-* Restoring from a session file name from a cli argument
+* Restoring from a session file name with a cli argument
 * Replace `_token_formula` with tiktoken or other token counting method
