@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imp"
+version = "0.1.0"
+description = "A small (almost minimal) pure-Python coding agent."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "yy2h8" }]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx2>=2.12.0",
+    "lxml[html-clean]>=6.1.2",
+    "openai>=3.5.0",
+    "prompt-toolkit>=3.0.51",
+    "rich>=13.9.0",
+]
+
+[project.scripts]
+imp = "imp.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.5",
+]
+
+[tool.ruff.lint]
+# Rule set = ruff 0.16 defaults, frozen by the pinned dev dependency above.
+# BLE001: tools catch Exception at the boundary by design and return ToolResult
+# error text instead of raising (see AGENTS.md).
+ignore = ["BLE001"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

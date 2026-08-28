@@ -1,0 +1,7 @@
+#!/bin/sh
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+[ -z "$staged" ] && exit 0
+
+uv run ruff format $staged || exit 1
+uv run ruff check --fix $staged || exit 1
+git add $staged
