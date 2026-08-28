@@ -29,7 +29,7 @@ class Tool(ABC):
         self,
         config: Config | None = None,
         fs: FileSystemAdapter | None = None,
-        prompt_user: Callable[[str, bool], Awaitable[str]] | None = None,
+        prompt_user: Callable[..., Awaitable[str]] | None = None,
         http: HttpClient | None = None,
     ) -> None:
         self.config = config

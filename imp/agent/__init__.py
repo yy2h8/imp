@@ -35,12 +35,25 @@ class AgentEvent:
 
 
 def _truncate_tool_output(tool_output: str, max_tool_output: int) -> str:
-    if len(tool_output) > max_tool_output:
-        return (
-            tool_output[:max_tool_output]
-            + f"... [truncated, {len(tool_output) - max_tool_output} characters omitted]"
+    if len(tool_output) <= max_tool_output:
+        return tool_output
+    # cut on a line boundary so line-numbered reads keep a clean resume point
+    kept: list[str] = []
+    length = 0
+    for line in tool_output.splitlines(keepends=True):
+        if length + len(line) > max_tool_output:
+            break
+        kept.append(line)
+        length += len(line)
+    omitted = len(tool_output) - length
+    if not kept:  # single line longer than the budget: fall back to a hard cut
+        return tool_output[:max_tool_output] + (
+            f"... [truncated, {len(tool_output) - max_tool_output} characters omitted]"
         )
-    return tool_output
+    return "".join(kept) + (
+        f"... [truncated after {len(kept)} lines, {omitted} characters omitted; "
+        "continue from the last line shown]"
+    )
 
 
 class Agent:

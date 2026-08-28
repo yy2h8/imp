@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import re
-from itertools import islice
 from pathlib import Path
 from typing import ClassVar
 
@@ -13,9 +12,25 @@ def _is_text(path: Path) -> bool:
             chunk = fh.read(4096)
         if b"\x00" in chunk:
             return False
-        chunk.decode("utf-8")
+        try:
+            chunk.decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            # a multi-byte char may straddle the probe boundary; trim the
+            # dangling tail and retry. A short chunk is the whole file, so
+            # its decode errors are real.
+            if len(chunk) < 4096:
+                return False
+            return any(_decodable(chunk[:-n]) for n in (1, 2, 3))
+    except OSError:
+        return False
+
+
+def _decodable(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
         return True
-    except (UnicodeDecodeError, OSError):
+    except UnicodeDecodeError:
         return False
 
 
@@ -141,7 +156,12 @@ class FileSystemAdapter:
         return skills
 
     def read_text_file(
-        self, path: str | Path, start_line: int = 1, end_line: int | None = None
+        self,
+        path: str | Path,
+        start_line: int = 1,
+        end_line: int | None = None,
+        *,
+        line_numbers: bool = False,
     ) -> str:
         file_path = self.resolve_path(path, must_exist=True)
         if file_path.is_dir():
@@ -150,9 +170,24 @@ class FileSystemAdapter:
             raise ValueError(f"File {file_path} appears to be binary or non-text")
 
         with file_path.open("r", encoding="utf-8") as fh:
-            start = max(1, start_line)
-            end = max(end_line, 0) if end_line is not None else None
-            return "".join(islice(fh, start - 1, end))
+            lines = fh.readlines()
+
+        total = len(lines)
+        start = max(1, start_line)
+        end = max(end_line, 0) if end_line is not None else None
+        selection = lines[start - 1 : end]
+
+        if not line_numbers:
+            return "".join(selection)
+
+        body = "".join(f"{n:>6}: {line}" for n, line in enumerate(selection, start))
+        if selection:
+            footer = f"(lines {start}-{start + len(selection) - 1} of {total})"
+        else:
+            footer = f"(no lines in requested range; file has {total} lines)"
+        if body and not body.endswith("\n"):
+            body += "\n"
+        return f"{body}{footer}\n"
 
     def gather_project_context(self) -> str:
         sections = []
@@ -187,8 +222,13 @@ class FileSystemAdapter:
         old_text = p.read_text(encoding="utf-8")
         count = old_text.count(old)
         if count == 0:
+            first = next((ln for ln in old.splitlines() if ln.strip()), "")
+            close = difflib.get_close_matches(
+                first, old_text.splitlines(), n=3, cutoff=0.6
+            )
+            hint = f" Closest lines in file: {close}." if close else ""
             raise ValueError(
-                f"error: '{old}' not found in {p}. "
+                f"error: '{old}' not found in {p}.{hint} "
                 "Re-read the file to get its exact current content and try again."
             )
         if count > 1:

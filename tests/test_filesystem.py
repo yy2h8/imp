@@ -95,9 +95,43 @@ class TestReadTextFile:
         with pytest.raises(ValueError, match="binary"):
             adapter.read_text_file("blob.bin")
 
+    def test_utf8_multibyte_at_chunk_boundary(self, workspace, adapter):
+        """A multi-byte char straddling the 4096-byte probe must not fail the
+        text check (regression: long arrow "⟶" read as binary)."""
+        content = "a" * 4094 + "⟶\nmore text\n"
+        (workspace / "arrows.txt").write_text(content, encoding="utf-8")
+        assert adapter.read_text_file("arrows.txt") == content
+
+    def test_truncated_utf8_rejected(self, workspace, adapter):
+        (workspace / "broken.txt").write_bytes(b"ok \xe2\x9f")
+        with pytest.raises(ValueError, match="binary"):
+            adapter.read_text_file("broken.txt")
+
     def test_directory_rejected(self, adapter):
         with pytest.raises(IsADirectoryError):
             adapter.read_text_file("sub")
+
+    def test_line_numbers_full(self, adapter):
+        assert adapter.read_text_file("sub/file.txt", line_numbers=True) == (
+            "     1: one\n     2: two\n     3: three\n     4: four\n     5: five\n"
+            "(lines 1-5 of 5)\n"
+        )
+
+    def test_line_numbers_range(self, adapter):
+        assert adapter.read_text_file("sub/file.txt", 2, 3, line_numbers=True) == (
+            "     2: two\n     3: three\n(lines 2-3 of 5)\n"
+        )
+
+    def test_line_numbers_out_of_range_reports_total(self, adapter):
+        assert adapter.read_text_file("sub/file.txt", 10, 20, line_numbers=True) == (
+            "(no lines in requested range; file has 5 lines)\n"
+        )
+
+    def test_line_numbers_missing_trailing_newline(self, workspace, adapter):
+        (workspace / "partial.txt").write_text("a\nb")
+        assert adapter.read_text_file("partial.txt", line_numbers=True) == (
+            "     1: a\n     2: b\n(lines 1-2 of 2)\n"
+        )
 
 
 def test_write_then_overwrite(adapter, workspace):
@@ -116,6 +150,10 @@ class TestStrReplace:
     def test_not_found(self, adapter):
         with pytest.raises(ValueError, match="not found"):
             adapter.str_replace("sub/file.txt", "nope", "x")
+
+    def test_not_found_suggests_close_lines(self, adapter):
+        with pytest.raises(ValueError, match=r"Closest lines in file: \['two'\]"):
+            adapter.str_replace("sub/file.txt", "twp", "x")
 
     def test_not_unique(self, adapter):
         with pytest.raises(ValueError, match="unique"):

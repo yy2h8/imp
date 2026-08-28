@@ -8,12 +8,12 @@ from imp.adapters import FileSystemAdapter, HttpClient
 from imp.config import Config
 from imp.tools import Tool, ToolResult, build_tools, execute_call
 from imp.tools.ask import Ask
-from imp.tools.fs import StrReplace, WriteFile
+from imp.tools.fs import ReadFile, StrReplace, WriteFile
 from imp.tools.shell import RunShell
 
 
 def responder(answer: str):
-    async def prompt_user(message: str) -> str:
+    async def prompt_user(message: str, markdown: bool = True) -> str:
         return answer
 
     return prompt_user
@@ -61,6 +61,14 @@ class TestApprovals:
         assert result.diff is not None
         assert "-alpha" in result.diff
         assert "+beta" in result.diff
+
+
+class TestReadFile:
+    async def test_output_is_line_numbered(self, config, fs):
+        fs.write_text_file("f.txt", "alpha\nbeta\n")
+        tool = ReadFile(config=config, fs=fs)
+        result = await tool.execute(path="f.txt")
+        assert result.content == "     1: alpha\n     2: beta\n(lines 1-2 of 2)\n"
 
 
 class TestAsk:

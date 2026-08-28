@@ -30,6 +30,11 @@ class ListDir(Tool):
 class ReadFile(Tool):
     name = "read_file"
     description = "Read the contents of a text file within the workspace."
+    instructions = (
+        "read_file prefixes each line with its 1-based line number and ends with a "
+        "`(lines X-Y of N)` footer; these are annotations, not file content. "
+        "Use start_line/end_line to page through large files."
+    )
     parameters: ClassVar[dict[str, Any]] = {
         "path": {
             "type": "string",
@@ -50,7 +55,11 @@ class ReadFile(Tool):
         self, path: str, start_line: int = 1, end_line: int | None = None
     ) -> ToolResult:
         content = await asyncio.to_thread(
-            self.fs.read_text_file, path, start_line=start_line, end_line=end_line
+            self.fs.read_text_file,
+            path,
+            start_line=start_line,
+            end_line=end_line,
+            line_numbers=True,
         )
         return ToolResult(ok=True, content=content)
 
@@ -83,7 +92,11 @@ class WriteFile(Tool):
 class StrReplace(Tool):
     name = "str_replace"
     description = "Replace a string in a text file within the workspace."
-    instructions = "Use str_replace for existing files; use write_file for new files or full rewrites."
+    instructions = (
+        "Use str_replace for existing files; use write_file for new files or full "
+        "rewrites. old and new must be exact raw file text, without the line-number "
+        "prefixes and footer read_file adds."
+    )
     mutating = True
     parameters: ClassVar[dict[str, Any]] = {
         "path": {

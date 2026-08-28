@@ -4,7 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from imp.agent import Agent, EventType
+from imp.agent import Agent, EventType, _truncate_tool_output
 from imp.agent.context import Context
 from imp.entities import ToolMessage
 from imp.tools import Tool, ToolResult
@@ -133,7 +133,7 @@ async def test_declined_mutating_tool_recorded(config, fs):
 
 
 def awaitable_no():
-    async def prompt_user(message: str) -> str:
+    async def prompt_user(message: str, markdown: bool = True) -> str:
         return "n"
 
     return prompt_user
@@ -175,3 +175,22 @@ async def test_max_iterations_reached(config):
     events = await collect(agent, "go")
     assert events[-1].type is EventType.ERROR
     assert "iteration limit" in events[-1].error_message
+
+
+def test_truncate_tool_output_under_limit_untouched():
+    assert _truncate_tool_output("short", 100) == "short"
+
+
+def test_truncate_tool_output_cuts_on_line_boundary():
+    text = "".join(f"line {i}\n" for i in range(1000))
+    out = _truncate_tool_output(text, 40)
+    assert out == (
+        "".join(f"line {i}\n" for i in range(5))
+        + "... [truncated after 5 lines, 8855 characters omitted; "
+        "continue from the last line shown]"
+    )
+
+
+def test_truncate_tool_output_single_long_line_falls_back_to_char_cut():
+    out = _truncate_tool_output("x" * 300, 100)
+    assert out == "x" * 100 + "... [truncated, 200 characters omitted]"

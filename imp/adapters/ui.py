@@ -79,7 +79,7 @@ class UIAdapter:
             self._fresh = False
         return text
 
-    async def ask(self, message: str, markdown) -> str:
+    async def ask(self, message: str, markdown: bool = True) -> str:
         """Read an answer to a question/approval message."""
         self._separator()
         self.console.print(Markdown(message) if markdown else Text(message))
