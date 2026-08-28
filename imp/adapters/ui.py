@@ -79,16 +79,12 @@ class UIAdapter:
             self._fresh = False
         return text
 
-    async def ask(self, message: str) -> str:
-        """Read an answer to a question/approval message.
-
-        The question prints verbatim as output, then input is read on its own
-        line below it, marked like the main prompt so it never sticks to text.
-        """
+    async def ask(self, message: str, markdown) -> str:
+        """Read an answer to a question/approval message."""
         self._separator()
-        self.console.print(Text(message))
+        self.console.print(Markdown(message) if markdown else Text(message))
         self._fresh = False
-        return await self.ask_session.prompt_async(ANSI(f"\n{YELLOW}>{RESET} "))
+        return await self.ask_session.prompt_async(ANSI(f"\n{YELLOW}>>{RESET} "))
 
     def error(self, message: str) -> None:
         self.console.print(Text(message), style="red")

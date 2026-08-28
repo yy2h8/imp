@@ -22,10 +22,10 @@ async def build_agent(config: Config, ui: UIAdapter) -> AsyncIterator[Agent]:
     fs = FileSystemAdapter(config.workspace)
     prompt_lock = asyncio.Lock()
 
-    async def prompt_user(message: str) -> str:
+    async def prompt_user(message: str, markdown: bool = True) -> str:
         # lock: concurrent asks/approvals must not interleave on the terminal
         async with prompt_lock:
-            return await ui.ask(message)
+            return await ui.ask(message, markdown)
 
     with SessionWriter(config.workspace) as session:
         async with (

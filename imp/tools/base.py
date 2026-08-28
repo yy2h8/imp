@@ -29,7 +29,7 @@ class Tool(ABC):
         self,
         config: Config | None = None,
         fs: FileSystemAdapter | None = None,
-        prompt_user: Callable[[str], Awaitable[str]] | None = None,
+        prompt_user: Callable[[str, bool], Awaitable[str]] | None = None,
         http: HttpClient | None = None,
     ) -> None:
         self.config = config
@@ -46,7 +46,7 @@ class Tool(ABC):
     async def _ask_approval(self, message: str) -> bool:
         if self.config.auto_approve:
             return True
-        response = await self.prompt_user(message)
+        response = await self.prompt_user(message, markdown=False)
         return response.strip().lower() in {"y", "yes"}
 
     def openai_schema(self) -> dict[str, Any]:
