@@ -12,13 +12,21 @@ from rich.status import Status
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ..agent import AgentEvent, EventType
 from ..config import Config
+from ..events import AgentEvent, EventType
 
 QUIET_TOOLS = {"read_file", "ask", "list_dir", "web_fetch", "web_search", "run_shell"}
 
 YELLOW = "\x1b[33m"
 RESET = "\x1b[0m"
+
+
+def _tail(text: str, limit: int) -> str:
+    """Keep the last `limit` lines; a leading "..." marks a crop."""
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text
+    return "...\n" + "\n".join(lines[-limit:])
 
 
 def _multiline_bindings() -> KeyBindings:
@@ -141,6 +149,13 @@ class UIAdapter:
     def render_event(self, event: AgentEvent) -> None:
         if event.type is EventType.THINKING:
             self._start_spinner()
+        elif event.type is EventType.REASONING:
+            self.stop_spinner()
+            if event.quote:
+                self._separator()
+                cropped = _tail(event.quote, self.config.max_reasoning_display_lines)
+                self.console.print(Text(cropped), style="italic bright_black")
+                self._fresh = False
         elif event.type is EventType.MODEL_RESPONSE:
             self.stop_spinner()
             if event.quote:

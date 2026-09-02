@@ -4,44 +4,76 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from imp.agent import Agent, EventType, _truncate_tool_output
+from imp.agent import Agent, EventType
 from imp.agent.context import Context
-from imp.entities import ToolMessage
+from imp.agent.executor import _truncate_tool_output
+from imp.entities import ReasoningMessage, ToolMessage
 from imp.tools import Tool, ToolResult
 from imp.tools.fs import WriteFile
 
 
-def sdk_tool_call(call: dict):
-    return SimpleNamespace(
-        id=call["id"],
-        function=SimpleNamespace(name=call["name"], arguments=call["arguments"]),
+def sdk_item(data: dict):
+    """Stand-in for an SDK output item; the agent only calls model_dump()."""
+    return SimpleNamespace(model_dump=lambda **_: data)
+
+
+def message_item(text: str):
+    return sdk_item(
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}],
+        }
     )
 
 
-def sdk_message(content: str | None, tool_calls: list[dict] | None = None):
-    calls = [sdk_tool_call(c) for c in tool_calls or []]
-    return SimpleNamespace(content=content, tool_calls=calls or None)
+def reasoning_item(
+    summary: str | None = None, text: str | None = None, encrypted: bool = True
+):
+    data: dict[str, Any] = {"type": "reasoning", "id": "rs_1"}
+    if encrypted:
+        data["encrypted_content"] = "enc"
+    if text:
+        data["content"] = [{"type": "reasoning_text", "text": text}]
+    if summary:
+        data["summary"] = [{"type": "summary_text", "text": summary}]
+    return sdk_item(data)
 
 
-def completion(message: object):
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+def function_call_item(call_id: str, name: str, arguments: dict):
+    return sdk_item(
+        {
+            "type": "function_call",
+            "id": f"fc_{call_id}",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "status": "completed",
+        }
+    )
+
+
+def response(items: list):
+    return SimpleNamespace(output=items)
 
 
 class StubClient:
     """Minimal AsyncOpenAI stand-in: plays scripted responses, records calls.
-    Scripted items may be Exceptions (raised) or SDK-shaped messages."""
+    Scripted items may be Exceptions (raised) or output-item lists."""
 
-    def __init__(self, responses: list) -> None:
-        self.responses = list(responses)
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
         self.calls: list[dict[str, Any]] = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.responses = SimpleNamespace(create=self._create)
 
     async def _create(self, **kwargs: Any):
         self.calls.append(kwargs)
-        item = self.responses.pop(0)
+        item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
-        return completion(item)
+        return item
 
 
 class FakeTool(Tool):
@@ -59,8 +91,8 @@ class FakeTool(Tool):
         return self.result
 
 
-def make_agent(config, tools: dict[str, Tool], responses: list):
-    client = StubClient(responses)
+def make_agent(config, tools: dict[str, Tool], script: list):
+    client = StubClient(script)
     agent = Agent(
         config=config,
         tools=tools,
@@ -75,7 +107,7 @@ async def collect(agent: Agent, prompt: str):
 
 
 async def test_text_only_turn(config):
-    agent, client = make_agent(config, {}, [sdk_message("Done")])
+    agent, client = make_agent(config, {}, [response([message_item("Done")])])
     events = await collect(agent, "hi")
     assert [e.type for e in events] == [EventType.THINKING, EventType.MODEL_RESPONSE]
     assert events[-1].quote == "Done"
@@ -83,9 +115,130 @@ async def test_text_only_turn(config):
     names = [type(m).__name__ for m in agent.context.messages]
     assert names == ["TextMessage", "TextMessage", "AssistantMessage"]
 
-    sent = client.calls[0]["messages"]
-    assert sent[0]["role"] == "system"
+    sent = client.calls[0]["input"]
+    assert sent[0] == {"role": "system", "content": "sys"}
     assert sent[1] == {"role": "user", "content": "hi"}
+    assert client.calls[0]["store"] is False
+    assert "include" not in client.calls[0]
+
+
+async def test_text_reply_replayed_as_raw_message_item_across_turns(config):
+    agent, client = make_agent(
+        config,
+        {},
+        [response([message_item("first")]), response([message_item("second")])],
+    )
+
+    await collect(agent, "hi")
+    await collect(agent, "again")
+
+    replayed = client.calls[1]["input"]
+    assert replayed[2] == {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first"}],
+    }
+    assert replayed[3] == {"role": "user", "content": "again"}
+
+
+async def test_reasoning_summary_event_and_stateless_replay(config):
+    config.reasoning_effort = "high"
+    script = [
+        response([reasoning_item("pondering"), function_call_item("1", "fake", {})]),
+        response([message_item("done")]),
+    ]
+    agent, client = make_agent(
+        config, {"fake": FakeTool(ToolResult(ok=True, content="r"))}, script
+    )
+    events = await collect(agent, "go")
+    assert events[1].type is EventType.REASONING
+    assert events[1].quote == "pondering"
+    assert events[-1].type is EventType.MODEL_RESPONSE
+
+    replayed = client.calls[1]["input"]
+    assert replayed[2] == {  # reasoning item replayed verbatim
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "enc",
+        "summary": [{"type": "summary_text", "text": "pondering"}],
+    }
+    assert replayed[3] == {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "1",
+        "name": "fake",
+        "arguments": {},
+        "status": "completed",
+    }
+    assert replayed[4] == ToolMessage(call_id="1", content="r").serialize()
+    assert any(isinstance(m, ReasoningMessage) for m in agent.context.messages)
+
+
+async def test_reasoning_text_event_shown_when_summary_missing(config):
+    config.reasoning_effort = "high"
+    agent, _ = make_agent(
+        config,
+        {},
+        [response([reasoning_item(text="thinking live"), message_item("ok")])],
+    )
+
+    events = await collect(agent, "hi")
+
+    assert [e.type for e in events] == [
+        EventType.THINKING,
+        EventType.REASONING,
+        EventType.MODEL_RESPONSE,
+    ]
+    assert events[1].quote == "thinking live"
+
+
+async def test_reasoning_text_preferred_over_summary(config):
+    config.reasoning_effort = "high"
+    items = [reasoning_item(summary="recap", text="thinking live"), message_item("ok")]
+    agent, _ = make_agent(config, {}, [response(items)])
+
+    events = await collect(agent, "hi")
+
+    assert [e.type for e in events] == [
+        EventType.THINKING,
+        EventType.REASONING,
+        EventType.MODEL_RESPONSE,
+    ]
+    assert events[1].quote == "thinking live"
+    assert events[2].quote == "ok"
+
+
+async def test_reasoning_param_sent_only_when_effort_set(config):
+    config.reasoning_effort = "high"
+    agent, client = make_agent(config, {}, [response([message_item("ok")])])
+    await collect(agent, "hi")
+    assert client.calls[0]["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert client.calls[0]["include"] == ["reasoning.encrypted_content"]
+
+    config.reasoning_effort = None
+    agent, client = make_agent(config, {}, [response([message_item("ok")])])
+    await collect(agent, "hi")
+    assert "reasoning" not in client.calls[0]
+    assert "include" not in client.calls[0]
+
+
+async def test_reasoning_without_encrypted_content_shown_but_not_replayed(config):
+    first = response(
+        [reasoning_item("musing", encrypted=False), function_call_item("1", "fake", {})]
+    )
+    script = [first, response([message_item("done")])]
+    agent, client = make_agent(
+        config, {"fake": FakeTool(ToolResult(ok=True, content="r"))}, script
+    )
+    events = await collect(agent, "go")
+    assert events[1].type is EventType.REASONING
+    assert events[1].quote == "musing"
+
+    replayed = client.calls[1]["input"]
+    assert all(m.get("type") != "reasoning" for m in replayed)
+    assert ToolMessage(call_id="1", content="r").serialize() in replayed
 
 
 async def test_results_append_in_tool_call_order(config):
@@ -93,37 +246,49 @@ async def test_results_append_in_tool_call_order(config):
         "slow": FakeTool(ToolResult(ok=True, content="slow"), delay=0.05, name="slow"),
         "fast": FakeTool(ToolResult(ok=True, content="fast"), name="fast"),
     }
-    batch = sdk_message(
-        None,
+    batch = response(
         [
-            {"id": "1", "name": "slow", "arguments": {}},
-            {"id": "2", "name": "fast", "arguments": {}},
-        ],
+            function_call_item("1", "slow", {}),
+            function_call_item("2", "fast", {}),
+        ]
     )
-    agent, _ = make_agent(config, tools, [batch, sdk_message("done")])
+    agent, _ = make_agent(config, tools, [batch, response([message_item("done")])])
     events = await collect(agent, "go")
     assert events[-1].type is EventType.MODEL_RESPONSE
 
     tool_messages = [m for m in agent.context.messages if isinstance(m, ToolMessage)]
-    assert [m.tool_call_id for m in tool_messages] == ["1", "2"]
+    assert [m.call_id for m in tool_messages] == ["1", "2"]
     assert [m.content for m in tool_messages] == ["slow", "fast"]
+
+
+async def test_duplicate_call_ids_do_not_collide(config):
+    tools = {
+        "one": FakeTool(ToolResult(ok=True, content="first"), name="one"),
+        "two": FakeTool(ToolResult(ok=True, content="second"), name="two"),
+    }
+    batch = response(
+        [
+            function_call_item("1", "one", {}),
+            function_call_item("1", "two", {}),  # same call_id
+        ]
+    )
+    agent, _ = make_agent(config, tools, [batch, response([message_item("done")])])
+    events = await collect(agent, "go")
+    assert events[-1].type is EventType.MODEL_RESPONSE
+
+    tool_messages = [m for m in agent.context.messages if isinstance(m, ToolMessage)]
+    assert [m.call_id for m in tool_messages] == ["1", "1"]
+    assert [m.content for m in tool_messages] == ["first", "second"]
 
 
 async def test_declined_mutating_tool_recorded(config, fs):
     tools = {
         "write_file": WriteFile(config=config, fs=fs, prompt_user=awaitable_no()),
     }
-    batch = sdk_message(
-        None,
-        [
-            {
-                "id": "1",
-                "name": "write_file",
-                "arguments": {"path": "x.txt", "content": "d"},
-            }
-        ],
+    batch = response(
+        [function_call_item("1", "write_file", {"path": "x.txt", "content": "d"})]
     )
-    agent, _ = make_agent(config, tools, [batch, sdk_message("ok")])
+    agent, _ = make_agent(config, tools, [batch, response([message_item("ok")])])
     events = await collect(agent, "go")
     assert events[-1].type is EventType.MODEL_RESPONSE
 
@@ -149,7 +314,7 @@ async def test_model_error_aborts(config):
 
 async def test_context_overflow_before_start(config):
     config.max_context = 100
-    agent, client = make_agent(config, {}, [sdk_message("nope")])
+    agent, client = make_agent(config, {}, [response([message_item("nope")])])
     events = await collect(agent, "y" * 10_000)
     assert [e.type for e in events] == [EventType.ERROR]
     assert "token limit" in events[0].error_message
@@ -159,8 +324,8 @@ async def test_context_overflow_before_start(config):
 async def test_context_overflow_after_tools(config):
     config.max_context = 500
     tools = {"big": FakeTool(ToolResult(ok=True, content="x" * 100_000), name="big")}
-    batch = sdk_message(None, [{"id": "1", "name": "big", "arguments": {}}])
-    agent, _ = make_agent(config, tools, [batch, sdk_message("never")])
+    batch = response([function_call_item("1", "big", {})])
+    agent, _ = make_agent(config, tools, [batch, response([message_item("never")])])
     events = await collect(agent, "go")
     assert events[-1].type is EventType.ERROR
     assert "token limit" in events[-1].error_message
@@ -168,7 +333,7 @@ async def test_context_overflow_after_tools(config):
 
 async def test_max_iterations_reached(config):
     config.max_iterations = 2
-    batch = sdk_message(None, [{"id": "1", "name": "fake", "arguments": {}}])
+    batch = response([function_call_item("1", "fake", {})])
     agent, _ = make_agent(
         config, {"fake": FakeTool(ToolResult(ok=True, content="r"))}, [batch] * 5
     )

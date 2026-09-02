@@ -3,8 +3,9 @@
 A small OpenAI-compatible CLI coding assistant in pure Python. Useful agent, total
 control over the context window, and a codebase you can read in one sitting.
 
-- **Small**: ~1,650 lines, five dependencies (`openai`, `httpx`, `lxml`, `rich`, `prompt_toolkit`).
-- **Provider-agnostic**: anything speaking the OpenAI chat-completions API.
+- **Small**: ~1,800 lines, five dependencies (`openai`, `httpx2`, `lxml`, `rich`, `prompt_toolkit`).
+- **Reasoning-native**: runs on the OpenAI Responses API with configurable reasoning effort.
+- **Provider-agnostic**: anything speaking the OpenAI Responses API.
 
 Project goals:
 * explore how coding harnesses work
@@ -21,19 +22,18 @@ export OPENAI_API_KEY=sk-...    # your provider key
 uv run imp                      # start the REPL (python -m imp.cli also works)
 ```
 
-Any OpenAI-compatible endpoint works:
+Reasoning extras stay opt-in via one env var:
 
 ```bash
-export OPENAI_BASE_URL=https://api.groq.com/openai/v1
-export OPENAI_MODEL=llama-3.3-70b-versatile
+export IMP_REASONING_EFFORT=high   # none | minimal | low | medium | high | xhigh | max
 ```
 
-Useful with OpenRouter:
+Any Responses-API-compatible endpoint works:
 
 ```bash
 export OPENAI_BASE_URL=https://openrouter.ai/api/v1/
 export OPENAI_API_KEY=sk-or...
-export OPENAI_MODEL=minimax/minimax-m3:free
+export OPENAI_MODEL=openai/gpt-5-mini
 ```
 
 ### Docker
@@ -60,10 +60,13 @@ the image name (`imp -y` to auto-approve tool calls).
 A banner shows the model, workspace, and key hints, then you get a `>` prompt.
 Arrow keys edit and recall input; end a line with `\` to continue onto the
 next line; pasted multi-line text is kept verbatim (Enter sends, Esc+Enter
-inserts a newline). While the model thinks a spinner runs; responses render as
+inserts a newline). While the model thinks a spinner runs; reasoning models
+show dim reasoning text or summaries above the answer when provided (cropped
+to the last `IMP_MAX_REASONING_DISPLAY_LINES` lines); responses render as
 plain markdown (no borders — terminal text stays copy-friendly), file edits as
-diffs, tool calls as `[tool_name] args`, and quiet read tools
-(`read_file`/`list_dir`/`ask`/`web_fetch`) print nothing on success. Context
+diffs, tool calls as `[tool_name]` args, and quiet tools
+(`read_file`/`list_dir`/`ask`/`web_fetch`/`web_search`/`run_shell`) print
+nothing on success. Context
 usage prints once at the end of each turn; tool output truncates to
 `IMP_MAX_TOOL_DISPLAY_LINES` lines. Mutating tools (`write_file`,
 `str_replace`, `run_shell`) ask `Allow ... (y/n)?` first, or pass `-y` to
@@ -83,6 +86,18 @@ user prompt ─▶ model ─▶ tool calls ─▶ tool results ─▶ model ─�
 - **Scheduling**: within one batch of tool calls, read-only tools run
   concurrently; mutating tools run sequentially. Results always append in
   tool-call order, so sessions replay deterministically.
+- **Model calls**: the [Responses API](https://developers.openai.com/api/docs/guides/reasoning)
+  is used statelessly (`store: false`) — imp sends the full item list every
+  call and replays reasoning items (encrypted content) verbatim, so it owns
+  its context window end to end.
+- **Reasoning**: `IMP_REASONING_EFFORT` sets `reasoning.effort`
+  (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) and requests
+  encrypted reasoning replay plus summaries, shown dim above the answer.
+  Unset, all reasoning-specific request fields are omitted for broader
+  provider compatibility; reasoning items returned without encrypted
+  content are shown but not replayed — the model just re-reasons each
+  iteration. Higher effort grows reasoning items and with them the
+  context budget usage.
 - **Context budget**: tokens are estimated (`len(json)/4 + 20` per message);
   the turn aborts when usage crosses 95% of the budget, and oversized tool
   output is truncated before entering the context.
@@ -126,8 +141,9 @@ Environment only (see `.env.example`); no config files to parse.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENAI_API_KEY` | — | **Required.** Provider API key. |
-| `OPENAI_MODEL` | `gpt-4.1-mini` | Model name. |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
+| `OPENAI_MODEL` | `gpt-5-mini` | Model name. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Responses-API-compatible endpoint. |
+| `IMP_REASONING_EFFORT` | unset | Reasoning effort: `none/minimal`/`low`/`medium`/`high/xhigh/max`. Unset = provider default. |
 | `BRAVE_API_KEY` | unset | Enables the `web_search` tool. |
 | `IMP_WORKSPACE` | `.` | Sandbox root (absolute or relative). |
 | `IMP_MAX_ITERATIONS` | `50` | Max ReAct iterations per turn. |
@@ -136,6 +152,7 @@ Environment only (see `.env.example`); no config files to parse.
 | `IMP_NETWORK_TIMEOUT` | `360` | HTTP/model timeout (s). |
 | `IMP_MAX_TOOL_OUTPUT` | `100000` | Tool output cap in chars before truncation. |
 | `IMP_MAX_TOOL_DISPLAY_LINES` | `10` | Max tool output lines shown in the UI. |
+| `IMP_MAX_REASONING_DISPLAY_LINES` | `10` | Max reasoning lines shown (last lines kept; `...` marks a crop). |
 | `IMP_MAX_HTTP_BYTES` | `10000000` | HTTP response cap in bytes. |
 | `IMP_AUTO_APPROVE` | unset | Skip approvals (`1/true/yes/on/y`). Same as `-y`. |
 
@@ -182,7 +199,8 @@ uv run python -m pytest                 # test suite
 
 ## References
 
-- [OpenAI guide on function calling](https://developers.openai.com/api/docs/guides/function-calling?api-mode=chat)
+- [OpenAI guide on function calling](https://developers.openai.com/api/docs/guides/function-calling?api-mode=responses)
+- [OpenAI guide on reasoning](https://developers.openai.com/api/docs/guides/reasoning)
 - [nano — one-file coding assistant](https://github.com/pnegahdar/nano)
 
 ## Potential features
