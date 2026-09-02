@@ -16,76 +16,86 @@ class TextMessage:
 
 @dataclass(slots=True, frozen=True)
 class ToolCall:
-    tool_call_id: str
+    call_id: str
     function_name: str
     arguments: dict[str, Any]
+    item: dict[str, Any]
 
     def serialize(self) -> dict[str, Any]:
-        return {
-            "id": self.tool_call_id,
-            "type": "function",
-            "function": {
-                "name": self.function_name,
-                "arguments": json.dumps(self.arguments, ensure_ascii=False),
-            },
-        }
+        return self.item
 
     @classmethod
-    def parse(cls, data: Any) -> ToolCall:
-        arguments = data.function.arguments or {}
-        if not isinstance(arguments, dict):
+    def parse(cls, data: dict[str, Any]) -> ToolCall:
+        arguments = data.get("arguments") or {}
+        if isinstance(arguments, str):
             try:
-                parsed_arguments = json.loads(arguments)
+                arguments = json.loads(arguments) if arguments.strip() else {}
             except json.JSONDecodeError as exc:
                 raise ValueError(
-                    f"Tool call {data.id} returned invalid JSON arguments"
+                    f"Tool call {data.get('call_id')} returned invalid JSON arguments"
                 ) from exc
-        else:
-            parsed_arguments = arguments
-
         return ToolCall(
-            tool_call_id=data.id,
-            function_name=data.function.name,
-            arguments=parsed_arguments,
+            call_id=data["call_id"],
+            function_name=data["name"],
+            arguments=arguments,
+            item=data,
         )
+
+
+@dataclass(slots=True, frozen=True)
+class ReasoningMessage:
+    """Reasoning item kept verbatim for stateless replay (encrypted content)."""
+
+    item: dict[str, Any]
+    content: str | None = None  # reasoning text or summary, for display
+
+    def serialize(self) -> dict[str, Any]:
+        return self.item
+
+    @classmethod
+    def parse(cls, data: dict[str, Any]) -> ReasoningMessage:
+        text = "".join(
+            part["text"]
+            for part in data.get("content") or []
+            if part.get("type") == "reasoning_text" and part.get("text")
+        )
+        summary = "\n".join(
+            s["text"] for s in data.get("summary") or [] if s.get("text")
+        )
+        return cls(item=data, content=text or summary or None)
 
 
 @dataclass(slots=True, frozen=True)
 class AssistantMessage:
     content: str | None
-    tool_calls: list[ToolCall] | None = None
+    item: dict[str, Any]
 
     def serialize(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"role": "assistant", "content": self.content}
-        if self.tool_calls:
-            payload["tool_calls"] = [
-                tool_call.serialize() for tool_call in self.tool_calls
-            ]
-        return payload
+        return self.item
 
     @classmethod
-    def parse(cls, data: Any) -> AssistantMessage:
-        tool_calls = [
-            ToolCall.parse(tool_call)
-            for tool_call in getattr(data, "tool_calls", None) or []
-        ]
-        return AssistantMessage(
-            content=getattr(data, "content", None),
-            tool_calls=tool_calls if tool_calls else None,
+    def parse(cls, data: dict[str, Any]) -> AssistantMessage:
+        text = "".join(
+            part.get("text", "")
+            for part in data.get("content") or []
+            if part.get("type") == "output_text"
         )
+        return cls(content=text or None, item=data)
 
 
 @dataclass(slots=True, frozen=True)
 class ToolMessage:
-    tool_call_id: str
+    call_id: str
     content: str
 
     def serialize(self) -> dict[str, Any]:
         return {
-            "role": "tool",
-            "tool_call_id": self.tool_call_id,
-            "content": self.content,
+            "type": "function_call_output",
+            "call_id": self.call_id,
+            "output": self.content,
         }
 
 
-ConversationMessage = TextMessage | AssistantMessage | ToolMessage
+ConversationMessage = (
+    TextMessage | AssistantMessage | ReasoningMessage | ToolCall | ToolMessage
+)

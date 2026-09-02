@@ -10,10 +10,12 @@ from imp.config import (
     DEFAULT_MAX_CONTEXT,
     DEFAULT_MAX_HTTP_BYTES,
     DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_REASONING_DISPLAY_LINES,
     DEFAULT_MAX_TOOL_DISPLAY_LINES,
     DEFAULT_MAX_TOOL_OUTPUT,
     DEFAULT_MODEL,
     DEFAULT_NETWORK_TIMEOUT,
+    REASONING_EFFORTS,
     Config,
 )
 
@@ -29,14 +31,17 @@ ENV_VARS = [
     "IMP_NETWORK_TIMEOUT",
     "IMP_MAX_TOOL_OUTPUT",
     "IMP_MAX_TOOL_DISPLAY_LINES",
+    "IMP_MAX_REASONING_DISPLAY_LINES",
     "IMP_MAX_HTTP_BYTES",
     "IMP_AUTO_APPROVE",
+    "IMP_REASONING_EFFORT",
 ]
 
 INT_VARS = [
     var
     for var in ENV_VARS
-    if var.startswith("IMP_") and var != "IMP_WORKSPACE" and var != "IMP_AUTO_APPROVE"
+    if var.startswith("IMP_")
+    and var not in {"IMP_WORKSPACE", "IMP_AUTO_APPROVE", "IMP_REASONING_EFFORT"}
 ]
 
 
@@ -65,9 +70,13 @@ def test_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert config.network_timeout == DEFAULT_NETWORK_TIMEOUT
     assert config.max_tool_output == DEFAULT_MAX_TOOL_OUTPUT
     assert config.max_tool_display_lines == DEFAULT_MAX_TOOL_DISPLAY_LINES
+    assert (
+        config.max_reasoning_display_lines == DEFAULT_MAX_REASONING_DISPLAY_LINES
+    )
     assert config.max_http_bytes == DEFAULT_MAX_HTTP_BYTES
     assert config.auto_approve is False
     assert config.brave_api_key is None
+    assert config.reasoning_effort is None
 
 
 def test_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -82,6 +91,7 @@ def test_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "IMP_NETWORK_TIMEOUT": "20",
         "IMP_MAX_TOOL_OUTPUT": "3000",
         "IMP_MAX_TOOL_DISPLAY_LINES": "4",
+        "IMP_MAX_REASONING_DISPLAY_LINES": "3",
         "IMP_MAX_HTTP_BYTES": "1000",
     }
     monkeypatch.setenv("OPENAI_API_KEY", "key")
@@ -98,6 +108,7 @@ def test_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert config.network_timeout == 20
     assert config.max_tool_output == 3000
     assert config.max_tool_display_lines == 4
+    assert config.max_reasoning_display_lines == 3
     assert config.max_http_bytes == 1000
 
 
@@ -137,3 +148,26 @@ def test_explicit_argument_wins_over_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENAI_API_KEY", "key")
     monkeypatch.setenv("IMP_AUTO_APPROVE", "1")
     assert Config.from_env(auto_approve=False).auto_approve is False
+
+
+@pytest.mark.parametrize("value", REASONING_EFFORTS)
+def test_reasoning_effort_valid(value: str, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    monkeypatch.setenv("IMP_REASONING_EFFORT", value.upper())
+    assert Config.from_env().reasoning_effort == value
+
+
+@pytest.mark.parametrize("value", ["", "  "])
+def test_reasoning_effort_empty_means_unset(
+    value: str, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    monkeypatch.setenv("IMP_REASONING_EFFORT", value)
+    assert Config.from_env().reasoning_effort is None
+
+
+def test_reasoning_effort_invalid_raises(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    monkeypatch.setenv("IMP_REASONING_EFFORT", "turbo")
+    with pytest.raises(ValueError, match="IMP_REASONING_EFFORT"):
+        Config.from_env()

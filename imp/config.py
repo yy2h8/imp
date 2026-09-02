@@ -4,8 +4,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_MODEL: str = "gpt-4.1-mini"
+DEFAULT_MODEL: str = "gpt-5-mini"
 DEFAULT_BASE_URL: str = "https://api.openai.com/v1"
+REASONING_EFFORTS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 DEFAULT_WORKSPACE: str = "."
 DEFAULT_MAX_ITERATIONS: int = 50
 DEFAULT_MAX_CONTEXT: int = 128_000
@@ -13,6 +22,7 @@ DEFAULT_COMMAND_TIMEOUT: int = 180
 DEFAULT_NETWORK_TIMEOUT: int = 360
 DEFAULT_MAX_TOOL_OUTPUT: int = 100_000
 DEFAULT_MAX_TOOL_DISPLAY_LINES: int = 10
+DEFAULT_MAX_REASONING_DISPLAY_LINES: int = 10
 DEFAULT_MAX_HTTP_BYTES: int = 10_000_000
 
 
@@ -31,6 +41,13 @@ def _truthy(name: str) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _effort(name: str) -> str | None:
+    value = (os.getenv(name) or "").strip().lower() or None
+    if value is not None and value not in REASONING_EFFORTS:
+        raise ValueError(f"{name} must be one of: {', '.join(REASONING_EFFORTS)}")
+    return value
+
+
 @dataclass(slots=True)
 class Config:
     api_key: str
@@ -43,9 +60,13 @@ class Config:
     network_timeout: int = DEFAULT_NETWORK_TIMEOUT
     max_tool_output: int = DEFAULT_MAX_TOOL_OUTPUT
     max_tool_display_lines: int = DEFAULT_MAX_TOOL_DISPLAY_LINES
+    max_reasoning_display_lines: int = DEFAULT_MAX_REASONING_DISPLAY_LINES
     max_http_bytes: int = DEFAULT_MAX_HTTP_BYTES
     auto_approve: bool = False  # Can also be set to true via cli argument
     brave_api_key: str | None = None  # Optional Brave Search API key for web search
+    reasoning_effort: str | None = (
+        None  # Optional reasoning effort for reasoning models
+    )
 
     @classmethod
     def from_env(cls, auto_approve: bool | None = None) -> Config:
@@ -74,9 +95,13 @@ class Config:
             max_tool_display_lines=_int(
                 "IMP_MAX_TOOL_DISPLAY_LINES", DEFAULT_MAX_TOOL_DISPLAY_LINES
             ),
+            max_reasoning_display_lines=_int(
+                "IMP_MAX_REASONING_DISPLAY_LINES", DEFAULT_MAX_REASONING_DISPLAY_LINES
+            ),
             max_http_bytes=_int("IMP_MAX_HTTP_BYTES", DEFAULT_MAX_HTTP_BYTES),
             auto_approve=auto_approve
             if auto_approve is not None
             else _truthy("IMP_AUTO_APPROVE"),
             brave_api_key=os.getenv("BRAVE_API_KEY"),
+            reasoning_effort=_effort("IMP_REASONING_EFFORT"),
         )

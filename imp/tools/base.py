@@ -50,18 +50,16 @@ class Tool(ABC):
         return response.strip().lower() in {"y", "yes"}
 
     def openai_schema(self) -> dict[str, Any]:
-        """Return the tool's schema in the shape most providers expect."""
+        """Flat function-tool shape the Responses API expects."""
         return {
             "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": self.parameters,
-                    "required": self.required,
-                    "additionalProperties": False,
-                },
+            "name": self.name,
+            "description": self.description,
+            "parameters": {
+                "type": "object",
+                "properties": self.parameters,
+                "required": self.required,
+                "additionalProperties": False,
             },
         }
 
