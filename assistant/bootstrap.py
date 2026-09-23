@@ -1,0 +1,301 @@
+"""Bootstrap: probe the machine, render AGENTS.md, fingerprint in state.json.
+
+Environment facts are pure code, never model-guessed (D7); the model only
+adapts the Operating Manual in one tailoring turn afterwards.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+TEMPLATE_NAME = "AGENTS.md.template"
+ENV_BEGIN = "<!-- ENVIRONMENT:BEGIN -->"
+ENV_END = "<!-- ENVIRONMENT:END -->"
+# degradation path when the packaged template cannot be read (§6: bootstrap
+# failures degrade to a minimal manual rather than blocking startup).
+# render_manual replaces everything between the markers with fresh facts.
+MINIMAL_TEMPLATE = """# AGENTS.md
+
+The assistant's operating manual. The packaged template was unreadable, so this
+minimal manual was generated instead; run with `--rebootstrap` to retry.
+
+<!-- ENVIRONMENT:BEGIN -->
+<!-- ENVIRONMENT:END -->
+"""
+
+_PROBED_TOOLS = ("uv", "pip", "python3", "git", "curl", "wget")
+
+
+def _tool_version(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        return "not found"
+    try:
+        result = subprocess.run(
+            [name, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        version = (result.stdout or result.stderr).strip().splitlines()
+        return f"{version[0]} ({path})" if version else path
+    except (OSError, subprocess.SubprocessError):
+        return path  # present but would not report a version
+
+
+def _disk_free(path: Path) -> str:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return "unknown"
+    return f"{usage.free / 1e9:.1f} GB free of {usage.total / 1e9:.1f} GB"
+
+
+def _ram_total() -> str:
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return f"{int(line.split()[1]) // 1024} MB"
+    except (OSError, ValueError, IndexError):
+        pass
+    return "unknown"
+
+
+def _network() -> str:
+    try:
+        socket.create_connection(("api.telegram.org", 443), timeout=5).close()
+    except OSError:
+        return "unreachable"
+    return "reachable"
+
+
+@dataclass(slots=True, frozen=True)
+class Probe:
+    """Environment facts; also the fingerprint input."""
+
+    os_name: str
+    arch: str
+    os_release: str
+    kernel: str
+    python_version: str
+    python_path: str
+    tools: dict[str, str]
+    shell: str
+    home: str
+    cwd: str
+    disk: str
+    ram: str
+    workspace: str
+    has_openai_key: bool
+    has_brave_key: bool
+    network: str
+    probed_at: str
+
+    @classmethod
+    def take(cls, workspace: Path) -> Probe:
+        release = ""
+        try:
+            with open("/etc/os-release", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("PRETTY_NAME="):
+                        release = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except OSError:
+            pass
+        shell = "unknown"
+        try:  # /proc gives the interpreter the process was started with
+            shell = Path("/proc/self/comm").read_text().strip()
+        except OSError:
+            pass
+        return cls(
+            os_name=platform.system() or "unknown",
+            arch=platform.machine() or "unknown",
+            os_release=release or "unknown",
+            kernel=platform.release(),
+            python_version=platform.python_version(),
+            python_path=sys.executable,
+            tools={name: _tool_version(name) for name in _PROBED_TOOLS},
+            shell=shell,
+            home=str(Path.home()),
+            cwd=str(Path.cwd()),
+            disk=_disk_free(workspace),
+            ram=_ram_total(),
+            workspace=str(workspace),
+            has_openai_key=bool(os.getenv("OPENAI_API_KEY")),
+            has_brave_key=bool(os.getenv("BRAVE_API_KEY")),
+            network=_network(),
+            probed_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        )
+
+    def fingerprint(self) -> str:
+        """Stable identity of the machine (timestamps and free-space noise
+        excluded): a change means the manual's environment block is stale."""
+        payload = json.dumps(
+            {
+                "os": self.os_name,
+                "arch": self.arch,
+                "release": self.os_release,
+                "kernel": self.kernel,
+                "python": self.python_version,
+                "tools": self.tools,
+                "ram": self.ram,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def render(self) -> str:
+        tools = " · ".join(f"`{name}`: {value}" for name, value in self.tools.items())
+        secrets = (
+            f"`OPENAI_API_KEY={'yes' if self.has_openai_key else 'no'}`, "
+            f"`BRAVE_API_KEY={'yes' if self.has_brave_key else 'no'}`"
+        )
+        return "\n".join(
+            [
+                f"- Host: `{self.os_name}/{self.arch}` {self.os_release}",
+                f"- Kernel: `{self.kernel}`",
+                f"- Python: `{self.python_version}` (`{self.python_path}`)",
+                f"- Tools: {tools}",
+                f"- Shell: `{self.shell}` — **`ash`/BusyBox, not bash**, on the Pi target",
+                f"- Home: `{self.home}`",
+                f"- Workspace (sandbox root): `{self.workspace}`",
+                f"- Free disk: {self.disk} · RAM: {self.ram}",
+                f"- Network at probe time: {self.network}",
+                f"- Secrets present (presence only): {secrets}",
+                f"- Probed at: `{self.probed_at}`",
+            ]
+        )
+
+
+def render_manual(template: str, environment: str) -> str:
+    """Splice the probed environment into the template's ENVIRONMENT block.
+    Manual content outside the markers is preserved (hand edits survive
+    re-bootstrap, per the template's own preamble)."""
+    head, marker, _ = template.partition(ENV_BEGIN)
+    if not marker:
+        return template  # malformed template: keep it verbatim
+    body = (
+        f"{ENV_BEGIN}\n## Environment\n\n"
+        "> Generated by bootstrap. Do not edit by hand; run `assistant --rebootstrap`.\n\n"
+        f"{environment}\n{ENV_END}"
+    )
+    rest = template.split(ENV_END, 1)[1] if ENV_END in template else ""
+    return f"{head}{body}\n{rest}"
+
+
+def load_template(package_dir: Path) -> str:
+    try:
+        return (package_dir / TEMPLATE_NAME).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read template: {exc}") from exc
+
+
+def read_state(home: Path) -> dict:
+    try:
+        return json.loads((home / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(home: Path, updates: dict) -> dict:
+    path = home / "state.json"
+    state = read_state(home)
+    state.update(updates)
+    path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    return state
+
+
+@dataclass(slots=True, frozen=True)
+class BootstrapResult:
+    """What a bootstrap run decided; drives the tailoring turn."""
+
+    probe: Probe
+    changed: bool  # manual written (first run, forced, or fingerprint mismatch)
+
+
+def run_bootstrap(
+    home: Path,
+    package_dir: Path,
+    probe: Probe | None = None,
+    force: bool = False,
+) -> BootstrapResult:
+    """Probe → fingerprint check → render manual → record fingerprint (D7).
+
+    A mismatch means the stored manual describes a machine that no longer
+    exists; the manual is rewritten with fresh facts (hand-edited manual text
+    outside the ENVIRONMENT block survives via render_manual). A template
+    failure degrades to a minimal manual rather than blocking startup (§6).
+    """
+    probe = probe or Probe.take(home)
+    changed = force or probe.fingerprint() != read_state(home).get("fingerprint")
+    if changed:
+        try:
+            template = load_template(package_dir)
+        except RuntimeError:
+            template = MINIMAL_TEMPLATE
+        manual = render_manual(template, probe.render())
+        (home / "AGENTS.md").write_text(manual, encoding="utf-8")
+    write_state(home, {"fingerprint": probe.fingerprint()})
+    return BootstrapResult(probe=probe, changed=changed)
+
+
+def prune_scratch(home: Path, ttl_days: float) -> int:
+    """Delete scratch/ files older than the TTL; returns how many went.
+
+    Directories are never removed (the agent may nest work); pruning is
+    best-effort — an undeletable file is left for the next boot.
+    """
+    scratch = home / "scratch"
+    try:
+        entries = list(scratch.iterdir())
+    except OSError:
+        return 0
+    cutoff = time.time() - ttl_days * 86400
+    removed = 0
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue  # pruning is best-effort
+    return removed
+
+
+def needs_tailoring(state: dict) -> bool:
+    """True when the Operating Manual still needs its one tailoring turn."""
+    return not state.get("tailored")
+
+
+async def tailor_manual(app, probe: Probe) -> None:
+    """The single bootstrap tailoring turn (spec §6.4): one agent turn that
+    adapts the manual's Operating Manual section to the probed machine.
+
+    Confined to the home: app is already sandboxed to IMP_HOME; the prompt
+    hands over only real probe facts and forbids invention.
+    """
+    prompt = (
+        "Bootstrap tailoring turn. Adapt the Operating Manual section of "
+        "AGENTS.md to this machine using ONLY the probed facts below — never "
+        "invent facts. Keep every section except Operating-Manual adaptations; "
+        "write the file back with str_replace. Adapt guidance like which "
+        "package manager or venv tool to use (no uv → python3 -m venv + pip), "
+        "disk and RAM budgeting (small disk → prune scratch aggressively), "
+        f"and the shell to target.\n\nProbed environment:\n{probe.render()}"
+    )
+    async for _ in app.agent.run_turn(prompt):
+        pass  # events are rendered by the caller's UI adapter, if any
+    write_state(home=app.config.workspace, updates={"tailored": True})

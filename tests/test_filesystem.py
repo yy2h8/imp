@@ -207,3 +207,31 @@ def test_project_context_includes_all_context_files(workspace, adapter):
 
 def test_project_context_empty_without_files(adapter):
     assert adapter.gather_project_context() == ""
+
+
+class TestSkillsDirSeam:
+    """The assistant seam (spec §3.1): skills live at <home>/skills/, not
+    .imp/skills/ — a constructor argument, nothing else moves."""
+
+    def test_default_stays_dot_imp_skills(self, workspace):
+        adapter = FileSystemAdapter(workspace)
+        assert adapter.skills_dir == ".imp/skills"
+        assert adapter.list_skills() == []
+
+    def test_custom_dir_is_discovered(self, workspace):
+        skill_dir = workspace / "skills" / "weather"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: weather\ndescription: "forecast lookup"\n---\nbody'
+        )
+        adapter = FileSystemAdapter(workspace, skills_dir="skills")
+        assert adapter.list_skills() == [("weather", "forecast lookup")]
+
+    def test_imp_skills_ignored_when_seam_is_redirected(self, workspace):
+        legacy = workspace / ".imp" / "skills" / "legacy"
+        legacy.mkdir(parents=True)
+        (legacy / "SKILL.md").write_text(
+            '---\nname: legacy\ndescription: "old location"\n---\nbody'
+        )
+        adapter = FileSystemAdapter(workspace, skills_dir="skills")
+        assert adapter.list_skills() == []

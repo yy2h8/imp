@@ -81,8 +81,9 @@ def build_system_prompt(
     tools: dict[str, Tool],
     skills: list[tuple],
     context: str,
+    base_prompt: str = BASE_PROMPT,
 ) -> str:
-    sections: list[str] = [BASE_PROMPT]
+    sections: list[str] = [base_prompt]
     sections.append(f"## Environment\n{_environment_block(workspace, fs_listing)}")
 
     if tools:

@@ -59,3 +59,17 @@ def test_project_context_section():
     assert "## Project Instructions" in build(context="PROJECT NOTES")
     assert "PROJECT NOTES" in build(context="PROJECT NOTES")
     assert "## Project Instructions" not in build()
+
+
+def test_base_prompt_kwarg_replaces_imp_prompt():
+    """The assistant seam (spec §3.1): a different base prompt, same layout."""
+    prompt = build_system_prompt(
+        "ws", [], {}, [], "", base_prompt="You are a general assistant."
+    )
+    assert prompt.startswith("You are a general assistant.")
+    assert "# imp" not in prompt  # imp's own base prompt is gone
+    assert "## Environment" in prompt  # the rest of the assembly is unchanged
+
+    from imp.agent.prompt import BASE_PROMPT
+
+    assert build().startswith(BASE_PROMPT.splitlines()[0])  # default unchanged

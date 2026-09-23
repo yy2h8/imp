@@ -12,6 +12,11 @@ Project goals:
 * have a usable assistant with full context control (for use with local llms)
 * readability and extensibility
 
+> **Also in this repo:** [`assistant/`](./assistant/README.md) — a general
+> personal assistant reached over Telegram, built on `imp` as a library. Same
+> agent core, different base prompt, plus Telegram transport, bootstrap and a
+> scheduler for deferred work.
+
 ## Quickstart
 
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
@@ -185,6 +190,7 @@ imp/
 │   └── prompt.py       # system prompt assembly
 ├── adapters/           # filesystem (sandbox), http, session, ui
 └── tools/              # Tool ABC + build_tools + shell/fs/ask/fetch/brave_search
+assistant/              # Telegram personal assistant on imp (see assistant/README.md)
 ```
 
 `AGENTS.md` documents the same layout for agents (including this one) and is

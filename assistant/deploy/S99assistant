@@ -1,0 +1,57 @@
+#!/bin/sh
+# BusyBox init script for the Raspberry Pi Zero 2W (spec §10, D12).
+#
+# Install:
+#   1. Repo at /opt/imp, venv at /opt/imp-venv (see assistant/README.md).
+#   2. Env in /etc/assistant.env (copy assistant/.env.example, fill in):
+#        chmod 600 /etc/assistant.env
+#   3. scp -O assistant/deploy/S99assistant root@pi:/etc/init.d/S99assistant
+#      chmod +x /etc/init.d/S99assistant
+#   (BusyBox rc runs S* scripts at boot with "start", at shutdown with "stop".)
+
+NAME=assistant
+DAEMON=/opt/imp-venv/bin/python
+ARGS="-m assistant"
+WORKDIR=/opt/imp
+ENVFILE=/etc/assistant.env
+PIDFILE=/var/run/$NAME.pid
+
+case "$1" in
+start)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "$NAME already running"
+        exit 0
+    fi
+    echo "Starting $NAME..."
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENVFILE"
+    set +a
+    cd "$WORKDIR" || exit 1
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS \
+        >>/var/log/$NAME.log 2>&1
+    ;;
+stop)
+    echo "Stopping $NAME..."
+    if [ -f "$PIDFILE" ]; then
+        start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON" || rm -f "$PIDFILE"
+    fi
+    ;;
+restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "$NAME is running (pid $(cat "$PIDFILE"))"
+        exit 0
+    fi
+    echo "$NAME is not running"
+    exit 1
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac

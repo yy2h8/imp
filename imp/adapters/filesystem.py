@@ -73,8 +73,11 @@ class FileSystemAdapter:
     SKIP_FILES: ClassVar[set[str]] = {".env"}
     CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md")
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self, workspace: Path, skills_dir: str | Path = ".imp/skills"
+    ) -> None:
         self.workspace = workspace.resolve()
+        self.skills_dir = skills_dir
 
     def resolve_path(self, value: str | Path, must_exist: bool = False) -> Path:
         path = (self.workspace / value).resolve()
@@ -135,7 +138,7 @@ class FileSystemAdapter:
         return entries
 
     def list_skills(self) -> list[tuple]:
-        skills_dir = self.resolve_path(".imp/skills", must_exist=False)
+        skills_dir = self.resolve_path(self.skills_dir, must_exist=False)
         if not skills_dir.exists() or not skills_dir.is_dir():
             return []
 

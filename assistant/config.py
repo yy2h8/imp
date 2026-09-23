@@ -1,0 +1,87 @@
+"""AssistantConfig: assistant-owned env vars; imp limits reused unchanged."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_HOME = "~/assistant"
+DEFAULT_EDIT_INTERVAL = 2.5
+DEFAULT_STATUS_MAX_CHARS = 3500
+DEFAULT_RESET_THRESHOLD = 0.85
+DEFAULT_SCRATCH_TTL_DAYS = 7
+
+
+@dataclass(slots=True)
+class AssistantConfig:
+    """Assistant-specific settings. The imp `Config` is built separately
+    (a plain dataclass) sharing this process's environment."""
+
+    bot_token: str
+    allowed_user_ids: frozenset[int]
+    home: Path
+    edit_interval: float = DEFAULT_EDIT_INTERVAL
+    status_max_chars: int = DEFAULT_STATUS_MAX_CHARS
+    reset_threshold: float = DEFAULT_RESET_THRESHOLD
+    scratch_ttl_days: int = DEFAULT_SCRATCH_TTL_DAYS
+
+    @classmethod
+    def from_env(cls) -> AssistantConfig:
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather and retry."
+            )
+        raw_ids = os.getenv("IMP_TG_ALLOWED_USER_IDS", "").strip()
+        if not raw_ids:
+            raise ValueError(
+                "IMP_TG_ALLOWED_USER_IDS is not set. "
+                "Add the owner's Telegram user id (comma-separated)."
+            )
+        try:
+            allowed = frozenset(
+                int(part) for part in raw_ids.split(",") if part.strip()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "IMP_TG_ALLOWED_USER_IDS must be comma-separated integers"
+            ) from exc
+        if not allowed:
+            raise ValueError("IMP_TG_ALLOWED_USER_IDS must contain at least one id")
+
+        home = Path(os.getenv("IMP_HOME") or DEFAULT_HOME).expanduser().resolve()
+
+        def _float(name: str, default: float) -> float:
+            try:
+                value = float(os.getenv(name) or default)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number") from exc
+            if not 0 < value <= 60:
+                raise ValueError(f"{name} must be in (0, 60] seconds")
+            return value
+
+        def _fraction(name: str, default: float) -> float:
+            try:
+                value = float(os.getenv(name) or default)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number") from exc
+            if not 0 < value < 1:
+                raise ValueError(f"{name} must be a fraction in (0, 1)")
+            return value
+
+        return cls(
+            bot_token=token,
+            allowed_user_ids=allowed,
+            home=home,
+            edit_interval=_float("IMP_TG_EDIT_INTERVAL", DEFAULT_EDIT_INTERVAL),
+            status_max_chars=int(
+                os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
+            ),
+            reset_threshold=_fraction(
+                "IMP_SESSION_RESET_THRESHOLD", DEFAULT_RESET_THRESHOLD
+            ),
+            scratch_ttl_days=int(
+                os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS
+            ),
+        )
