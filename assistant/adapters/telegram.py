@@ -135,6 +135,10 @@ class TelegramBot:
             delay = min(delay * 2, BACKOFF_MAX_S)
         return None  # transport failed after retries: in-band for send_file
 
+    async def get_me(self) -> dict:
+        """The bot's own identity; whoami uses it to validate the token."""
+        return await self.call("getMe")
+
     async def get_file(self, file_id: str) -> dict:
         """Look up a file entry (file_path) for downloading."""
         return await self.call("getFile", file_id=file_id)

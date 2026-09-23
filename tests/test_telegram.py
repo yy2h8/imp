@@ -141,3 +141,26 @@ async def test_get_updates_parses_results(no_sleep):
 async def test_send_chat_action_swallows_errors(no_sleep):
     bot = bot_with(lambda request: api_error("nope"))
     await bot.send_chat_action(1, "typing")  # no raise
+
+
+async def test_get_me_returns_bot_identity(no_sleep):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/botTESTTOKEN/getMe"
+        return api_result({"id": 42, "username": "my_bot", "first_name": "My Bot"})
+
+    me = await bot_with(handler).get_me()
+    assert me["username"] == "my_bot"
+    assert me["id"] == 42
+
+
+async def test_get_file_and_download_roundtrip(no_sleep):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getFile"):
+            assert json.loads(request.content)["file_id"] == "f1"
+            return api_result({"file_id": "f1", "file_path": "docs/f1.txt"})
+        assert request.url.path == "/file/botTESTTOKEN/docs/f1.txt"
+        return httpx.Response(200, content=b"file bytes")
+
+    bot = bot_with(handler)
+    entry = await bot.get_file("f1")
+    assert await bot.download_file(entry["file_path"]) == b"file bytes"

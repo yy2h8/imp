@@ -34,5 +34,5 @@ Reporting:
 - Never expose API keys or secrets. Do not echo credentials from the environment.
 
 Scheduling:
-- For deferred or recurring work, write a `jobs/*.json` entry (see the operating
-  manual) and tell the owner it is scheduled."""
+- For deferred or recurring work, use the schedule_job tool call (see the
+  operating manual) and tell the owner it is scheduled."""

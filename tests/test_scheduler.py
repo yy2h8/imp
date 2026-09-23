@@ -8,15 +8,15 @@ from pathlib import Path
 import pytest
 from test_agent import StubClient, message_item, response
 
-from assistant.scheduler import (
+from assistant.jobstore import (
     Job,
-    Scheduler,
     advance,
     compute_next,
     load_jobs,
     next_due,
     save_job,
 )
+from assistant.scheduler import Scheduler
 
 NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
 
@@ -170,6 +170,9 @@ def make_app(tmp_path, client, bot):
         client=client,
         context=session.context,
     )
+    from assistant.uploads import Uploads
+
+    uploads = Uploads(bot=bot, inbox=tmp_path / "inbox", chat_id=7)
     return AssistantApp(
         config=imp_config,
         assistant=assistant_config,
@@ -178,6 +181,7 @@ def make_app(tmp_path, client, bot):
         bot=bot,
         chat_id=7,
         ask_router=None,
+        uploads=uploads,
     )
 
 

@@ -15,12 +15,17 @@ operating manual, and an internal scheduler for deferred work.
   turn runs, then collapses to a one-line summary. The final answer is its own
   message in Telegram-safe markdown.
 - **Tools:** imp's `list_dir` / `read_file` / `write_file` / `str_replace` /
-  `run_shell` / `web_fetch` / `web_search`, plus `ask` and `send_file`.
+  `run_shell` / `web_fetch` / `web_search`, plus `ask`, `send_file`,
+  `schedule_job` and `unschedule_job`.
 - **Self-configuring:** on first start it probes the machine and writes
   `<IMP_HOME>/AGENTS.md`, which shapes how it organises work (`scratch/`,
-  `scripts/`, `outbox/`, `jobs/`).
-- **Deferred work:** an internal scheduler runs `jobs/*.json` — one-shot `at` or
+  `scripts/`, `outbox/`, `jobs/`, `inbox/`).
+- **Deferred work:** the agent schedules runs with the `schedule_job` tool call;
+  an internal scheduler executes `jobs/*.json` — one-shot `at`/`at_local` or
   `every` interval — with a fresh context per run.
+- **Uploads and voice:** documents, photos and voice notes the owner sends land
+  in `inbox/`; voice notes are transcribed (OpenRouter STT) into the next
+  prompt, and the audio file is deleted after a successful transcription.
 - **Commands:** `/new` starts a fresh session (previous transcript stays on
   disk); `/status` reports context usage and the transcript name.
 
@@ -39,10 +44,10 @@ skills_dir=...)`, `SessionWriter(workspace, sessions_dir=...)`.
 
 ```
 assistant/
-├── cli.py            app.py         config.py      prompt.py
-├── bootstrap.py      scheduler.py
-├── adapters/  telegram.py  ui.py
-├── tools/     send_file.py   (ask is reused from imp)
+├── main.py             app.py         config.py      prompt.py
+├── bootstrap.py        scheduler.py   jobstore.py    uploads.py
+├── adapters/  telegram.py  ui.py  stt.py
+├── tools/     send_file.py  schedule.py   (ask is reused from imp)
 └── deploy/    assistant.service  S99assistant
 ```
 
@@ -54,16 +59,28 @@ install imp as usual and run the assistant from the repository root:
 ```bash
 export TELEGRAM_BOT_TOKEN=...
 export IMP_TG_ALLOWED_USER_IDS=123456789
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY=sk-or-...       # an OpenRouter key
+export IMP_TZ=Asia/Almaty            # default; resolves at_local schedules
 export BRAVE_API_KEY=...            # optional: enables web_search
 uv sync                             # or: pip install . into a venv
 uv run python -m assistant          # long-polling bot
-python -m assistant --probe         # print the environment probe and exit
-python -m assistant --rebootstrap   # force re-probe + manual rewrite + tailoring
+python -m assistant whoami          # print your Telegram user id, then exit
 ```
+
+**Finding your Telegram id:** run `python -m assistant whoami` (only
+`TELEGRAM_BOT_TOKEN` needed) **while the bot is stopped** — two `getUpdates`
+consumers fight over the same update stream — send the bot any message, and its
+sender id prints. Put that id into `IMP_TG_ALLOWED_USER_IDS` and start the bot.
+
+The assistant talks to **OpenRouter only**: the base URL is pinned to
+`https://openrouter.ai/api/v1`. imp's documented env vars (`OPENAI_MODEL`,
+`IMP_MAX_CONTEXT`, `IMP_REASONING_EFFORT`, …) apply unchanged.
 
 In a fresh chat the assistant answers `/status`; a busy bot replies with a
 one-line `✓ done · N tools · X s` status before the answer.
+
+Re-tailoring the operating manual (the old `--rebootstrap`): stop the bot,
+delete the `fingerprint` key from `<IMP_HOME>/state.json`, start the bot.
 
 See `.env.example` for every variable.
 
@@ -111,5 +128,6 @@ uv run python -m pytest  # imp + assistant suites
 
 imp's suite stays green; the three seams have one test each, and the assistant
 modules are covered in `tests/test_bootstrap.py`, `tests/test_scheduler.py`,
-`tests/test_send_file.py`, `tests/test_telegram.py` and
-`tests/test_assistant_app.py`.
+`tests/test_schedule.py`, `tests/test_send_file.py`, `tests/test_telegram.py`,
+`tests/test_stt.py`, `tests/test_uploads.py`, `tests/test_whoami.py`,
+`tests/test_assistant_config.py` and `tests/test_assistant_app.py`.

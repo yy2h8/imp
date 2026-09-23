@@ -18,8 +18,9 @@ from assistant.app import (
     Session,
     ensure_home,
 )
-from assistant.cli import PollLoop, TurnRunner, turn_summary
 from assistant.config import AssistantConfig
+from assistant.main import PollLoop, TurnRunner, turn_summary
+from assistant.uploads import Uploads
 from imp.agent import Agent
 from imp.config import Config
 from imp.tools.base import Tool, ToolResult
@@ -145,6 +146,7 @@ def app(home: Path) -> AssistantApp:
         bot=None,
         chat_id=7,
         ask_router=AskRouter(),
+        uploads=Uploads(bot=None, inbox=home / "inbox"),
     )
 
 
@@ -386,3 +388,100 @@ async def test_poll_loop_queues_message_racing_a_pending_ask(app, home):
     ]
     assert any("early reply" in m.content for m in tool_messages)
     assert "done" in bot.sent[-1]
+
+
+# ------------------------------------------------------------------- uploads
+
+
+class UploadBot(FakeBot):
+    """FakeBot plus getFile/download_file feeding bytes from a dict."""
+
+    def __init__(self, files: dict[str, bytes] | None = None):
+        super().__init__()
+        self.files = files or {}
+
+    async def get_file(self, file_id: str) -> dict:
+        return {"file_path": f"docs/{file_id}"}
+
+    async def download_file(self, file_path: str) -> bytes:
+        return self.files[file_path.removeprefix("docs/")]
+
+
+def document_update(file_id: str, name: str, caption: str | None = None) -> dict:
+    message: dict = {
+        "from": {"id": 7},
+        "document": {"file_id": file_id, "file_name": name, "file_size": 5},
+    }
+    if caption is not None:
+        message["caption"] = caption
+    return {"update_id": 200, "message": message}
+
+
+def with_upload_bot(app, bot):
+    """Point the app's upload handler at the test's transport."""
+    app.uploads.bot = bot
+    app.uploads.chat_id = app.chat_id
+    return app
+
+
+async def test_upload_without_caption_saves_and_acks_only(app, home):
+    bot = UpdateBot([])
+    bot.__class__ = UploadBot
+    bot.files = {"f1": b"hello"}
+    with_upload_bot(app, bot)
+    script_client(app, [response([message_item("should not run")])])
+
+    loop = PollLoop(app, bot)
+    await loop._handle_update(document_update("f1", "note.txt"))
+
+    assert (home / "inbox" / "note.txt").read_bytes() == b"hello"
+    assert any("Saved inbox/note.txt" in text for text in bot.sent)
+    assert len(app.agent.context.messages) == 1  # system only: no turn started
+
+
+async def test_captioned_upload_starts_a_turn(app, home):
+    bot = UpdateBot([[owner_update("unused")], []])
+    bot.__class__ = UploadBot
+    bot.files = {"f1": b"data"}
+    with_upload_bot(app, bot)
+    script_client(app, [response([message_item("here is the summary")])])
+
+    loop = PollLoop(app, bot)
+    await loop._handle_update(document_update("f1", "doc.txt", caption="read it"))
+    await loop.turn_task
+
+    turn_prompt = app.agent.client.calls[0]["input"][1]
+    assert "inbox/doc.txt" in turn_prompt["content"]
+    assert "read it" in turn_prompt["content"]
+
+
+async def test_captioned_upload_mid_turn_is_held_not_answer(app, home):
+    """A captioned upload during a pending ask must not resolve the ask."""
+    bot = UpdateBot([])
+    bot.__class__ = UploadBot
+    bot.files = {"f1": b"data"}
+    with_upload_bot(app, bot)
+
+    async def prompt_user(message: str, markdown: bool = True) -> str:
+        future = app.ask_router.start()
+        await bot.send_message(app.chat_id, message)
+        return await future
+
+    from imp.tools import build_tools
+
+    app.agent.tools = {"ask": build_tools(
+        config=app.config, fs=None, prompt_user=prompt_user, http=None
+    )["ask"]}
+
+    loop = PollLoop(app, bot)
+    ask_future = app.ask_router.start()  # simulate the ask tool waiting
+    loop.turn_task = asyncio.create_task(asyncio.sleep(3600))  # turn "running"
+    await asyncio.sleep(0)
+
+    await loop._handle_update(document_update("f1", "mid.txt", caption="look"))
+
+    assert not ask_future.done()  # the upload never resolved the ask
+    assert app.ask_router.take() == (
+        "Owner sent a file, saved to inbox/mid.txt, with the note: look"
+    )
+    loop.turn_task.cancel()

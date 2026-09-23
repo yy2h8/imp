@@ -4,134 +4,25 @@ A single task sleeps until the earliest due job, runs it in a fresh context
 (a job never inherits or pollutes the interactive chat), delivers the result
 to the owner, and updates the job file. Jobs are re-read every cycle, so they
 survive restarts; a failing job is marked ``error`` and never stops the loop.
+
+The Job dataclass, schema, and load/save live in jobstore.py — shared with the
+schedule_job/unschedule_job tools, which are the only writers from the model's
+side.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from imp.agent import Agent, EventType
 
 from .app import AssistantApp, Session
+from .jobstore import Job, advance, load_jobs, next_due, save_job
 
 IDLE_POLL_S = 30.0  # re-read jobs/ this often while nothing is due
 MAX_SLEEP_S = 3600.0  # re-check at least hourly (clock drift, edited jobs)
-
-
-def _parse_ts(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    ts = datetime.fromisoformat(str(value))
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)  # naive job timestamps mean UTC
-    return ts.astimezone(UTC)
-
-
-def _iso(ts: datetime | None) -> str | None:
-    return ts.isoformat() if ts is not None else None
-
-
-@dataclass(slots=True)
-class Job:
-    """One scheduled work item; ``at`` one-shots it, ``every`` repeats it."""
-
-    id: str
-    prompt: str
-    at: datetime | None = None
-    every: int | None = None
-    last_run: datetime | None = None
-    next_run: datetime | None = None
-    status: str = "pending"
-
-    @classmethod
-    def from_dict(cls, data: dict) -> Job:
-        every = data.get("every")
-        return cls(
-            id=str(data.get("id") or "").strip(),
-            prompt=str(data.get("prompt") or ""),
-            at=_parse_ts(data.get("at")),
-            every=int(every) if every is not None else None,
-            last_run=_parse_ts(data.get("last_run")),
-            next_run=_parse_ts(data.get("next_run")),
-            status=str(data.get("status") or "pending"),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "prompt": self.prompt,
-            "at": _iso(self.at),
-            "every": self.every,
-            "last_run": _iso(self.last_run),
-            "next_run": _iso(self.next_run),
-            "status": self.status,
-        }
-
-
-def load_jobs(home: Path) -> list[Job]:
-    """Parse jobs/*.json; malformed or unsafely-named files are skipped."""
-    jobs: list[Job] = []
-    try:
-        paths = sorted((home / "jobs").glob("*.json"))
-    except OSError:
-        return []
-    for path in paths:
-        try:
-            job = Job.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, TypeError):
-            continue
-        if job.id and job.prompt and job.id == Path(job.id).name:
-            jobs.append(job)
-    return jobs
-
-
-def save_job(home: Path, job: Job) -> None:
-    path = home / "jobs" / f"{job.id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(job.to_dict(), indent=2) + "\n", encoding="utf-8")
-
-
-def compute_next(job: Job, now: datetime) -> datetime | None:
-    """When ``job`` should run next, or None (D8: datetime/timedelta only).
-
-    An explicit ``next_run`` wins; a never-run ``at`` is the first fire time;
-    ``every`` repeats from the last run (or from now on first sight).
-    """
-    if job.status != "pending":
-        return None
-    if job.next_run is not None:
-        return job.next_run
-    if job.at is not None and job.last_run is None:
-        return job.at
-    if job.every is not None:
-        return (job.last_run or now) + timedelta(seconds=job.every)
-    return None
-
-
-def next_due(jobs: list[Job], now: datetime) -> tuple[Job, datetime] | None:
-    """The pending job with the earliest next fire time, if any."""
-    best: tuple[Job, datetime] | None = None
-    for job in jobs:
-        due = compute_next(job, now)
-        if due is not None and (best is None or due < best[1]):
-            best = (job, due)
-    return best
-
-
-def advance(job: Job, ran_at: datetime) -> None:
-    """Record a successful run: repeat or finish."""
-    job.last_run = ran_at
-    if job.every is not None:
-        job.next_run = ran_at + timedelta(seconds=job.every)
-        job.status = "pending"
-    else:
-        job.next_run = None
-        job.status = "done"
 
 
 class Scheduler:

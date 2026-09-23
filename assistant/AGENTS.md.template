@@ -7,7 +7,8 @@ on first start and re-generated when the machine's fingerprint changes.
   a real probe** and must never be edited by hand or guessed by the model.
 - Everything else is the Operating Manual. Bootstrap writes this section once; a
   single tailoring turn may adapt it to the machine. Later hand-edits survive
-  re-bootstrap unless `--rebootstrap` is used.
+  re-bootstrap. To force a full re-probe and re-tailor, stop the bot, delete the
+  `fingerprint` key from `state.json`, and start it again.
 
 ---
 
@@ -67,12 +68,15 @@ The workspace root is the sandbox; you cannot read or write outside it.
 
 - `scratch/` — one-off scripts and throwaway files. Files here are pruned
   automatically after a few days, so nothing here is permanent.
+- `inbox/` — files the owner sends you. Read them, work on them, move or edit
+  them as the owner asks; new uploads land here unprompted.
 - `scripts/` — scripts worth keeping or reusing. If you write something twice,
   put it here with a short header comment saying what it does and how to run it.
 - `outbox/` — files meant for the owner. `send_file` only accepts paths that
   resolve inside the workspace; stage deliverables here.
 - `sessions/` — transcripts. Read-only for you; never edit them.
-- `jobs/` — scheduled work (see below).
+- `jobs/` — scheduled work (see below). Create and cancel jobs only with the
+  `schedule_job` / `unschedule_job` tools; never edit job files directly.
 - `skills/` — reusable instructions; consult a skill when its description matches
   the task.
 
@@ -92,6 +96,7 @@ than trivial. Name files descriptively and clean up after yourself.
 - `web_search` — Brave Search, for when you do not know the URL.
 - `ask` — ask the owner a question (see above).
 - `send_file` — deliver a file to the owner. The only way files leave the sandbox.
+- `schedule_job` / `unschedule_job` — deferred and recurring work (see below).
 
 ## Reporting to the owner
 
@@ -107,8 +112,9 @@ than trivial. Name files descriptively and clean up after yourself.
 
 ## Deferred and recurring work
 
-To run something later, write a job file into `jobs/` and tell the owner it is
-scheduled. A job is JSON:
+To run something later, call `schedule_job` and tell the owner it is scheduled.
+The tool writes a job file into `jobs/` for you — a strict JSON structure you
+never edit by hand:
 
 ```json
 {
@@ -122,10 +128,13 @@ scheduled. A job is JSON:
 }
 ```
 
-- `at` is a one-shot ISO timestamp; `every` is an interval in seconds. Use one.
+- Exactly one of `at` (ISO timestamp with offset), `at_local` (the owner's
+  wall time, resolved via `IMP_TZ`), or `every` (interval seconds) per job.
+- An existing `id` is replaced wholesale — that is how you reschedule.
 - Jobs run with a fresh context — they do not see this chat. Put everything the
   job needs into its `prompt`.
-- Keep job prompts self-contained and deliver results as messages.
+- Cancel with `unschedule_job`; the job file stays as a record.
+- Files the owner sends land in `inbox/` and stay there — jobs may read them.
 
 ## Housekeeping
 

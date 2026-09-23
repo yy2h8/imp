@@ -4,7 +4,6 @@ session holder (current Context + SessionWriter, resettable per D10)."""
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,12 +14,13 @@ from imp.adapters import FileSystemAdapter, HttpClient, SessionWriter
 from imp.agent import Agent, Context, build_system_prompt
 from imp.config import Config
 
-from .adapters.telegram import TelegramBot
-from .config import AssistantConfig
+from .adapters import SttClient, TelegramBot
+from .config import OPENROUTER_BASE_URL, AssistantConfig
 from .prompt import BASE_PROMPT
 from .tools import build_assistant_tools
+from .uploads import Uploads
 
-HOME_DIRS = ("skills", "sessions", "scratch", "scripts", "outbox", "jobs")
+HOME_DIRS = ("skills", "sessions", "scratch", "scripts", "outbox", "jobs", "inbox")
 
 RESET_NOTICE = (
     "Context was nearly full — started a fresh session. "
@@ -61,6 +61,10 @@ class AskRouter:
         else:
             self._held = text
 
+    def hold(self, text: str) -> None:
+        """Hold without ever resolving a pending ask (uploads mid-turn)."""
+        self._held = text
+
     def take(self) -> str | None:
         held, self._held = self._held, None
         return held
@@ -84,27 +88,19 @@ class Session:
         return cls(writer=writer, context=context)
 
 
+@dataclass(slots=True)
 class AssistantApp:
     """imp's Agent plus the assistant home concerns: session lifecycle,
-    usage thresholds, and the shared ask router."""
+    usage thresholds, the shared ask router, and the upload handler."""
 
-    def __init__(
-        self,
-        config: Config,
-        assistant: AssistantConfig,
-        agent: Agent,
-        session: Session,
-        bot: TelegramBot,
-        chat_id: int,
-        ask_router: AskRouter,
-    ) -> None:
-        self.config = config
-        self.assistant = assistant
-        self.agent = agent
-        self.session = session
-        self.bot = bot
-        self.chat_id = chat_id
-        self.ask_router = ask_router
+    config: Config
+    assistant: AssistantConfig
+    agent: Agent
+    session: Session
+    bot: TelegramBot
+    chat_id: int
+    ask_router: AskRouter
+    uploads: Uploads
 
     @property
     def usage(self) -> tuple[int, int]:
@@ -127,12 +123,9 @@ class AssistantApp:
 @asynccontextmanager
 async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
     """Compose the agent for the owner chat; owns http/bot/client lifetimes."""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY is not set. Export your provider API key and retry."
-        )
-    imp_config = Config(api_key=api_key, workspace=assistant_config.home)
+    imp_config = Config.from_env()
+    imp_config.workspace = assistant_config.home
+    imp_config.base_url = OPENROUTER_BASE_URL  # the only provider
     imp_config.auto_approve = True  # D3: the sandbox is the boundary in v1
 
     ensure_home(assistant_config.home)
@@ -176,6 +169,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 prompt_user=prompt_user,
                 http=http,
                 sender=sender,
+                tz=assistant_config.tz,
             )
             system_prompt = build_system_prompt(
                 str(imp_config.workspace),
@@ -192,6 +186,12 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 client=openai_client,
                 context=session.context,
             )
+            uploads = Uploads(
+                bot=bot,
+                inbox=assistant_config.home / "inbox",
+                stt=SttClient(openai_client, assistant_config.stt_model),
+                chat_id=chat_id,
+            )
             yield AssistantApp(
                 config=imp_config,
                 assistant=assistant_config,
@@ -200,6 +200,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 bot=bot,
                 chat_id=chat_id,
                 ask_router=ask_router,
+                uploads=uploads,
             )
     finally:
         await bot.close()
