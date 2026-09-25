@@ -31,9 +31,7 @@ class TestScheduleJob:
         assert job.status == "pending" and job.every is None
 
     async def test_at_requires_offset(self, tmp_path):
-        result = await make_tool(tmp_path).execute(
-            prompt="x", at="2026-09-24T08:00:00"
-        )
+        result = await make_tool(tmp_path).execute(prompt="x", at="2026-09-24T08:00:00")
         assert not result.ok
         assert "offset" in result.content
         assert load_jobs(tmp_path) == []
@@ -85,7 +83,9 @@ class TestScheduleJob:
         data["last_run"] = "2026-09-23T00:00:00+00:00"
         data["status"] = "error"
         path.write_text(json.dumps(data))
-        result = await tool.execute(prompt="v2", at="2026-09-25T08:00:00+00:00", id="digest")
+        result = await tool.execute(
+            prompt="v2", at="2026-09-25T08:00:00+00:00", id="digest"
+        )
         assert result.ok and "replaced" in result.content
         (job,) = load_jobs(tmp_path)
         assert job.prompt == "v2" and job.status == "pending"
@@ -114,7 +114,17 @@ class TestScheduleJob:
         await make_tool(tmp_path).execute(prompt="x", every=60, id="shaped")
         data = json.loads((tmp_path / "jobs" / "shaped.json").read_text())
         assert set(data) == {
-            "id", "prompt", "at", "every", "last_run", "next_run", "status",
+            "id",
+            "prompt",
+            "at",
+            "every",
+            "last_run",
+            "next_run",
+            "status",
+            "revision",
+            "result",
+            "delivery_error",
+            "transcript",
         }
         assert not list((tmp_path / "jobs").glob("*.tmp"))
 

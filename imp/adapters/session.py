@@ -17,13 +17,11 @@ class SessionWriter:
     """Appends each conversation message to a jsonl file, one line per message.
     Persistence only — the agent always runs from the in-memory Context."""
 
-    def __init__(
-        self, workspace: Path, sessions_dir: str | Path | None = None
-    ) -> None:
+    def __init__(self, workspace: Path, sessions_dir: str | Path | None = None) -> None:
         base = (
             Path(sessions_dir)
             if sessions_dir is not None
-            else workspace / ".imp" / "sessions"
+            else Path(".imp") / "sessions"
         )
         if not base.is_absolute():  # relative sessions_dir is workspace-relative
             base = workspace / base

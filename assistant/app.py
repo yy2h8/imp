@@ -1,11 +1,12 @@
 """build_assistant(): the composition root. Owns resource lifetimes and the
-session holder (current Context + SessionWriter, resettable per D10)."""
+session holder (current Context + SessionWriter, resettable)."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -15,6 +16,7 @@ from imp.agent import Agent, Context, build_system_prompt
 from imp.config import Config
 
 from .adapters import SttClient, TelegramBot
+from .adapters.telegram import send_text
 from .config import OPENROUTER_BASE_URL, AssistantConfig
 from .prompt import BASE_PROMPT
 from .tools import build_assistant_tools
@@ -35,41 +37,35 @@ def ensure_home(home: Path) -> None:
 
 
 class AskRouter:
-    """Routes the owner's next message to a pending `ask` tool call.
+    """Deliver an answer only to a question that is currently pending.
 
-    The poll loop hands every mid-turn message to deliver(); when a question
-    is outstanding it becomes that ask's answer, otherwise it is held until
-    one starts — a message that races the question resolves it instead of
-    deadlocking the turn. When the turn ends without asking, take() promotes
-    the held message to the next prompt (spec §4.1)."""
+    New prompts belong to PollLoop's persistent FIFO, never to a future ask.
+    """
 
     def __init__(self) -> None:
         self._future: asyncio.Future[str] | None = None
-        self._held: str | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._future is not None and not self._future.done()
 
     def start(self) -> asyncio.Future[str]:
         self._future = asyncio.get_running_loop().create_future()
-        if self._held is not None:  # the owner answered before we asked
-            held, self._held = self._held, None
-            self._future.set_result(held)
         return self._future
 
-    def deliver(self, text: str) -> None:
-        """Answer a pending ask, or hold the text for the next one."""
-        if self._future is not None and not self._future.done():
-            self._future.set_result(text)
-        else:
-            self._held = text
+    @property
+    def question(self) -> asyncio.Future[str] | None:
+        return self._future if self.pending else None
 
-    def hold(self, text: str) -> None:
-        """Hold without ever resolving a pending ask (uploads mid-turn)."""
-        self._held = text
-
-    def take(self) -> str | None:
-        held, self._held = self._held, None
-        return held
+    def deliver(self, text: str, question: asyncio.Future[str] | None = None) -> bool:
+        if not self.pending or (question is not None and self._future is not question):
+            return False
+        self._future.set_result(text)
+        return True
 
     def clear(self) -> None:
+        if self.pending:
+            self._future.cancel()
         self._future = None
 
 
@@ -101,6 +97,8 @@ class AssistantApp:
     chat_id: int
     ask_router: AskRouter
     uploads: Uploads
+    # ponytail: whole-turn lock; finer locks only if delayed jobs become unacceptable.
+    execution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def usage(self) -> tuple[int, int]:
@@ -110,11 +108,29 @@ class AssistantApp:
         used, maximum = self.usage
         return used >= maximum * self.assistant.reset_threshold
 
+    def build_prompt(self) -> str:
+        fs = FileSystemAdapter(
+            self.config.workspace,
+            skills_dir="skills",
+            max_bytes=self.config.max_http_bytes,
+        )
+        return build_system_prompt(
+            str(self.config.workspace),
+            fs.list_directory(level=1),
+            self.agent.tools,
+            fs.list_skills(),
+            fs.gather_project_context(),
+            base_prompt=BASE_PROMPT,
+        )
+
+    def refresh_prompt(self) -> None:
+        self.session.context.replace_system_prompt(self.build_prompt())
+
     def reset(self) -> str:
-        """Hard reset (D10): close the writer, open a fresh timestamped
-        transcript, rebuild the context with the same system prompt."""
+        """Hard reset: close the writer, open a fresh timestamped
+        transcript, rebuild the context from current instructions and skills."""
         self.session.writer.__exit__(None, None, None)
-        system_prompt = self.session.context.messages[0].content
+        system_prompt = self.build_prompt()
         self.session = Session.open(self.config, system_prompt)
         self.agent.context = self.session.context
         return self.session.writer.path.name
@@ -123,30 +139,34 @@ class AssistantApp:
 @asynccontextmanager
 async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
     """Compose the agent for the owner chat; owns http/bot/client lifetimes."""
-    imp_config = Config.from_env()
-    imp_config.workspace = assistant_config.home
-    imp_config.base_url = OPENROUTER_BASE_URL  # the only provider
-    imp_config.auto_approve = True  # D3: the sandbox is the boundary in v1
-
     ensure_home(assistant_config.home)
-    fs = FileSystemAdapter(imp_config.workspace, skills_dir="skills")
+    imp_config = Config.from_env(workspace=assistant_config.home)
+    imp_config.model = os.getenv("OPENAI_MODEL") or "openai/gpt-5-mini"
+    imp_config.base_url = OPENROUTER_BASE_URL  # the only provider
+    imp_config.auto_approve = (
+        True  # trusted host automation with service-account permissions
+    )
+
+    fs = FileSystemAdapter(
+        imp_config.workspace, skills_dir="skills", max_bytes=imp_config.max_http_bytes
+    )
 
     prompt_lock = asyncio.Lock()
     ask_router = AskRouter()
 
     async def prompt_user(message: str, markdown: bool = True) -> str:
-        # D3 seam: mutating-tool approvals auto-approve, so this is reached
+        # mutating-tool approvals auto-approve, so this is reached
         # only by the `ask` tool — send the question, await the owner's next
         # message; an empty answer means "use your best judgment".
         async with prompt_lock:
             future = ask_router.start()
             try:
-                await bot.send_message(chat_id, message)
+                await send_text(bot, chat_id, message)
                 return await future
             finally:
                 ask_router.clear()
 
-    bot = TelegramBot(assistant_config.bot_token)
+    bot = TelegramBot(assistant_config.bot_token, max_bytes=imp_config.max_http_bytes)
     try:
         async with (
             HttpClient(imp_config) as http,
@@ -158,7 +178,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
         ):
 
             async def sender(path: Path, caption: str) -> str | None:
-                data = await asyncio.to_thread(path.read_bytes)
+                data = await asyncio.to_thread(fs.read_bytes, path)
                 return await bot.send_document(
                     chat_id, data, filename=path.name, caption=caption
                 )
@@ -180,27 +200,33 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 base_prompt=BASE_PROMPT,
             )
             session = Session.open(imp_config, system_prompt)
-            agent = Agent(
-                config=imp_config,
-                tools=tools,
-                client=openai_client,
-                context=session.context,
-            )
-            uploads = Uploads(
-                bot=bot,
-                inbox=assistant_config.home / "inbox",
-                stt=SttClient(openai_client, assistant_config.stt_model),
-                chat_id=chat_id,
-            )
-            yield AssistantApp(
-                config=imp_config,
-                assistant=assistant_config,
-                agent=agent,
-                session=session,
-                bot=bot,
-                chat_id=chat_id,
-                ask_router=ask_router,
-                uploads=uploads,
-            )
+            app = None
+            try:
+                agent = Agent(
+                    config=imp_config,
+                    tools=tools,
+                    client=openai_client,
+                    context=session.context,
+                )
+                uploads = Uploads(
+                    bot=bot,
+                    inbox=assistant_config.home / "inbox",
+                    fs=fs,
+                    stt=SttClient(openai_client, assistant_config.stt_model),
+                    chat_id=chat_id,
+                )
+                app = AssistantApp(
+                    config=imp_config,
+                    assistant=assistant_config,
+                    agent=agent,
+                    session=session,
+                    bot=bot,
+                    chat_id=chat_id,
+                    ask_router=ask_router,
+                    uploads=uploads,
+                )
+                yield app
+            finally:
+                (app.session if app else session).writer.__exit__(None, None, None)
     finally:
         await bot.close()

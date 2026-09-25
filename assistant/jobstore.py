@@ -1,4 +1,4 @@
-"""The job store: pure data and functions over jobs/*.json (D8: stdlib only).
+"""The job store: pure data and functions over jobs/*.json (stdlib only).
 
 Split from scheduler.py so the schedule_job/unschedule_job tools can share the
 exact schema and validation without importing the app (app imports the tools —
@@ -9,15 +9,25 @@ stays UTC, local time exists only at the tool boundary via resolve_local_time.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import secrets
+import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-JOB_STATUSES = ("pending", "done", "error", "cancelled")
+from imp.adapters import FileSystemAdapter
+
+JOB_STATUSES = ("pending", "running", "done", "error", "cancelled")
+_STORE_LOCK = (
+    threading.RLock()
+)  # ponytail: one process/home; database if multiple writers are required
+_LOG = logging.getLogger(__name__)
 _ID_RE = re.compile(r"[a-z0-9-]{1,64}")
 
 
@@ -45,14 +55,25 @@ class Job:
     last_run: datetime | None = None
     next_run: datetime | None = None
     status: str = "pending"
+    revision: str = ""
+    result: str = ""
+    delivery_error: str = ""
+    transcript: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> Job:
+        if not isinstance(data, dict):
+            raise ValueError("Job must be a JSON object")  # noqa: TRY004
         every = data.get("every")
+        prompt = data.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Job prompt must be nonempty text")
+        if (data.get("at") is not None) == (every is not None):
+            raise ValueError("Job requires exactly one of at or every")
         status = str(data.get("status") or "pending")
         if status not in JOB_STATUSES:
             raise ValueError(f"unknown status: {status}")
-        if every is not None and int(every) <= 0:
+        if every is not None and (type(every) is not int or every <= 0):
             raise ValueError(f"every must be positive: {every}")
         job_id = str(data.get("id") or "").strip()
         if not _ID_RE.fullmatch(job_id):
@@ -65,6 +86,10 @@ class Job:
             last_run=_parse_ts(data.get("last_run")),
             next_run=_parse_ts(data.get("next_run")),
             status=status,
+            revision=str(data.get("revision") or ""),
+            result=str(data.get("result") or ""),
+            delivery_error=str(data.get("delivery_error") or ""),
+            transcript=str(data.get("transcript") or ""),
         )
 
     def to_dict(self) -> dict:
@@ -76,6 +101,10 @@ class Job:
             "last_run": _iso(self.last_run),
             "next_run": _iso(self.next_run),
             "status": self.status,
+            "revision": self.revision,
+            "result": self.result,
+            "delivery_error": self.delivery_error,
+            "transcript": self.transcript,
         }
 
 
@@ -84,16 +113,24 @@ def valid_id(job_id: str) -> bool:
 
 
 def load_jobs(home: Path) -> list[Job]:
+    with _STORE_LOCK:
+        return _load_jobs(home)
+
+
+def _load_jobs(home: Path) -> list[Job]:
     """Parse jobs/*.json; malformed or unsafely-named files are skipped."""
     jobs: list[Job] = []
     try:
-        paths = sorted((home / "jobs").glob("*.json"))
-    except OSError:
+        paths = sorted(FileSystemAdapter(home).resolve_path("jobs").glob("*.json"))
+    except (OSError, ValueError):
         return []
     for path in paths:
         try:
-            job = Job.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if path.is_symlink():
+                raise ValueError("Job symlinks are unsupported")
+            job = Job.from_dict(json.loads(FileSystemAdapter(home).read_bytes(path)))
         except (OSError, ValueError, TypeError):
+            _LOG.warning("Skipping invalid job file %s", path.name)
             continue
         # strict structure: the file name is the id (save_job guarantees it)
         if job.prompt and job.id == path.stem:
@@ -102,16 +139,47 @@ def load_jobs(home: Path) -> list[Job]:
 
 
 def save_job(home: Path, job: Job) -> None:
-    """Write jobs/<id>.json atomically: temp file, then os.replace."""
-    path = home / "jobs" / f"{job.id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(job.to_dict(), indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    with _STORE_LOCK:
+        if not valid_id(job.id):
+            raise ValueError("Invalid job id")
+        lexical = home / "jobs" / f"{job.id}.json"
+        if lexical.is_symlink():
+            raise ValueError("Job symlinks are unsupported")
+        path = FileSystemAdapter(home).resolve_path(lexical)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if job.status == "pending" and job.every and job.next_run is None:
+            job.next_run = (job.last_run or datetime.now(UTC)) + timedelta(
+                seconds=job.every
+            )
+        job.revision = secrets.token_hex(16)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as fh:
+            tmp = Path(fh.name)
+            try:
+                fh.write(json.dumps(job.to_dict(), indent=2) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+        try:
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def save_if_current(home: Path, job: Job, revision: str) -> bool:
+    with _STORE_LOCK:
+        current = next((item for item in load_jobs(home) if item.id == job.id), None)
+        if current is None or current.revision != revision:
+            return False
+        save_job(home, job)
+        return True
 
 
 def compute_next(job: Job, now: datetime) -> datetime | None:
-    """When ``job`` should run next, or None (D8: datetime/timedelta only).
+    """When ``job`` should run next, or None (datetime/timedelta only).
 
     An explicit ``next_run`` wins; a never-run ``at`` is the first fire time;
     ``every`` repeats from the last run (or from now on first sight).

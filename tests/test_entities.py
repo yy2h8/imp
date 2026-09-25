@@ -123,9 +123,9 @@ class TestAssistantMessage:
         }
         assert AssistantMessage.parse(item).content == "ab"
 
-    def test_parse_without_text_parts_gives_none(self):
+    def test_refusal_text_is_visible(self):
         item = {"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}
-        assert AssistantMessage.parse(item).content is None
+        assert AssistantMessage.parse(item).content == "no"
 
 
 class TestSimpleMessages:

@@ -58,8 +58,10 @@ class AssistantConfig:
             raise ValueError(
                 "IMP_TG_ALLOWED_USER_IDS must be comma-separated integers"
             ) from exc
-        if not allowed:
-            raise ValueError("IMP_TG_ALLOWED_USER_IDS must contain at least one id")
+        if len(allowed) != 1 or next(iter(allowed)) <= 0:
+            raise ValueError(
+                "IMP_TG_ALLOWED_USER_IDS must contain exactly one positive owner id"
+            )
 
         home = Path(os.getenv("IMP_HOME") or DEFAULT_HOME).expanduser().resolve()
         tz = os.getenv("IMP_TZ") or DEFAULT_TZ
@@ -86,20 +88,24 @@ class AssistantConfig:
                 raise ValueError(f"{name} must be a fraction in (0, 1)")
             return value
 
+        status_size = int(
+            os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
+        )
+        ttl = int(os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS)
+        if not 1 <= status_size <= 4096:
+            raise ValueError("IMP_TG_STATUS_MAX_CHARS must be in 1..4096")
+        if ttl <= 0:
+            raise ValueError("IMP_SCRATCH_TTL_DAYS must be positive")
         return cls(
             bot_token=token,
             allowed_user_ids=allowed,
             home=home,
             edit_interval=_float("IMP_TG_EDIT_INTERVAL", DEFAULT_EDIT_INTERVAL),
-            status_max_chars=int(
-                os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
-            ),
+            status_max_chars=status_size,
             reset_threshold=_fraction(
                 "IMP_SESSION_RESET_THRESHOLD", DEFAULT_RESET_THRESHOLD
             ),
-            scratch_ttl_days=int(
-                os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS
-            ),
+            scratch_ttl_days=ttl,
             stt_model=os.getenv("IMP_STT_MODEL") or DEFAULT_STT_MODEL,
             tz=tz,
         )

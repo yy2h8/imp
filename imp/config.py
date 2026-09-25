@@ -69,7 +69,9 @@ class Config:
     )
 
     @classmethod
-    def from_env(cls, auto_approve: bool | None = None) -> Config:
+    def from_env(
+        cls, auto_approve: bool | None = None, *, workspace: Path | None = None
+    ) -> Config:
         key = os.getenv("OPENAI_API_KEY", "").strip()
         if not key:
             raise ValueError(
@@ -77,7 +79,13 @@ class Config:
             )
 
         root = (
-            Path(os.getenv("IMP_WORKSPACE") or DEFAULT_WORKSPACE).expanduser().resolve()
+            Path(
+                workspace
+                if workspace is not None
+                else os.getenv("IMP_WORKSPACE") or DEFAULT_WORKSPACE
+            )
+            .expanduser()
+            .resolve()
         )
         if not root.is_dir():
             raise ValueError(f"Workspace is not a directory: {root}")

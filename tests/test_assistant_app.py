@@ -18,6 +18,7 @@ from assistant.app import (
     Session,
     ensure_home,
 )
+from assistant.bootstrap import read_state, write_state
 from assistant.config import AssistantConfig
 from assistant.main import PollLoop, TurnRunner, turn_summary
 from assistant.uploads import Uploads
@@ -138,7 +139,7 @@ def app(home: Path) -> AssistantApp:
         client=StubClient([]),
         context=session.context,
     )
-    return AssistantApp(
+    instance = AssistantApp(
         config=imp_config,
         assistant=assistant_config,
         agent=agent,
@@ -148,6 +149,11 @@ def app(home: Path) -> AssistantApp:
         ask_router=AskRouter(),
         uploads=Uploads(bot=None, inbox=home / "inbox"),
     )
+
+    try:
+        yield instance
+    finally:
+        instance.session.writer.__exit__(None, None, None)
 
 
 def script_client(app: AssistantApp, script: list) -> StubClient:
@@ -207,7 +213,9 @@ async def test_command_new_resets_session(app, home):
 
     await runner.run("/new")
 
-    assert bot.sent == [f"{RESET_NOTICE} New transcript: `{app.session.writer.path.name}`"]
+    assert bot.sent == [
+        f"Started a fresh session. Previous transcript is saved. New transcript: `{app.session.writer.path.name}`"
+    ]
     assert app.session.writer.path != old_transcript
     assert [m.role for m in app.agent.context.messages] == ["system"]
 
@@ -277,7 +285,11 @@ class UpdateBot(FakeBot):
 def owner_update(text: str, update_id: int = 100, user_id: int = 7) -> dict:
     return {
         "update_id": update_id,
-        "message": {"from": {"id": user_id}, "text": text},
+        "message": {
+            "from": {"id": user_id},
+            "chat": {"id": user_id, "type": "private"},
+            "text": text,
+        },
     }
 
 
@@ -298,7 +310,10 @@ async def run_poll_loop(bot, app, cycles: int) -> PollLoop:
 async def test_poll_loop_persists_offset_and_filters_non_owner(app, home):
     bot = UpdateBot(
         [
-            [owner_update("first", update_id=100), owner_update("stranger", user_id=99)],
+            [
+                owner_update("first", update_id=100),
+                owner_update("stranger", user_id=99),
+            ],
             [],
             [],
         ]
@@ -331,14 +346,18 @@ async def test_poll_loop_delivers_mid_turn_message_to_pending_ask(app, home):
 
     from imp.tools import build_tools
 
-    app.agent.tools = {"ask": build_tools(
-        config=app.config, fs=None, prompt_user=prompt_user, http=None
-    )["ask"]}
+    app.agent.tools = {
+        "ask": build_tools(
+            config=app.config, fs=None, prompt_user=prompt_user, http=None
+        )["ask"]
+    }
 
     loop = PollLoop(app, bot)
     await loop._handle_update(owner_update("start"))  # turn starts as a task
     await asyncio.sleep(0.05)  # let the turn reach the ask tool
-    await loop._handle_update(owner_update("the answer"))  # mid-turn: routes to ask
+    await loop._handle_update(
+        owner_update("the answer", update_id=101)
+    )  # mid-turn: routes to ask
     await loop.turn_task
 
     assert any("which one?" in text for text in bot.sent)  # the question went out
@@ -349,45 +368,159 @@ async def test_poll_loop_delivers_mid_turn_message_to_pending_ask(app, home):
     assert "got it" in bot.sent[-1]
 
 
-async def test_poll_loop_queues_message_racing_a_pending_ask(app, home):
-    """A message that lands between the turn starting and the ask tool
-    starting must not be lost and must not deadlock the turn (§4.1)."""
+async def test_messages_before_a_question_stay_queued(app):
     bot = FakeBot()
-
-    class SlowThenAskClient(StubClient):
-        async def _create(self, **kwargs):
-            self.calls.append(kwargs)
-            if len(self.calls) == 1:
-                await asyncio.sleep(0.2)  # the ask has not started yet
-                return response([function_call_item("1", "ask", {"question": "q?"})])
-            return response([message_item("done")])
-
-    client = SlowThenAskClient([])
-
-    async def prompt_user(message: str, markdown: bool = True) -> str:
-        future = app.ask_router.start()
-        await bot.send_message(app.chat_id, message)
-        return await future
-
-    from imp.tools import build_tools
-
-    app.agent.client = client
-    app.agent.tools = {"ask": build_tools(
-        config=app.config, fs=None, prompt_user=prompt_user, http=None
-    )["ask"]}
-
     loop = PollLoop(app, bot)
-    await loop._handle_update(owner_update("start"))
-    await asyncio.sleep(0.05)  # mid first (slow) model call; no ask pending yet
-    await loop._handle_update(owner_update("early reply"))  # must be held
-    await loop.turn_task
+    started = asyncio.Event()
+    ask_now = asyncio.Event()
+    asked = asyncio.Event()
+    prompts = []
+    answers = []
 
-    # the held message resolved the ask once it started
-    tool_messages = [
-        m for m in app.agent.context.messages if type(m).__name__ == "ToolMessage"
-    ]
-    assert any("early reply" in m.content for m in tool_messages)
-    assert "done" in bot.sent[-1]
+    async def run_turn(prompt):
+        prompts.append(prompt)
+        if prompt == "start":
+            started.set()
+            await ask_now.wait()
+            future = app.ask_router.start()
+            asked.set()
+            answers.append(await future)
+            app.ask_router.clear()
+
+    loop._run_turn = run_turn
+    await loop._handle_update(owner_update("start"))
+    await asyncio.wait_for(started.wait(), 2)
+    try:
+        await loop._handle_update(owner_update("next task", update_id=101))
+        ask_now.set()
+        await asyncio.wait_for(asked.wait(), 2)
+        assert answers == []
+        await loop._handle_update(owner_update("actual answer", update_id=102))
+        await asyncio.wait_for(loop.turn_task, 2)
+        assert answers == ["actual answer"]
+        assert prompts == ["start", "next task"]
+    finally:
+        loop.turn_task.cancel()
+        await asyncio.gather(loop.turn_task, return_exceptions=True)
+
+
+async def test_waiting_requests_survive_restart_in_fifo_order(app, home):
+    bot = UpdateBot([])
+    loop = PollLoop(app, bot)
+    started = asyncio.Event()
+
+    async def blocked_turn(prompt):
+        started.set()
+        await asyncio.Event().wait()
+
+    loop._run_turn = blocked_turn
+    await loop._handle_update(owner_update("running", update_id=100))
+    await asyncio.wait_for(started.wait(), 2)
+    try:
+        await loop._handle_update(owner_update("first waiting", update_id=101))
+        await loop._handle_update(owner_update("second waiting", update_id=102))
+        state = read_state(home)
+        assert state["offset"] == 103
+        assert state["active_request"] == "running"
+        assert state["pending_requests"] == ["first waiting", "second waiting"]
+    finally:
+        loop.turn_task.cancel()
+        await asyncio.gather(loop.turn_task, return_exceptions=True)
+
+    # A new loop reads disk. It must not execute the interrupted request.
+    resumed = PollLoop(app, bot)
+    completed = asyncio.Event()
+    prompts = []
+
+    async def record_turn(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 2:
+            completed.set()
+
+    resumed._run_turn = record_turn
+    task = asyncio.create_task(resumed.poll_forever())
+    try:
+        await asyncio.wait_for(completed.wait(), 2)
+        await asyncio.wait_for(resumed.turn_task, 2)
+        assert prompts == ["first waiting", "second waiting"]
+        assert any("interrupted" in message.lower() for message in bot.sent)
+        assert read_state(home)["active_request"] is None
+        assert read_state(home)["pending_requests"] == []
+        assert bot.polls[0] == 103
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_duplicate_update_does_not_repeat_work(app, home):
+    bot = FakeBot()
+    loop = PollLoop(app, bot)
+    prompts = []
+
+    async def record_turn(prompt):
+        prompts.append(prompt)
+
+    loop._run_turn = record_turn
+    update = owner_update("once", update_id=100)
+    await loop._handle_update(update)
+    await loop.turn_task
+    await loop._handle_update(update)
+    await loop.turn_task
+    assert prompts == ["once"]
+    assert read_state(home)["offset"] == 101
+
+
+async def test_failed_queue_write_does_not_acknowledge_or_run(app, home, monkeypatch):
+    write_state(home, {"offset": 100, "pending_requests": []})
+    loop = PollLoop(app, FakeBot())
+
+    def fail_write(home, updates):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("assistant.main.write_state", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        await loop._handle_update(owner_update("do not run", update_id=100))
+    assert loop.offset == 100
+    assert loop.turn_task is None
+    assert read_state(home)["offset"] == 100
+    assert read_state(home)["pending_requests"] == []
+
+
+async def test_worker_drains_without_waiting_for_long_poll(app, home):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    polling = asyncio.Event()
+
+    class BlockingPollBot(FakeBot):
+        async def get_updates(self, offset):
+            polling.set()
+            await asyncio.Event().wait()
+
+    write_state(home, {"pending_requests": ["first", "second"]})
+    loop = PollLoop(app, BlockingPollBot())
+    prompts = []
+
+    async def run_turn(prompt):
+        prompts.append(prompt)
+        if prompt == "first":
+            started.set()
+            await release.wait()
+        else:
+            finished.set()
+
+    loop._run_turn = run_turn
+    task = asyncio.create_task(loop.poll_forever())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(polling.wait(), 2)
+        release.set()
+        await asyncio.wait_for(finished.wait(), 2)
+        assert prompts == ["first", "second"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert loop.turn_task.done()
 
 
 # ------------------------------------------------------------------- uploads
@@ -410,6 +543,7 @@ class UploadBot(FakeBot):
 def document_update(file_id: str, name: str, caption: str | None = None) -> dict:
     message: dict = {
         "from": {"id": 7},
+        "chat": {"id": 7, "type": "private"},
         "document": {"file_id": file_id, "file_name": name, "file_size": 5},
     }
     if caption is not None:
@@ -433,6 +567,7 @@ async def test_upload_without_caption_saves_and_acks_only(app, home):
 
     loop = PollLoop(app, bot)
     await loop._handle_update(document_update("f1", "note.txt"))
+    await loop.turn_task
 
     assert (home / "inbox" / "note.txt").read_bytes() == b"hello"
     assert any("Saved inbox/note.txt" in text for text in bot.sent)
@@ -469,9 +604,11 @@ async def test_captioned_upload_mid_turn_is_held_not_answer(app, home):
 
     from imp.tools import build_tools
 
-    app.agent.tools = {"ask": build_tools(
-        config=app.config, fs=None, prompt_user=prompt_user, http=None
-    )["ask"]}
+    app.agent.tools = {
+        "ask": build_tools(
+            config=app.config, fs=None, prompt_user=prompt_user, http=None
+        )["ask"]
+    }
 
     loop = PollLoop(app, bot)
     ask_future = app.ask_router.start()  # simulate the ask tool waiting
@@ -481,7 +618,146 @@ async def test_captioned_upload_mid_turn_is_held_not_answer(app, home):
     await loop._handle_update(document_update("f1", "mid.txt", caption="look"))
 
     assert not ask_future.done()  # the upload never resolved the ask
-    assert app.ask_router.take() == (
-        "Owner sent a file, saved to inbox/mid.txt, with the note: look"
-    )
+    assert read_state(home)["pending_requests"] == [
+        {
+            "attachment": {
+                "document": {"file_id": "f1", "file_name": "mid.txt", "file_size": 5},
+                "caption": "look",
+            }
+        }
+    ]
+    app.ask_router.clear()
+    later_question = app.ask_router.start()
+    assert not later_question.done()
     loop.turn_task.cancel()
+    await asyncio.gather(loop.turn_task, return_exceptions=True)
+
+
+async def test_group_message_cannot_start_work(app):
+    loop = PollLoop(app, FakeBot())
+    update = owner_update("run")
+    update["message"]["chat"] = {"id": -42, "type": "group"}
+    await loop._handle_update(update)
+    assert loop.turn_task is None
+    assert loop.pending == []
+
+
+def test_command_prefix_is_not_a_command(app):
+    runner = TurnRunner(app, FakeBot(), 0, 3500)
+    assert runner._command_reply("/newsletter") is None
+
+
+async def test_upload_intake_does_not_download_while_asking(app):
+    loop = PollLoop(app, FakeBot())
+    future = app.ask_router.start()
+    loop.turn_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def forbidden(message):
+        raise AssertionError("polling must not download")
+
+    app.uploads.handle = forbidden
+    try:
+        await loop._handle_update(document_update("file", "file.txt"))
+        await loop._handle_update(owner_update("answer", update_id=201))
+        assert future.result() == "answer"
+        assert len(loop.pending) == 1
+    finally:
+        loop.turn_task.cancel()
+        await asyncio.gather(loop.turn_task, return_exceptions=True)
+
+
+async def test_execution_lock_keeps_waiting_request_durable(app, home):
+    loop = PollLoop(app, FakeBot())
+    async with app.execution_lock:
+        await loop._handle_update(owner_update("waiting"))
+        await asyncio.sleep(0)
+        assert read_state(home)["pending_requests"] == ["waiting"]
+        assert read_state(home).get("active_request") is None
+        loop.turn_task.cancel()
+        await asyncio.gather(loop.turn_task, return_exceptions=True)
+
+
+async def test_failed_recovery_notice_preserves_active_marker(app, home):
+    from assistant.adapters.telegram import TelegramError
+
+    class FailedBot(FakeBot):
+        async def send_message(self, *args):
+            return None
+
+    write_state(
+        home, {"active_request": "previous work", "pending_requests": ["waiting"]}
+    )
+    with pytest.raises(TelegramError):
+        await PollLoop(app, FailedBot()).poll_forever()
+    assert read_state(home)["active_request"] == "previous work"
+    assert read_state(home)["pending_requests"] == ["waiting"]
+
+
+async def test_empty_final_does_not_repeat_commentary(app):
+    bot = FakeBot()
+    script_client(
+        app,
+        [
+            response([message_item("Working"), function_call_item("one", "fake", {})]),
+            response([]),
+        ],
+    )
+    await TurnRunner(app, bot, 0, 3500).run("go")
+    assert "Working" not in bot.sent
+
+
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"photo": []},
+        {"document": []},
+        {"voice": {}},
+        {"document": {"file_id": 4}},
+        {"document": {"file_id": "ok"}, "caption": []},
+    ],
+)
+def test_malformed_attachment_state_is_rejected(app, home, attachment):
+    write_state(home, {"pending_requests": [{"attachment": attachment}]})
+    with pytest.raises(ValueError, match="queue"):
+        PollLoop(app, FakeBot())
+
+
+async def test_corrupt_queue_stops_before_startup(tmp_path, monkeypatch):
+    import assistant.main as main_module
+
+    config = AssistantConfig(
+        bot_token="t", allowed_user_ids=frozenset({7}), home=tmp_path
+    )
+    monkeypatch.setattr(main_module.AssistantConfig, "from_env", lambda: config)
+    write_state(tmp_path, {"pending_requests": [{"attachment": {"photo": []}}]})
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("tailoring must not start")
+
+    monkeypatch.setattr(main_module, "startup", forbidden)
+    with pytest.raises(ValueError, match="queue"):
+        await main_module.run_bot()
+
+
+async def test_answer_cannot_jump_to_next_question_during_save(app, monkeypatch):
+    loop = PollLoop(app, FakeBot())
+    loop.turn_task = asyncio.create_task(asyncio.Event().wait())
+    app.ask_router.start()
+    original = loop._save
+    next_question = []
+
+    async def save_and_change_question(**updates):
+        await original(**updates)
+        if not next_question:
+            app.ask_router.clear()
+            next_question.append(app.ask_router.start())
+
+    monkeypatch.setattr(loop, "_save", save_and_change_question)
+    try:
+        await loop._handle_update(owner_update("for first question"))
+        assert not next_question[0].done()
+        assert loop.pending == ["for first question"]
+    finally:
+        app.ask_router.clear()
+        loop.turn_task.cancel()
+        await asyncio.gather(loop.turn_task, return_exceptions=True)

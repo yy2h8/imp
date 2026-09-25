@@ -6,7 +6,6 @@ from typing import Any, ClassVar
 from lxml import html
 from lxml.html import clean
 
-from ..adapters.http import validate_url
 from .base import Tool, ToolResult
 
 
@@ -53,7 +52,6 @@ class WebFetch(Tool):
     }
 
     async def execute(self, url: str) -> ToolResult:
-        await validate_url(url)
         # lazy: a truncation marker landing after a complete </html> is dropped by the
         # parser; the common mid-cut case keeps it. Upgrade: re-append marker in WebFetch.
         raw_html = await self.http.get(

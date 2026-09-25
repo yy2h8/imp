@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
 from openai import AsyncOpenAI
 
 from ..config import Config
-from ..entities import ReasoningMessage, TextMessage
+from ..entities import ReasoningMessage, TextMessage, ToolCall, ToolMessage
 from ..events import AgentEvent, EventType
 from ..tools import Tool
 from .context import Context
@@ -29,6 +30,24 @@ class Agent:
     async def run_turn(self, prompt: str) -> AsyncIterator[AgentEvent]:
         """Run a single turn of the ReAct loop with the given prompt."""
 
+        try:
+            async with aclosing(self._run_turn(prompt)) as events:
+                async for event in events:
+                    yield event
+        finally:
+            completed = {
+                m.call_id for m in self.context.messages if isinstance(m, ToolMessage)
+            }
+            for message in list(self.context.messages):
+                if isinstance(message, ToolCall) and message.call_id not in completed:
+                    self.context.append(
+                        ToolMessage(
+                            call_id=message.call_id,
+                            content="Interrupted; execution outcome unknown. Inspect state before retrying actions.",
+                        )
+                    )
+
+    async def _run_turn(self, prompt: str) -> AsyncIterator[AgentEvent]:
         self.context.append(TextMessage(role="user", content=prompt))
         if not self.context.is_within_token_limit():
             yield AgentEvent(
@@ -72,10 +91,11 @@ class Agent:
             if not reply.tool_calls:
                 return  # final response, no tool calls, exit the loop
 
-            async for event in execute_tool_batch(
-                self.tools, reply.tool_calls, self.context
-            ):
-                yield event
+            async with aclosing(
+                execute_tool_batch(self.tools, reply.tool_calls, self.context)
+            ) as events:
+                async for event in events:
+                    yield event
 
             if not self.context.is_within_token_limit():
                 yield AgentEvent(

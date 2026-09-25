@@ -225,7 +225,9 @@ class TestSkillsDirSeam:
             '---\nname: weather\ndescription: "forecast lookup"\n---\nbody'
         )
         adapter = FileSystemAdapter(workspace, skills_dir="skills")
-        assert adapter.list_skills() == [("weather", "forecast lookup")]
+        assert adapter.list_skills() == [
+            ("weather", "forecast lookup", "skills/weather/SKILL.md")
+        ]
 
     def test_imp_skills_ignored_when_seam_is_redirected(self, workspace):
         legacy = workspace / ".imp" / "skills" / "legacy"
@@ -235,3 +237,32 @@ class TestSkillsDirSeam:
         )
         adapter = FileSystemAdapter(workspace, skills_dir="skills")
         assert adapter.list_skills() == []
+
+
+def test_skill_link_outside_is_not_discovered(tmp_path):
+    from imp.adapters import FileSystemAdapter
+
+    home = tmp_path / "home"
+    skill = home / ".imp/skills/link"
+    skill.mkdir(parents=True)
+    secret = tmp_path / "secret"
+    secret.write_text("---\nname: secret\ndescription: outside\n---")
+    (skill / "SKILL.md").symlink_to(secret)
+    assert FileSystemAdapter(home).list_skills() == []
+
+
+def test_bounded_text_and_replace(tmp_path):
+    from imp.adapters import FileSystemAdapter
+
+    fs = FileSystemAdapter(tmp_path, max_bytes=16)
+    (tmp_path / "huge").write_text("x" * 17)
+    with pytest.raises(ValueError, match="limit"):
+        fs.read_text_file("huge")
+    with pytest.raises(ValueError, match="limit"):
+        fs.str_replace("huge", "x", "y")
+
+
+def test_paged_read_keeps_only_requested_range(tmp_path):
+    fs = FileSystemAdapter(tmp_path, max_bytes=16)
+    (tmp_path / "many").write_text("line\n" * 10000)
+    assert fs.read_text_file("many", start_line=9000, end_line=9001) == "line\nline\n"

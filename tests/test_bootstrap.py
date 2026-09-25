@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from test_agent import StubClient, function_call_item, message_item, response
 
+from assistant.app import Session
 from assistant.bootstrap import (
     ENV_BEGIN,
     ENV_END,
@@ -20,6 +25,13 @@ from assistant.bootstrap import (
     tailor_manual,
     write_state,
 )
+from assistant.config import AssistantConfig
+from assistant.main import startup
+from imp.adapters import FileSystemAdapter
+from imp.agent import Agent
+from imp.config import Config
+from imp.tools.ask import Ask
+from imp.tools.fs import StrReplace
 
 MINIMAL_TEMPLATE = (
     "# manual\n\n"
@@ -60,7 +72,7 @@ class TestProbe:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.delenv("BRAVE_API_KEY", raising=False)
         probe = Probe.take(tmp_path)
-        assert probe.os_name == "Linux"
+        assert probe.os_name == platform.system()
         assert probe.arch
         assert probe.python_version
         assert probe.python_path
@@ -109,8 +121,20 @@ class TestRenderManual:
     def test_preserves_hand_edits_outside_the_block(self):
         assert "keep this" in render_manual(MINIMAL_TEMPLATE, "- Fact: value")
 
-    def test_malformed_template_returned_verbatim(self):
-        assert render_manual("no markers here", "- Fact: value") == "no markers here"
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "no markers here",
+            f"{ENV_BEGIN}\nowner instructions without a closing marker",
+            f"{ENV_END}\n{ENV_BEGIN}\nowner instructions with reversed markers",
+        ],
+    )
+    def test_malformed_template_returned_verbatim(self, template):
+        assert render_manual(template, "- Fact: value") == template
+
+    def test_refresh_does_not_accumulate_blank_lines(self):
+        rendered = render_manual(MINIMAL_TEMPLATE, "- Fact: value")
+        assert render_manual(rendered, "- Fact: value") == rendered
 
     def test_header_outside_block_survives(self):
         template = "HEAD\n<!-- ENVIRONMENT:BEGIN -->x<!-- ENVIRONMENT:END -->\nTAIL"
@@ -128,9 +152,22 @@ class TestState:
     def test_missing_file_reads_as_empty(self, tmp_path):
         assert read_state(tmp_path) == {}
 
-    def test_corrupt_file_reads_as_empty(self, tmp_path):
+    def test_corrupt_state_is_rejected(self, tmp_path):
         (tmp_path / "state.json").write_text("not json")
-        assert read_state(tmp_path) == {}
+        with pytest.raises(ValueError, match="state.json"):
+            read_state(tmp_path)
+
+    def test_failed_state_replace_keeps_previous_state(self, tmp_path, monkeypatch):
+        write_state(tmp_path, {"offset": 12, "pending_requests": ["waiting"]})
+
+        def fail_replace(source, destination):
+            raise OSError("disk failure")
+
+        monkeypatch.setattr("assistant.bootstrap.os.replace", fail_replace)
+        with pytest.raises(OSError, match="disk failure"):
+            write_state(tmp_path, {"offset": 13, "pending_requests": []})
+        assert read_state(tmp_path) == {"offset": 12, "pending_requests": ["waiting"]}
+        assert list(tmp_path.iterdir()) == [tmp_path / "state.json"]
 
 
 class TestRunBootstrap:
@@ -181,6 +218,35 @@ class TestRunBootstrap:
         assert result.changed is False
         assert (home / "AGENTS.md").read_text() == "hand-edited manual"
 
+    @pytest.mark.parametrize("force", [False, True])
+    def test_refresh_preserves_owner_edits_and_requires_tailoring(
+        self, tmp_path, package_dir, force
+    ):
+        run_bootstrap(tmp_path, package_dir, probe=make_probe())
+        manual = tmp_path / "AGENTS.md"
+        manual.write_text(manual.read_text().replace("keep this", "OWNER INSTRUCTION"))
+        write_state(tmp_path, {"tailored": True, "offset": 42})
+
+        result = run_bootstrap(
+            tmp_path, package_dir, probe=make_probe(ram="256 MB"), force=force
+        )
+
+        assert result.changed
+        assert "OWNER INSTRUCTION" in manual.read_text()
+        assert "256 MB" in manual.read_text()
+        assert needs_tailoring(read_state(tmp_path))
+        assert read_state(tmp_path)["offset"] == 42
+
+    def test_missing_manual_is_recreated_with_matching_fingerprint(
+        self, tmp_path, package_dir
+    ):
+        probe = make_probe()
+        write_state(tmp_path, {"fingerprint": probe.fingerprint(), "tailored": True})
+
+        assert run_bootstrap(tmp_path, package_dir, probe=probe).changed
+        assert "512 MB" in (tmp_path / "AGENTS.md").read_text()
+        assert needs_tailoring(read_state(tmp_path))
+
     def test_load_template_missing_raises_runtime_error(self, tmp_path):
         with pytest.raises(RuntimeError, match="Cannot read template"):
             load_template(tmp_path / "no-such-dir")
@@ -228,40 +294,127 @@ def test_needs_tailoring():
     assert needs_tailoring({"tailored": True}) is False
 
 
-class _StubAgent:
-    def __init__(self):
-        self.prompts: list[str] = []
-
-    async def run_turn(self, prompt):
-        self.prompts.append(prompt)
-        yield "event"
-
-
-async def test_tailor_manual_runs_one_turn_with_probe_facts(tmp_path):
-    from assistant.app import AssistantApp
-    from imp.config import Config
-
-    agent = _StubAgent()
-    app = AssistantApp.__new__(AssistantApp)  # tailor_manual only touches these
-    app.agent = agent
-    app.config = Config(api_key="k", workspace=tmp_path)
-
-    await tailor_manual(app, make_probe())
-
-    assert len(agent.prompts) == 1
-    prompt = agent.prompts[0]
-    assert "512 MB" in prompt  # real probe facts only
-    assert "never" in prompt.lower()  # forbidden to invent
+@pytest.fixture
+def tailoring_app(tmp_path):
+    config = Config(api_key="k", workspace=tmp_path, auto_approve=True)
+    session = Session.open(config, "system prompt")
+    client = StubClient([])
+    fs = FileSystemAdapter(tmp_path)
+    app = SimpleNamespace(
+        config=config,
+        agent=Agent(
+            config=config,
+            tools={StrReplace.name: StrReplace(config=config, fs=fs)},
+            client=client,
+            context=session.context,
+        ),
+    )
+    (tmp_path / "AGENTS.md").write_text(MINIMAL_TEMPLATE)
+    try:
+        yield app
+    finally:
+        session.writer.__exit__(None, None, None)
 
 
-async def test_tailor_manual_writes_tailored_flag(tmp_path):
-    from assistant.app import AssistantApp
-    from imp.config import Config
+async def test_tailor_manual_edits_file_and_marks_success(tailoring_app, tmp_path):
+    client = tailoring_app.agent.client
+    client.script = [
+        response(
+            [
+                function_call_item(
+                    "edit",
+                    StrReplace.name,
+                    {
+                        "path": "AGENTS.md",
+                        "old": "keep this",
+                        "new": "Use small scripts.",
+                    },
+                )
+            ]
+        ),
+        response([message_item("Manual adapted.")]),
+    ]
 
-    app = AssistantApp.__new__(AssistantApp)
-    app.agent = _StubAgent()
-    app.config = Config(api_key="k", workspace=tmp_path)  # sandbox root == home
+    await tailor_manual(tailoring_app, make_probe())
 
-    await tailor_manual(app, make_probe())
-
+    assert "Use small scripts." in (tmp_path / "AGENTS.md").read_text()
     assert read_state(tmp_path)["tailored"] is True
+    assert "512 MB" in client.calls[0]["input"][1]["content"]
+
+
+@pytest.mark.parametrize("reply", [RuntimeError("provider down"), response([])])
+async def test_failed_tailoring_remains_pending(tailoring_app, tmp_path, reply):
+    write_state(tmp_path, {"tailored": True})
+    tailoring_app.agent.client.script = [reply]
+
+    with pytest.raises(RuntimeError):
+        await tailor_manual(tailoring_app, make_probe())
+
+    assert needs_tailoring(read_state(tmp_path))
+
+
+async def test_tailoring_cannot_ask_before_polling_starts(tailoring_app):
+    questions = []
+
+    async def prompt_user(question):
+        questions.append(question)
+        return "reply"
+
+    ask = Ask(prompt_user=prompt_user)
+    tailoring_app.agent.tools[Ask.name] = ask
+    client = tailoring_app.agent.client
+    client.script = [
+        response(
+            [function_call_item("question", Ask.name, {"question": "Which shell?"})]
+        ),
+        response([message_item("Used the probed facts.")]),
+    ]
+
+    await tailor_manual(tailoring_app, make_probe())
+
+    assert questions == []
+    assert Ask.name not in {tool["name"] for tool in client.calls[0]["tools"]}
+    assert client.calls[1]["input"][-1]["output"] == f"Tool not found: {Ask.name}"
+    assert tailoring_app.agent.tools[Ask.name] is ask
+
+
+async def test_startup_retries_failed_tailoring_then_skips_success(
+    tailoring_app, tmp_path, monkeypatch
+):
+    probe = make_probe()
+    monkeypatch.setattr(Probe, "take", lambda workspace: probe)
+    write_state(tmp_path, {"fingerprint": probe.fingerprint(), "tailored": False})
+    config = AssistantConfig(
+        bot_token="fake", allowed_user_ids=frozenset({7}), home=tmp_path
+    )
+    tailoring_app.assistant = config
+    client = tailoring_app.agent.client
+    client.script = [
+        RuntimeError("provider down"),
+        response([message_item("Adapted.")]),
+    ]
+    notices = []
+
+    async def send_message(chat_id, text):
+        notices.append(text)
+        return 1
+
+    tailoring_app.bot = SimpleNamespace(send_message=send_message)
+    builds = []
+
+    @asynccontextmanager
+    async def build(config, chat_id):
+        builds.append(chat_id)
+        yield tailoring_app
+
+    monkeypatch.setattr("assistant.main.build_assistant", build)
+
+    await startup(config, 7, force=False)
+    assert len(client.calls) == 1
+    assert needs_tailoring(read_state(tmp_path))
+    assert any("failed" in notice.lower() for notice in notices)
+    await startup(config, 7, force=False)
+    assert read_state(tmp_path)["tailored"] is True
+    await startup(config, 7, force=False)
+    assert len(client.calls) == 2
+    assert builds == [7, 7]

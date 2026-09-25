@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
+from ..config import DEFAULT_MAX_HTTP_BYTES
+
 
 def _is_text(path: Path) -> bool:
     try:
@@ -46,12 +48,15 @@ def parse_skill_frontmatter(path: Path) -> tuple[str, str] | None:
     """Extract just the YAML frontmatter from a SKILL.md, without reading
     the full file body into memory."""
     with path.open("r", encoding="utf-8") as f:
-        first = f.readline()
+        first = f.readline(65537)
         if first.strip() != "---":
             return None  # no frontmatter, skip
 
         fields: dict[str, str] = {}
-        for line in f:
+        for _ in range(128):
+            line = f.readline(65537)
+            if not line or len(line) > 65536:
+                return None
             stripped = line.strip()
             if stripped == "---":
                 break
@@ -74,10 +79,15 @@ class FileSystemAdapter:
     CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md")
 
     def __init__(
-        self, workspace: Path, skills_dir: str | Path = ".imp/skills"
+        self,
+        workspace: Path,
+        skills_dir: str | Path = ".imp/skills",
+        *,
+        max_bytes: int = DEFAULT_MAX_HTTP_BYTES,
     ) -> None:
         self.workspace = workspace.resolve()
         self.skills_dir = skills_dir
+        self.max_bytes = max_bytes
 
     def resolve_path(self, value: str | Path, must_exist: bool = False) -> Path:
         path = (self.workspace / value).resolve()
@@ -147,15 +157,19 @@ class FileSystemAdapter:
             if not f.is_file():
                 continue
             try:
+                f = self.resolve_path(f, must_exist=True)
+            except (OSError, ValueError):
+                continue
+            try:
                 meta = parse_skill_frontmatter(f)
             except (OSError, UnicodeDecodeError, ValueError):
                 meta = None
             if not meta:
                 skills.append(
-                    (str(f.parent.name),)
+                    (str(f.parent.name), "", str(f.relative_to(self.workspace)))
                 )  # fallback to directory name if frontmatter is missing or malformed
                 continue
-            skills.append(meta)
+            skills.append((*meta, str(f.relative_to(self.workspace))))
         return skills
 
     def read_text_file(
@@ -172,13 +186,23 @@ class FileSystemAdapter:
         if not _is_text(file_path):
             raise ValueError(f"File {file_path} appears to be binary or non-text")
 
-        with file_path.open("r", encoding="utf-8") as fh:
-            lines = fh.readlines()
-
-        total = len(lines)
         start = max(1, start_line)
         end = max(end_line, 0) if end_line is not None else None
-        selection = lines[start - 1 : end]
+        selection, total, size = [], 0, 0
+        with file_path.open("rb") as fh:
+            while raw := fh.readline(self.max_bytes + 1):
+                if len(raw) > self.max_bytes:
+                    raise ValueError(
+                        "File line exceeds byte limit; use a shell extraction command"
+                    )
+                total += 1
+                if total >= start and (end is None or total <= end):
+                    size += len(raw)
+                    if size > self.max_bytes:
+                        raise ValueError(
+                            "Read exceeds byte limit; request a smaller line range"
+                        )
+                    selection.append(raw.decode("utf-8"))
 
         if not line_numbers:
             return "".join(selection)
@@ -207,6 +231,27 @@ class FileSystemAdapter:
             )
         return "\n\n".join(sections) if sections else ""
 
+    def read_bytes(self, path: str | Path) -> bytes:
+        resolved = self.resolve_path(path, must_exist=True)
+        if not resolved.is_file():
+            raise ValueError("Expected a regular file")
+        with resolved.open("rb") as fh:
+            data = fh.read(self.max_bytes + 1)
+        if len(data) > self.max_bytes:
+            raise ValueError(f"File exceeds byte limit ({self.max_bytes})")
+        return data
+
+    def create_bytes(self, path: str | Path, data: bytes) -> Path:
+        if len(data) > self.max_bytes:
+            raise ValueError(f"File exceeds byte limit ({self.max_bytes})")
+        lexical = self.workspace / path
+        if lexical.is_symlink():
+            raise FileExistsError(str(lexical))
+        resolved = self.resolve_path(path)
+        with resolved.open("xb") as fh:
+            fh.write(data)
+        return resolved
+
     def write_text_file(self, path: str, content: str) -> str:
         p = self.resolve_path(path)
         existed = p.exists()
@@ -222,7 +267,7 @@ class FileSystemAdapter:
         if not p.is_file():
             raise IsADirectoryError(f"Path {p} is not a file")
 
-        old_text = p.read_text(encoding="utf-8")
+        old_text = self.read_bytes(p).decode("utf-8")
         count = old_text.count(old)
         if count == 0:
             first = next((ln for ln in old.splitlines() if ln.strip()), "")

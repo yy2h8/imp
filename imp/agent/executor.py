@@ -51,47 +51,58 @@ async def execute_tool_batch(
     reads = [c for c in calls if not is_mutating(c.function_name)]
     writes = [c for c in calls if is_mutating(c.function_name)]
 
-    for call in reads:
-        yield AgentEvent(
-            type=EventType.TOOL_START,
-            token_usage=context.get_usage(),
-            tool_name=call.function_name,
-            tool_args=call.arguments,
-        )
-    results: dict[int, ToolResult] = {}  # keyed by object: duplicate call_ids can't collide
-    for finished in asyncio.as_completed([run(c) for c in reads]):
-        call, result = await finished
-        results[id(call)] = result
-        yield AgentEvent(
-            type=EventType.TOOL_RESULT,
-            tool_result=result,
-            token_usage=context.get_usage(),
-            tool_name=call.function_name,
-        )
-
-    for call in writes:
-        yield AgentEvent(
-            type=EventType.TOOL_START,
-            token_usage=context.get_usage(),
-            tool_name=call.function_name,
-            tool_args=call.arguments,
-        )
-        result = await execute_call(tools, call.function_name, call.arguments)
-        results[id(call)] = result
-        yield AgentEvent(
-            type=EventType.TOOL_RESULT,
-            tool_result=result,
-            token_usage=context.get_usage(),
-            tool_name=call.function_name,
-        )
-
-    for call in calls:
-        context.append(
-            ToolMessage(
-                content=_truncate_tool_output(
-                    results[id(call)].content,
-                    context.config.max_tool_output,
-                ),
-                call_id=call.call_id,
+    results: dict[int, ToolResult] = {}
+    try:
+        for call in reads:
+            yield AgentEvent(
+                type=EventType.TOOL_START,
+                token_usage=context.get_usage(),
+                tool_name=call.function_name,
+                tool_args=call.arguments,
             )
-        )
+        tasks = [asyncio.create_task(run(c)) for c in reads]
+        try:
+            for finished in asyncio.as_completed(tasks):
+                call, result = await finished
+                results[id(call)] = result
+                yield AgentEvent(
+                    type=EventType.TOOL_RESULT,
+                    tool_result=result,
+                    token_usage=context.get_usage(),
+                    tool_name=call.function_name,
+                )
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        for call in writes:
+            yield AgentEvent(
+                type=EventType.TOOL_START,
+                token_usage=context.get_usage(),
+                tool_name=call.function_name,
+                tool_args=call.arguments,
+            )
+            result = await execute_call(tools, call.function_name, call.arguments)
+            results[id(call)] = result
+            yield AgentEvent(
+                type=EventType.TOOL_RESULT,
+                tool_result=result,
+                token_usage=context.get_usage(),
+                tool_name=call.function_name,
+            )
+
+    finally:
+        for call in calls:
+            result = results.get(id(call))
+            context.append(
+                ToolMessage(
+                    call_id=call.call_id,
+                    content=_truncate_tool_output(
+                        result.content
+                        if result is not None
+                        else "Interrupted; execution outcome unknown. Inspect state before retrying actions.",
+                        context.config.max_tool_output,
+                    ),
+                )
+            )

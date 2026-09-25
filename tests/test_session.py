@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from imp.adapters.session import SessionWriter
 from imp.entities import TextMessage
@@ -40,3 +41,8 @@ def test_sessions_dir_seam_absolute_path(tmp_path):
         writer.write(TextMessage(role="user", content="x"))
     assert writer.path.parent == elsewhere
     assert elsewhere.joinpath(writer.path.name).exists()
+
+
+def test_relative_workspace_default_sessions():
+    writer = SessionWriter(Path("workspace"))
+    assert writer.path.parent == Path("workspace/.imp/sessions")

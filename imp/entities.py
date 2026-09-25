@@ -26,7 +26,7 @@ class ToolCall:
 
     @classmethod
     def parse(cls, data: dict[str, Any]) -> ToolCall:
-        arguments = data.get("arguments") or {}
+        arguments = data.get("arguments", {})
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments) if arguments.strip() else {}
@@ -34,6 +34,13 @@ class ToolCall:
                 raise ValueError(
                     f"Tool call {data.get('call_id')} returned invalid JSON arguments"
                 ) from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool arguments must be a JSON object")  # noqa: TRY004
+        if any(
+            not isinstance(data.get(key), str) or not data[key].strip()
+            for key in ("call_id", "name")
+        ):
+            raise ValueError("Tool call id and name must be nonempty strings")
         return ToolCall(
             call_id=data["call_id"],
             function_name=data["name"],
@@ -76,9 +83,13 @@ class AssistantMessage:
     @classmethod
     def parse(cls, data: dict[str, Any]) -> AssistantMessage:
         text = "".join(
-            part.get("text", "")
+            (
+                part.get("text", "")
+                if part.get("type") == "output_text"
+                else part.get("refusal", "")
+            )
             for part in data.get("content") or []
-            if part.get("type") == "output_text"
+            if part.get("type") in {"output_text", "refusal"}
         )
         return cls(content=text or None, item=data)
 

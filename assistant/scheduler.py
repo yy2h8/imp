@@ -1,4 +1,4 @@
-"""Internal asyncio scheduler over jobs/*.json (D8: no host cron, stdlib only).
+"""Internal asyncio scheduler over jobs/*.json (no host cron, stdlib only).
 
 A single task sleeps until the earliest due job, runs it in a fresh context
 (a job never inherits or pollutes the interactive chat), delivers the result
@@ -13,16 +13,19 @@ side.
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import aclosing
 from datetime import UTC, datetime
 from pathlib import Path
 
 from imp.agent import Agent, EventType
+from imp.tools.ask import Ask
 
+from .adapters.telegram import send_text
 from .app import AssistantApp, Session
-from .jobstore import Job, advance, load_jobs, next_due, save_job
+from .jobstore import Job, advance, load_jobs, next_due, save_if_current
 
 IDLE_POLL_S = 30.0  # re-read jobs/ this often while nothing is due
-MAX_SLEEP_S = 3600.0  # re-check at least hourly (clock drift, edited jobs)
 
 
 class Scheduler:
@@ -36,64 +39,99 @@ class Scheduler:
         return self.app.assistant.home
 
     async def run(self) -> None:
+        for job in await asyncio.to_thread(load_jobs, self.home):
+            if job.status == "running":
+                revision = job.revision
+                job.status = "error"
+                job.result = "Interrupted by shutdown; actions may already have occurred. Reschedule manually."
+                job.next_run = None
+                if await asyncio.to_thread(save_if_current, self.home, job, revision):
+                    await self._deliver(job)
         while True:
             try:
                 await self._cycle()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                await asyncio.sleep(IDLE_POLL_S)  # §7: a failure never stops us
+                logging.getLogger(__name__).exception("Scheduler cycle failed")
+                await asyncio.sleep(IDLE_POLL_S)  # a failure never stops us
 
     async def _cycle(self) -> None:
-        due = next_due(load_jobs(self.home), datetime.now(UTC))
+        jobs = await asyncio.to_thread(load_jobs, self.home)
+        for job in jobs:
+            if job.status == "pending" and job.every and job.next_run is None:
+                await asyncio.to_thread(save_if_current, self.home, job, job.revision)
+        due = next_due(jobs, datetime.now(UTC))
         if due is None:
             await asyncio.sleep(IDLE_POLL_S)
             return
         job, at = due
         wait = (at - datetime.now(UTC)).total_seconds()
         if wait > 0:
-            await asyncio.sleep(min(wait, MAX_SLEEP_S))
+            await asyncio.sleep(min(wait, IDLE_POLL_S))
             return
         await self.run_job(job)
 
     async def run_job(self, job: Job) -> None:
-        ran_at = datetime.now(UTC)
+        async with self.app.execution_lock:
+            revision = job.revision
+            job.status = "running"
+            if not await asyncio.to_thread(save_if_current, self.home, job, revision):
+                return
+            revision = job.revision
+            try:
+                job.result = await self._execute(job)
+            except Exception as exc:
+                job.status = "error"
+                job.last_run = datetime.now(UTC)
+                job.next_run = None
+                job.result = f"Job {job.id} failed: {exc}"
+            else:
+                advance(job, datetime.now(UTC))
+            if await asyncio.to_thread(save_if_current, self.home, job, revision):
+                await self._deliver(job)
+
+    async def _deliver(self, job: Job) -> None:
+        revision = job.revision
         try:
-            answer = await self._execute(job)
+            if job.result:
+                await send_text(
+                    self.app.bot, self.app.chat_id, f"⏰ {job.id}\n\n{job.result}"
+                )
+            job.delivery_error = ""
         except Exception as exc:
-            job.status = "error"
-            job.last_run = ran_at
-            job.next_run = None
-            save_job(self.home, job)
-            await self.app.bot.send_message(
-                self.app.chat_id, f"Job {job.id} failed: {exc}"
-            )
-            return
-        advance(job, ran_at)
-        save_job(self.home, job)
-        if answer:
-            await self.app.bot.send_message(
-                self.app.chat_id, f"⏰ {job.id}\n\n{answer}"
-            )
+            job.delivery_error = str(exc)
+            logging.getLogger(__name__).error("Job %s delivery failed: %s", job.id, exc)
+        await asyncio.to_thread(save_if_current, self.home, job, revision)
 
     async def _execute(self, job: Job) -> str:
-        """Run the job in a fresh context: second Session, same system prompt,
-        shared tools/client — nothing leaks into or out of the chat."""
-        system_prompt = self.app.session.context.messages[0].content
+        """Run in a fresh context with no access to interactive questions."""
+        system_prompt = await asyncio.to_thread(self.app.build_prompt)
+        system_prompt += (
+            "\n\nThis is a non-interactive scheduled job. The ask tool is unavailable. "
+            "Do not ask questions or wait for replies. If essential information "
+            "is missing, report what prevented completion."
+        )
         session = Session.open(self.app.config, system_prompt)
+        job.transcript = session.writer.path.name
         agent = Agent(
             config=self.app.config,
-            tools=self.app.agent.tools,
+            tools={
+                name: tool
+                for name, tool in self.app.agent.tools.items()
+                if name != Ask.name
+            },
             client=self.app.agent.client,
             context=session.context,
         )
         answer = ""
         try:
-            async for event in agent.run_turn(job.prompt):
-                if event.type is EventType.MODEL_RESPONSE and event.quote:
-                    answer = event.quote
-                elif event.type is EventType.ERROR and event.error_message:
-                    raise RuntimeError(event.error_message)
+            async with aclosing(agent.run_turn(job.prompt)) as events:
+                async for event in events:
+                    if event.type is EventType.MODEL_RESPONSE:
+                        answer = event.quote or ""
+                    elif event.type is EventType.ERROR and event.error_message:
+                        raise RuntimeError(event.error_message)
         finally:
             session.writer.__exit__(None, None, None)
         return answer

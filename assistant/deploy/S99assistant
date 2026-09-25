@@ -1,5 +1,5 @@
 #!/bin/sh
-# BusyBox init script for the Raspberry Pi Zero 2W (spec §10, D12).
+# BusyBox init script for the Raspberry Pi Zero 2W.
 #
 # Install:
 #   1. Repo at /opt/imp, venv at /opt/imp-venv (see assistant/README.md).

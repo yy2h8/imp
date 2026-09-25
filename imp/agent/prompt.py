@@ -29,11 +29,11 @@ Reporting:
 - Never expose API keys or secrets. Do not echo credentials from the environment.
 - Use markdown formatting for text messages."""
 
-SKILL_INSTRUCTIONS = """Skills are directories under `.imp/skills/<name>/SKILL.md` containing detailed instructions.
+SKILL_INSTRUCTIONS = """Skills contain detailed instructions at the paths listed above.
 The list above shows only name and description — that's all you have until you load one.
 
 - If a skill's description matches the current task, call read_file with
-  path=".imp/skills/<name>/SKILL.md" before proceeding, and follow its instructions.
+  the listed path before proceeding, and follow its instructions.
 - SKILL.md may reference other files in the same directory (e.g. REFERENCE.md, scripts/).
   Only read or run those if the task actually needs them.
 - If a script is mentioned, run it with run_shell rather than reproducing its logic yourself.
@@ -58,9 +58,10 @@ def _format_skills(skills: list[tuple]) -> str:
     lines = []
     for s in skills:
         if len(s) == 1:
-            lines.append(f"- {s[0]}")
-        elif len(s) == 2:
-            lines.append(f"- **{s[0]}** - {s[1]}")
+            lines.append(f"- {s[0]} (path: `.imp/skills/{s[0]}/SKILL.md`)")
+        elif len(s) >= 2:
+            path = s[2] if len(s) > 2 else f".imp/skills/{s[0]}/SKILL.md"
+            lines.append(f"- **{s[0]}** - {s[1]} (path: `{path}`)")
     return "\n".join(lines)
 
 

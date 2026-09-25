@@ -19,7 +19,7 @@ async def build_agent(config: Config, ui: UIAdapter) -> AsyncIterator[Agent]:
     Owns the lifetimes of the HttpClient and SessionWriter resources.
     """
 
-    fs = FileSystemAdapter(config.workspace)
+    fs = FileSystemAdapter(config.workspace, max_bytes=config.max_http_bytes)
     prompt_lock = asyncio.Lock()
 
     async def prompt_user(message: str, markdown: bool = True) -> str:

@@ -1,8 +1,8 @@
-# systemd unit — generic Linux (spec §10)
+# systemd unit — generic Linux
 #
 # Install:
 #   1. Repo checkout at /opt/imp, venv at /opt/imp-venv (see assistant/README.md).
-#   2. Env file at /etc/assistant.env (copy assistant/.env.example and fill it in):
+#   2. Create assistant account/home (see README), then env file at /etc/assistant.env (copy assistant/.env.example and fill it in):
 #        chmod 600 /etc/assistant.env && chown assistant:assistant /etc/assistant.env
 #   3. cp assistant/deploy/assistant.service /etc/systemd/system/
 #      systemctl daemon-reload && systemctl enable --now assistant

@@ -39,7 +39,8 @@ def _parse_output(output: Iterable[Any]) -> ModelReply:
             messages.append(ReasoningMessage.parse(item))
         elif kind == "message":
             message = AssistantMessage.parse(item)
-            text = message.content
+            if message.content:
+                text = "\n".join(filter(None, (text, message.content)))
             messages.append(message)
         elif kind == "function_call":
             call = ToolCall.parse(item)
@@ -77,4 +78,15 @@ async def call_model(
             "summary": "auto",
         }
     response = await client.responses.create(**request)
-    return _parse_output(response.output)
+    status = getattr(response, "status", None)
+    if status not in (None, "completed"):
+        raise ValueError(
+            f"Model response {status}: {getattr(response, 'incomplete_details', None) or getattr(response, 'error', None)}"
+        )
+    reply = _parse_output(response.output)
+    seen = {item.call_id for item in messages if isinstance(item, ToolCall)}
+    for call in reply.tool_calls:
+        if not call.call_id or call.call_id in seen:
+            raise ValueError("Duplicate or empty tool call id")
+        seen.add(call.call_id)
+    return reply

@@ -19,3 +19,12 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run python -m pytest
+      - run: uv build --wheel
+      - name: Verify wheel outside checkout
+        shell: bash
+        run: |
+          uv venv /tmp/imp-wheel-test
+          uv pip install --python /tmp/imp-wheel-test/bin/python dist/*.whl
+          cd /tmp
+          /tmp/imp-wheel-test/bin/python -c "import assistant, imp; from importlib.resources import files; assert files('assistant').joinpath('AGENTS.md.template').is_file()"
+          /tmp/imp-wheel-test/bin/imp --help

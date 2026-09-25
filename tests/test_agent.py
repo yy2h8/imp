@@ -106,6 +106,42 @@ async def collect(agent: Agent, prompt: str):
     return [event async for event in agent.run_turn(prompt)]
 
 
+async def test_cancelling_turn_joins_read_tools(config):
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    tasks = []
+
+    class WaitingTool(FakeTool):
+        async def execute(self, **kwargs):
+            tasks.append(asyncio.current_task())
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+    tool = WaitingTool(ToolResult(ok=True, content="unused"))
+    agent, _ = make_agent(
+        config,
+        {tool.name: tool},
+        [response([function_call_item("wait", tool.name, {})])],
+    )
+    turn = asyncio.create_task(collect(agent, "wait"))
+    await asyncio.wait_for(started.wait(), 1)
+    turn.cancel()
+    await asyncio.gather(turn, return_exceptions=True)
+    try:
+        assert stopped.is_set()
+        assert all(task.done() for task in tasks)
+        outputs = [m for m in agent.context.messages if isinstance(m, ToolMessage)]
+        assert len(outputs) == 1
+        assert "interrupt" in outputs[0].content.lower()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def test_text_only_turn(config):
     agent, client = make_agent(config, {}, [response([message_item("Done")])])
     events = await collect(agent, "hi")
@@ -274,11 +310,8 @@ async def test_duplicate_call_ids_do_not_collide(config):
     )
     agent, _ = make_agent(config, tools, [batch, response([message_item("done")])])
     events = await collect(agent, "go")
-    assert events[-1].type is EventType.MODEL_RESPONSE
-
-    tool_messages = [m for m in agent.context.messages if isinstance(m, ToolMessage)]
-    assert [m.call_id for m in tool_messages] == ["1", "1"]
-    assert [m.content for m in tool_messages] == ["first", "second"]
+    assert events[-1].type is EventType.ERROR
+    assert not any(isinstance(m, ToolMessage) for m in agent.context.messages)
 
 
 async def test_declined_mutating_tool_recorded(config, fs):
@@ -333,9 +366,10 @@ async def test_context_overflow_after_tools(config):
 
 async def test_max_iterations_reached(config):
     config.max_iterations = 2
-    batch = response([function_call_item("1", "fake", {})])
     agent, _ = make_agent(
-        config, {"fake": FakeTool(ToolResult(ok=True, content="r"))}, [batch] * 5
+        config,
+        {"fake": FakeTool(ToolResult(ok=True, content="r"))},
+        [response([function_call_item(str(i), "fake", {})]) for i in range(5)],
     )
     events = await collect(agent, "go")
     assert events[-1].type is EventType.ERROR
@@ -359,3 +393,93 @@ def test_truncate_tool_output_cuts_on_line_boundary():
 def test_truncate_tool_output_single_long_line_falls_back_to_char_cut():
     out = _truncate_tool_output("x" * 300, 100)
     assert out == "x" * 100 + "... [truncated, 200 characters omitted]"
+
+
+async def test_duplicate_calls_rejected_before_execution(config):
+    tool = FakeTool(ToolResult(ok=True, content="effect"))
+    agent, _ = make_agent(
+        config,
+        {"fake": tool},
+        [
+            response(
+                [
+                    function_call_item("same", "fake", {}),
+                    function_call_item("same", "fake", {}),
+                ]
+            )
+        ],
+    )
+    events = await collect(agent, "go")
+    assert any(event.type is EventType.ERROR for event in events)
+    assert not any(event.type is EventType.TOOL_START for event in events)
+
+
+async def test_multiple_text_and_refusal_are_visible(config):
+    refusal = sdk_item(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "refusal", "refusal": "Cannot do that"}],
+        }
+    )
+    agent, _ = make_agent(config, {}, [response([message_item("First"), refusal])])
+    events = await collect(agent, "go")
+    assert events[-1].quote == "First\nCannot do that"
+
+
+async def test_malformed_later_call_prevents_entire_batch(config):
+    tool = FakeTool(ToolResult(ok=True, content="side effect"))
+    agent, _ = make_agent(
+        config,
+        {"fake": tool},
+        [
+            response(
+                [
+                    function_call_item("good", "fake", {}),
+                    function_call_item("bad", "fake", "[1]"),
+                ]
+            )
+        ],
+    )
+    events = await collect(agent, "go")
+    assert events[-1].type is EventType.ERROR
+    assert not any(event.type is EventType.TOOL_START for event in events)
+    assert not any(
+        type(message).__name__ == "ToolCall" for message in agent.context.messages
+    )
+
+
+async def test_incomplete_response_never_executes_tools(config):
+    reply = response([function_call_item("one", "fake", {})])
+    reply.status = "incomplete"
+    reply.incomplete_details = {"reason": "max_output_tokens"}
+    agent, _ = make_agent(
+        config, {"fake": FakeTool(ToolResult(ok=True, content="effect"))}, [reply]
+    )
+    events = await collect(agent, "go")
+    assert events[-1].type is EventType.ERROR
+    assert "max_output_tokens" in events[-1].error_message
+    assert not any(event.type is EventType.TOOL_START for event in events)
+
+
+async def test_consumer_close_preserves_completed_result_and_next_turn(config):
+    agent, client = make_agent(
+        config,
+        {"fake": FakeTool(ToolResult(ok=True, content="real result"))},
+        [
+            response([function_call_item("one", "fake", {})]),
+            response([message_item("next answer")]),
+        ],
+    )
+    stream = agent.run_turn("first")
+    async for event in stream:
+        if event.type is EventType.TOOL_RESULT:
+            break
+    await stream.aclose()
+    outputs = [m for m in agent.context.messages if isinstance(m, ToolMessage)]
+    assert [m.content for m in outputs] == ["real result"]
+    events = await collect(agent, "second")
+    assert events[-1].quote == "next answer"
+    assert any(
+        item.get("type") == "function_call_output" for item in client.calls[-1]["input"]
+    )

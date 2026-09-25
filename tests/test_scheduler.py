@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from test_agent import StubClient, message_item, response
+from test_agent import StubClient, function_call_item, message_item, response
 
 from assistant.jobstore import (
     Job,
@@ -17,8 +17,28 @@ from assistant.jobstore import (
     save_job,
 )
 from assistant.scheduler import Scheduler
+from imp.tools.ask import Ask
+from imp.tools.fs import ReadFile
 
 NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def close_test_sessions(monkeypatch):
+    from assistant.app import Session
+
+    original = Session.open
+    writers = []
+
+    def open_session(config, system_prompt):
+        session = original(config, system_prompt)
+        writers.append(session.writer)
+        return session
+
+    monkeypatch.setattr(Session, "open", open_session)
+    yield
+    for writer in writers:
+        writer.__exit__(None, None, None)
 
 
 def make_job(**overrides) -> Job:
@@ -201,6 +221,7 @@ def test_run_job_delivers_answer_and_reschedules(tmp_path):
     scheduler = Scheduler(app)
     job = make_job(id="digest", every=3600)
 
+    save_job(tmp_path, job)
     asyncio.run(scheduler.run_job(job))
 
     assert bot.sent == [(7, "⏰ digest\n\ndigest ready")]
@@ -219,7 +240,9 @@ def test_run_job_empty_answer_sends_nothing(tmp_path):
     bot = _StubBot()
     app = make_app(tmp_path, client, bot)
 
-    asyncio.run(Scheduler(app).run_job(make_job(id="quiet", at=NOW)))
+    job = make_job(id="quiet", at=NOW)
+    save_job(tmp_path, job)
+    asyncio.run(Scheduler(app).run_job(job))
 
     assert bot.sent == []
     saved = json.loads((tmp_path / "jobs" / "quiet.json").read_text())
@@ -232,6 +255,7 @@ def test_run_job_error_event_marks_error_and_notifies(tmp_path):
     app = make_app(tmp_path, client, bot)
     job = make_job(id="doomed", every=60)
 
+    save_job(tmp_path, job)
     asyncio.run(Scheduler(app).run_job(job))
 
     assert len(bot.sent) == 1
@@ -247,13 +271,54 @@ def test_run_job_runs_in_a_fresh_context(tmp_path):
     client = StubClient([response([message_item("answer")])])
     app = make_app(tmp_path, client, bot=_StubBot())
 
-    asyncio.run(Scheduler(app).run_job(make_job(id="t", at=NOW)))
+    job = make_job(id="t", at=NOW)
+    save_job(tmp_path, job)
+    asyncio.run(Scheduler(app).run_job(job))
 
     chat_messages = app.session.context.messages
     assert [m.role for m in chat_messages] == ["system"]  # untouched
     job_prompt = client.calls[0]["input"][1]  # system, then the job's prompt
     assert job_prompt == {"role": "user", "content": "say hi"}
     assert list((tmp_path / "sessions").glob("*.jsonl"))  # own transcript file
+
+
+async def test_scheduled_job_cannot_ask_but_interactive_agent_can(tmp_path):
+    questions = []
+
+    async def prompt_user(question):
+        questions.append(question)
+        return "owner answer"
+
+    client = StubClient(
+        [
+            response(
+                [function_call_item("question", Ask.name, {"question": "Which file?"})]
+            ),
+            response(
+                [message_item("Missing the file name; could not complete the job.")]
+            ),
+        ]
+    )
+    bot = _StubBot()
+    app = make_app(tmp_path, client, bot)
+    ask = Ask(prompt_user=prompt_user)
+    app.agent.tools = {Ask.name: ask, ReadFile.name: ReadFile()}
+    try:
+        job = make_job(at=NOW)
+        save_job(tmp_path, job)
+        await Scheduler(app).run_job(job)
+
+        assert questions == []
+        assert {tool["name"] for tool in client.calls[0]["tools"]} == {ReadFile.name}
+        output = client.calls[1]["input"][-1]
+        assert output["type"] == "function_call_output"
+        assert output["output"] == f"Tool not found: {Ask.name}"
+        assert "could not complete" in bot.sent[-1][1]
+        assert app.agent.tools[Ask.name] is ask
+        assert (await app.agent.tools[Ask.name].execute("Interactive question?")).ok
+        assert questions == ["Interactive question?"]
+    finally:
+        app.session.writer.__exit__(None, None, None)
 
 
 def test_scheduler_cycle_sleeps_when_nothing_due(tmp_path):
@@ -276,7 +341,7 @@ def test_scheduler_cycle_sleeps_when_nothing_due(tmp_path):
     asyncio.run(scenario())
 
 
-def test_scheduler_run_survives_repeated_failures(tmp_path):
+def test_scheduler_run_survives_repeated_failures(tmp_path, monkeypatch):
     client = StubClient([])
     app = make_app(tmp_path, client, _StubBot())
     scheduler = Scheduler(app)
@@ -287,7 +352,7 @@ def test_scheduler_run_survives_repeated_failures(tmp_path):
     scheduler._cycle = boom
     import assistant.scheduler as scheduler_module
 
-    monkeypatch_idle(scheduler_module)
+    monkeypatch.setattr(scheduler_module, "IDLE_POLL_S", 0.01)
 
     async def scenario():
         task = asyncio.create_task(scheduler.run())
@@ -301,10 +366,6 @@ def test_scheduler_run_survives_repeated_failures(tmp_path):
     asyncio.run(scenario())  # reaching here means the loop survived
 
 
-def monkeypatch_idle(module):
-    module.IDLE_POLL_S = 0.01
-
-
 def test_job_dataclass_defaults():
     job = Job(id="x", prompt="p")
     assert job.status == "pending"
@@ -312,8 +373,9 @@ def test_job_dataclass_defaults():
     assert job.to_dict()["status"] == "pending"
 
 
-def test_job_from_dict_coerces_every_to_int():
-    assert Job.from_dict({"id": "x", "prompt": "p", "every": "90"}).every == 90
+def test_job_from_dict_rejects_non_integer_interval():
+    with pytest.raises(ValueError):
+        Job.from_dict({"id": "x", "prompt": "p", "every": "90"})
 
 
 def test_job_roundtrip_via_dict():
@@ -332,3 +394,168 @@ def test_job_roundtrip_via_dict():
 def test_job_from_dict_bad_timestamps_raise_valueerror(kwargs):
     with pytest.raises(ValueError):
         Job.from_dict({"id": "x", "prompt": "p", **kwargs})
+
+
+def test_bad_json_shape_does_not_starve_valid_job(tmp_path):
+    save_job(tmp_path, make_job(at=NOW))
+    (tmp_path / "jobs/bad.json").write_text("[]")
+    assert [job.id for job in load_jobs(tmp_path)] == ["j1"]
+
+
+def test_first_interval_deadline_survives_reload(tmp_path):
+    save_job(tmp_path, make_job(every=60))
+    first = load_jobs(tmp_path)[0]
+    assert first.next_run is not None
+    assert compute_next(load_jobs(tmp_path)[0], first.next_run) == first.next_run
+
+
+async def test_old_completion_cannot_replace_new_job(tmp_path):
+    app = make_app(tmp_path, StubClient([]), _StubBot())
+    scheduler = Scheduler(app)
+    old = make_job(every=60)
+    save_job(tmp_path, old)
+
+    async def replace_during_run(job):
+        save_job(tmp_path, make_job(every=60, prompt="replacement"))
+        return "old answer"
+
+    scheduler._execute = replace_during_run
+    await scheduler.run_job(old)
+    assert load_jobs(tmp_path)[0].prompt == "replacement"
+
+
+async def test_first_and_second_fire_through_cycles(tmp_path, monkeypatch):
+    import assistant.jobstore as store
+    import assistant.scheduler as module
+
+    clock = [NOW]
+
+    class Clock:
+        @classmethod
+        def now(cls, tz):
+            return clock[0]
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    monkeypatch.setattr(store, "datetime", Clock)
+    # Timestamp parsing still uses real datetime.
+    monkeypatch.setattr(
+        store,
+        "_parse_ts",
+        lambda value: datetime.fromisoformat(value) if value else None,
+    )
+    app = make_app(tmp_path, StubClient([]), _StubBot())
+    scheduler = Scheduler(app)
+    starts = []
+
+    async def execute(job):
+        starts.append(clock[0])
+        clock[0] += timedelta(seconds=15)
+        return "done"
+
+    scheduler._execute = execute
+    job = make_job(every=60)
+    save_job(tmp_path, job)
+    clock[0] = NOW + timedelta(seconds=60)
+    await scheduler._cycle()
+    assert starts == [NOW + timedelta(seconds=60)]
+    assert load_jobs(tmp_path)[0].next_run == NOW + timedelta(seconds=135)
+    clock[0] = NOW + timedelta(seconds=135)
+    await scheduler._cycle()
+    assert len(starts) == 2
+
+
+async def test_running_job_recovery_never_executes_again(tmp_path):
+    job = make_job(at=NOW, status="running")
+    save_job(tmp_path, job)
+    app = make_app(tmp_path, StubClient([]), _StubBot())
+    scheduler = Scheduler(app)
+
+    async def stop():
+        raise asyncio.CancelledError
+
+    scheduler._cycle = stop
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler.run()
+    saved = load_jobs(tmp_path)[0]
+    assert saved.status == "error"
+    assert "Interrupted" in saved.result
+    assert app.agent.client.calls == []
+    assert "Interrupted" in app.bot.sent[0][1]
+
+
+async def test_delivery_failure_preserves_result_without_rerun(tmp_path):
+    class FailedBot:
+        async def send_message(self, *args):
+            return None
+
+    app = make_app(
+        tmp_path, StubClient([response([message_item("valuable result")])]), FailedBot()
+    )
+    job = make_job(at=NOW)
+    save_job(tmp_path, job)
+    await Scheduler(app).run_job(job)
+    saved = load_jobs(tmp_path)[0]
+    assert saved.status == "done"
+    assert saved.result == "valuable result"
+    assert saved.delivery_error
+    assert saved.transcript
+    assert next_due([saved], NOW) is None
+
+
+async def test_cancelled_job_is_not_resurrected(tmp_path):
+    from assistant.tools.schedule import UnscheduleJob
+
+    app = make_app(tmp_path, StubClient([]), _StubBot())
+    scheduler = Scheduler(app)
+    job = make_job(every=60)
+    save_job(tmp_path, job)
+
+    async def cancel_during_run(job):
+        result = await UnscheduleJob(config=app.config).execute(job.id)
+        assert result.ok
+        return "finished in flight"
+
+    scheduler._execute = cancel_during_run
+    await scheduler.run_job(job)
+    assert load_jobs(tmp_path)[0].status == "cancelled"
+
+
+async def test_identical_replacement_has_new_revision(tmp_path):
+    from assistant.jobstore import save_if_current
+
+    old = make_job(every=60)
+    save_job(tmp_path, old)
+    revision = old.revision
+    replacement = make_job(every=60)
+    save_job(tmp_path, replacement)
+    old.status = "done"
+    assert not save_if_current(tmp_path, old, revision)
+    assert load_jobs(tmp_path)[0].revision == replacement.revision
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"id": "x", "prompt": "p"},
+        {"id": "x", "prompt": "p", "at": NOW.isoformat(), "every": 60},
+        {"id": "x", "prompt": [], "every": 60},
+    ],
+)
+def test_invalid_job_schema_rejected(data):
+    with pytest.raises(ValueError):
+        Job.from_dict(data)
+
+
+async def test_scheduler_future_wait_is_bounded(tmp_path, monkeypatch):
+    import assistant.scheduler as module
+
+    app = make_app(tmp_path, StubClient([]), _StubBot())
+    save_job(tmp_path, make_job(at=datetime.now(UTC) + timedelta(hours=3)))
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    await Scheduler(app)._cycle()
+    assert delays == [module.IDLE_POLL_S]

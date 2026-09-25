@@ -1,4 +1,4 @@
-"""send_file: the only file egress from the assistant's sandbox."""
+"""send_file: deliver workspace files to Telegram."""
 
 from __future__ import annotations
 
@@ -44,13 +44,14 @@ class SendFile(Tool):
                 "outbox/ is the convention).",
             )
         except ValueError as exc:
-            return ToolResult(
-                ok=False, content=f"send_file refused: {exc}"
-            )
+            return ToolResult(ok=False, content=f"send_file refused: {exc}")
         if not resolved.is_file():
             return ToolResult(ok=False, content=f"Not a file: {path}")
 
-        message = await self.sender(resolved, caption)
+        try:
+            message = await self.sender(resolved, caption)
+        except Exception as exc:
+            return ToolResult(ok=False, content=f"File delivery failed: {exc}")
         if message is None:
             return ToolResult(
                 ok=False, content=f"Telegram rejected the upload of {path}."

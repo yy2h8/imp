@@ -39,6 +39,12 @@ class Context:
         if self.writer is not None:
             self.writer.write(message)
 
+    def replace_system_prompt(self, content: str) -> None:
+        self.messages[0] = TextMessage(role="system", content=content)
+        self.tokens = _estimate_context_tokens(self.messages)
+        if self.writer is not None:
+            self.writer.write(self.messages[0])
+
     def get_usage(self) -> tuple[int, int]:
         return self.tokens, self.config.max_context
 

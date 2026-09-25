@@ -1,7 +1,7 @@
 """Telegram Bot API transport: one method per endpoint the assistant uses.
 
 No SDK and no framework — raw POSTs over the shared httpx client family,
-long-polling via getUpdates. Transport only: rendering lives in ui.py.
+long-polling via getUpdates. Transport and lossless delivery; status rendering lives in ui.py.
 """
 
 from __future__ import annotations
@@ -10,9 +10,11 @@ import asyncio
 
 import httpx2 as httpx
 
+from imp.config import DEFAULT_MAX_HTTP_BYTES
+
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 POLL_TIMEOUT_S = 25  # long-poll server hold; must stay below the HTTP timeout
-# transport failures back off exponentially before retrying (spec §4.5)
+# transport failures back off exponentially before retrying
 BACKOFF_BASE_S = 1.0
 BACKOFF_MAX_S = 60.0
 
@@ -21,46 +23,93 @@ class TelegramError(RuntimeError):
     """A Bot API call failed after retries; message describes the cause."""
 
 
+MAX_MESSAGE_CHARS = 4096
+
+
+def split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
+    """Lossless plain-text chunks; count UTF-16 units conservatively."""
+    if limit < 2:
+        raise ValueError("chunk limit must be at least 2")
+    chunks, start, size = [], 0, 0
+    for index, char in enumerate(text):
+        units = 2 if ord(char) > 0xFFFF else 1
+        if size + units > limit:
+            chunks.append(text[start:index])
+            start, size = index, 0
+        size += units
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
+async def send_text(bot, chat_id: int, text: str) -> list[int]:
+    ids = []
+    for chunk in split(text):
+        message_id = await bot.send_message(chat_id, chunk)
+        if message_id is None:
+            raise TelegramError("Required message delivery failed")
+        ids.append(message_id)
+    return ids
+
+
 class TelegramBot:
-    """Thin async client for the subset of the Bot API the assistant needs:
-    getUpdates / sendMessage / editMessageText / sendChatAction / sendDocument /
-    getFile. Never raises on Telegram-side rejections mid-turn — senders check
-    the returned ``ok`` flag; only exhausted retries raise TelegramError."""
+    """Bot API client. Required sends raise on rejection or exhausted retries;
+    cosmetic edits and typing indicators may fail without aborting a turn."""
 
     def __init__(
-        self, token: str, timeout: float = 60.0, max_attempts: int = 4
+        self,
+        token: str,
+        timeout: float = 60.0,
+        max_attempts: int = 4,
+        max_bytes: int = DEFAULT_MAX_HTTP_BYTES,
     ) -> None:
+        self.max_bytes = max_bytes
         self.token = token
         self.max_attempts = max_attempts
         self.client = httpx.AsyncClient(timeout=timeout)
 
-    async def call(self, method: str, **payload) -> dict:
-        """POST a Bot API method; returns its ``result`` object.
-
-        Retryable failures (network, 429/5xx) back off exponentially and are
-        retried up to max_attempts; a final failure raises TelegramError.
-        """
+    async def call(self, method: str, *, files=None, **payload) -> dict:
+        """Shared bounded retry policy for JSON and multipart requests."""
         url = API_BASE.format(token=self.token, method=method)
-        delay = BACKOFF_BASE_S
-        last = ""
-        for _ in range(self.max_attempts):
+        last = "unknown failure"
+        for attempt in range(self.max_attempts):
+            delay = min(BACKOFF_BASE_S * 2**attempt, BACKOFF_MAX_S)
+            retry = True
             try:
-                response = await self.client.post(url, json=payload)
-                if response.status_code == 429 or response.status_code >= 500:
-                    last = f"HTTP {response.status_code}"
-                    retry_after = response.headers.get("retry-after")
-                    if retry_after and response.status_code == 429:
-                        delay = max(delay, min(float(retry_after), BACKOFF_MAX_S))
-                else:
+                kwargs = (
+                    {"data": payload, "files": files} if files else {"json": payload}
+                )
+                response = await self.client.post(url, **kwargs)
+                try:
                     data = response.json()
-                    if data.get("ok"):
-                        return data["result"]
-                    last = data.get("description", "unknown Telegram error")
-            except (httpx.HTTPError, ValueError) as exc:  # transport / bad JSON
-                last = str(exc)
+                except ValueError:
+                    data = {}
+                if not isinstance(data, dict):
+                    data = {}
+                if response.is_success and data.get("ok"):
+                    return data["result"]
+                code = data.get("error_code", response.status_code)
+                last = f"HTTP/API {code}"
+                retry = code == 429 or (isinstance(code, int) and code >= 500)
+                if code == 429:
+                    parameters = data.get("parameters") or {}
+                    requested = parameters.get(
+                        "retry_after", response.headers.get("retry-after")
+                    )
+                    try:
+                        delay = (
+                            max(delay, float(requested))
+                            if requested is not None
+                            else delay
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            except httpx.HTTPError as exc:
+                last = type(exc).__name__  # request URLs contain the bot token
+            if not retry or attempt + 1 == self.max_attempts:
+                break
             await asyncio.sleep(delay)
-            delay = min(delay * 2, BACKOFF_MAX_S)
-        raise TelegramError(f"{method} failed after {self.max_attempts} attempts: {last}")
+        raise TelegramError(f"{method} failed after {attempt + 1} attempts: {last}")
 
     async def get_updates(self, offset: int) -> list[dict]:
         """Long-poll for updates newer than ``offset`` (empty list on timeout)."""
@@ -69,30 +118,24 @@ class TelegramBot:
         )
         return list(updates)
 
-    async def send_message(self, chat_id: int, text: str) -> int | None:
-        """Send a markdown message; returns the message_id (None if rejected)."""
-        try:
-            result = await self.call(
-                "sendMessage",
-                chat_id=chat_id,
-                text=text[:4096],
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
-        except TelegramError:
-            return None
-        return result.get("message_id")
+    async def send_message(self, chat_id: int, text: str) -> int:
+        if not text or len(text.encode("utf-16-le")) // 2 > MAX_MESSAGE_CHARS:
+            raise ValueError("Telegram message must contain 1..4096 UTF-16 units")
+        result = await self.call(
+            "sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True
+        )
+        return result["message_id"]
+
+    async def send_text(self, chat_id: int, text: str) -> list[int]:
+        return await send_text(self, chat_id, text)
 
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
-        """Edit a sent message in place. Returns False when Telegram refuses
-        (e.g. unchanged text); transport errors bubble to the caller."""
         try:
             await self.call(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text[:4096],
-                parse_mode="Markdown",
+                text=split(text)[0] if text else " ",
             )
         except TelegramError:
             return False
@@ -106,34 +149,14 @@ class TelegramBot:
 
     async def send_document(
         self, chat_id: int, data: bytes, filename: str, caption: str = ""
-    ) -> int | None:
-        """Upload a file via multipart sendDocument; returns the message_id.
-        Returns None when Telegram rejects the upload (e.g. too big)."""
-        files = {"document": (filename, data)}
-        payload: dict = {"chat_id": chat_id}
-        if caption:
-            payload["caption"] = caption[:1024]
-            payload["parse_mode"] = "Markdown"
-        delay = BACKOFF_BASE_S
-        for _ in range(self.max_attempts):
-            # a fresh request each attempt: multipart streams are single-use
-            request = self.client.build_request(
-                "POST",
-                API_BASE.format(token=self.token, method="sendDocument"),
-                data=payload,
-                files=files,
-            )
-            try:
-                response = await self.client.send(request)
-                data_json = response.json()
-                if data_json.get("ok"):
-                    return data_json["result"].get("message_id")
-                return None  # Telegram rejected the upload (e.g. file too big)
-            except (httpx.HTTPError, ValueError):
-                pass  # transport failure: retry with backoff
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, BACKOFF_MAX_S)
-        return None  # transport failed after retries: in-band for send_file
+    ) -> int:
+        result = await self.call(
+            "sendDocument",
+            files={"document": (filename, data)},
+            chat_id=chat_id,
+            caption=split(caption, 1024)[0] if caption else "",
+        )
+        return result["message_id"]
 
     async def get_me(self) -> dict:
         """The bot's own identity; whoami uses it to validate the token."""
@@ -146,9 +169,19 @@ class TelegramBot:
     async def download_file(self, file_path: str) -> bytes:
         """Fetch raw bytes for a file previously resolved via get_file."""
         url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        response = await self.client.get(url)
-        response.raise_for_status()
-        return response.content
+        try:
+            async with self.client.stream("GET", url) as response:
+                response.raise_for_status()
+                data = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    if len(data) + len(chunk) > self.max_bytes:
+                        raise TelegramError(
+                            f"Download exceeds byte limit ({self.max_bytes})"
+                        )
+                    data.extend(chunk)
+                return bytes(data)
+        except httpx.HTTPError as exc:
+            raise TelegramError(f"Download failed: {type(exc).__name__}") from None
 
     async def close(self) -> None:
         await self.client.aclose()

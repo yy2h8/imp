@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+from assistant.adapters.telegram import MAX_MESSAGE_CHARS
 from assistant.adapters.ui import (
-    MAX_MESSAGE_CHARS,
     StatusBuffer,
     TelegramUIAdapter,
-    sanitise,
     split,
 )
 from imp.events import AgentEvent, EventType
@@ -15,71 +14,13 @@ def ToolResult_ok(content: str) -> ToolResult:
     return ToolResult(ok=True, content=content)
 
 
-class TestSanitise:
-    def test_heading_becomes_bold_and_escaped(self):
-        out = sanitise("# Title *with* _fancy_ chars")
-        assert out == "*Title \\*with\\* \\_fancy\\_ chars*"
-
-    def test_table_becomes_fenced_rows(self):
-        text = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter"
-        assert sanitise(text).splitlines() == [
-            "before",
-            "```",
-            "a · b",
-            "1 · 2",
-            "```",
-            "after",
-        ]
-
-    def test_table_separator_row_dropped(self):
-        assert "|---|---|" not in sanitise("| a | b |\n|---|---|\n| 1 | 2 |")
-
-    def test_nested_list_markers_flattened(self):
-        text = "- one\n  - two\n    - three\n1. first"
-        assert sanitise(text).splitlines() == ["- one", "- two", "- three", "- first"]
-
-    def test_table_at_end_closes_fence(self):
-        out = sanitise("| a |\n| 1 |")
-        assert out.endswith("```")
-
-    def test_plain_text_passthrough(self):
-        assert sanitise("just text\nwith lines") == "just text\nwith lines"
-
-
-class TestSplit:
-    def test_short_text_single_chunk(self):
-        assert split("hello") == ["hello"]
-        assert split("") == []
-
-    def test_split_at_limit(self):
-        text = "a" * 10 + "\n" + "b" * 10
-        chunks = split(text, limit=12)
-        assert chunks == ["a" * 10 + "\n", "b" * 10]
-
-    oversize = None  # placeholder to keep the class flat
-
-    def test_long_single_line_is_hard_cut(self):
-        text = "x" * 25
-        chunks = split(text, limit=10)
-        assert "".join(chunks).startswith("x")
-        assert all(len(c) <= 12 for c in chunks)  # fence lines can exceed limit
-
-    def test_fence_cut_closed_and_reopened(self):
-        text = "```\n" + "a\nb\nc\n" + "```\n" + "after"
-        # cut inside the fence: chunk1 ends with close, chunk2 reopens
-        chunks = split(text, limit=12)
-        assert chunks[0].endswith("```\n")
-        assert chunks[1].startswith("```\n")
-        assert "".join(chunks).count("```") % 2 == 0  # fence parity restored
-
-    def test_no_open_fence_across_chunks(self):
-        text = ("```\n" + "x" * 30 + "\n```\n") * 3
-        chunks = split(text, limit=20)
-        for chunk in chunks:
-            assert chunk.count("```") % 2 == 0
-
-    def test_max_message_chars_constant(self):
-        assert MAX_MESSAGE_CHARS == 4096
+def test_split_preserves_arbitrary_content():
+    text = "# title\n```\n" + "😀_*" * 5000 + "\n```\n\n"
+    chunks = split(text)
+    assert "".join(chunks) == text
+    assert all(
+        len(chunk.encode("utf-16-le")) // 2 <= MAX_MESSAGE_CHARS for chunk in chunks
+    )
 
 
 class TestStatusBuffer:
@@ -142,16 +83,23 @@ class TestTelegramUIAdapter:
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=3600, max_chars=500)
         await ui.handle(
-            AgentEvent(type=EventType.TOOL_START, token_usage=(0, 100),
-                       tool_name="run_shell", tool_args={"command": "ls"})
+            AgentEvent(
+                type=EventType.TOOL_START,
+                token_usage=(0, 100),
+                tool_name="run_shell",
+                tool_args={"command": "ls"},
+            )
         )
         await ui.flush()  # first flush creates the message regardless of debounce
         assert len(bot.sent) == 1
         message_id = bot.sent[0] and ui.status_message_id
         await ui.handle(
-            AgentEvent(type=EventType.TOOL_RESULT, token_usage=(0, 100),
-                       tool_name="run_shell",
-                       tool_result=ToolResult_ok("out"))
+            AgentEvent(
+                type=EventType.TOOL_RESULT,
+                token_usage=(0, 100),
+                tool_name="run_shell",
+                tool_result=ToolResult_ok("out"),
+            )
         )
         await ui.flush()  # within the debounce window: skipped
         assert len(bot.edits) == 0
@@ -164,8 +112,11 @@ class TestTelegramUIAdapter:
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=3600, max_chars=500)
         await ui.handle(
-            AgentEvent(type=EventType.MODEL_RESPONSE, token_usage=(0, 100),
-                       quote="thinking out loud")
+            AgentEvent(
+                type=EventType.MODEL_RESPONSE,
+                token_usage=(0, 100),
+                quote="thinking out loud",
+            )
         )
         await ui.flush()
         await ui.end_turn("✓ done · 0 tools · 1 s")
@@ -189,13 +140,21 @@ class TestTelegramUIAdapter:
         bot.edit_fails = True
         ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=0.0, max_chars=500)
         await ui.handle(
-            AgentEvent(type=EventType.TOOL_START, token_usage=(0, 100),
-                       tool_name="list_dir", tool_args={})
+            AgentEvent(
+                type=EventType.TOOL_START,
+                token_usage=(0, 100),
+                tool_name="list_dir",
+                tool_args={},
+            )
         )
         await ui.flush()
         await ui.handle(
-            AgentEvent(type=EventType.TOOL_RESULT, token_usage=(0, 100),
-                       tool_name="list_dir", tool_result=ToolResult_ok("[]"))
+            AgentEvent(
+                type=EventType.TOOL_RESULT,
+                token_usage=(0, 100),
+                tool_name="list_dir",
+                tool_result=ToolResult_ok("[]"),
+            )
         )
         await ui.flush(force=True)  # edit fails → fresh message, editing stops
         assert len(bot.sent) == 2
@@ -213,7 +172,10 @@ class TestTelegramUIAdapter:
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
         await ui.handle(
-            AgentEvent(type=EventType.ERROR, token_usage=(0, 100),
-                       error_message="model exploded")
+            AgentEvent(
+                type=EventType.ERROR,
+                token_usage=(0, 100),
+                error_message="model exploded",
+            )
         )
         assert "*error:* model exploded" in ui.buffer.render()

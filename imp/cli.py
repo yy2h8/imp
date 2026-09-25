@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import aclosing
 
 from .adapters import UIAdapter
 from .agent import Agent
@@ -38,8 +39,9 @@ async def repl(agent: Agent, ui: UIAdapter) -> None:
         if prompt.lower() in {"exit", "quit"}:
             break
         try:
-            async for event in agent.run_turn(prompt):
-                ui.render_event(event)
+            async with aclosing(agent.run_turn(prompt)) as events:
+                async for event in events:
+                    ui.render_event(event)
             ui.end_turn(event.token_usage)  # one usage report per turn
         finally:
             ui.stop_spinner()  # Ctrl-C mid-turn must not leave a spinner running

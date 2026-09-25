@@ -129,3 +129,15 @@ async def test_run_shell_smoke(config):
     assert result.ok is True
     assert '"exit_code": 0' in result.content
     assert "imp" in result.content
+
+
+async def test_nonzero_shell_is_failure(config, fs):
+    from imp.tools.shell import RunShell
+
+    config.auto_approve = True
+    result = await RunShell(config=config, fs=fs).execute(
+        command="printf failure; exit 3"
+    )
+    assert not result.ok
+    assert "failure" in result.content
+    assert "3" in result.content

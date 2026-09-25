@@ -107,4 +107,4 @@ class RunShell(Tool):
             ensure_ascii=False,
             indent=2,
         )
-        return ToolResult(ok=True, content=result)
+        return ToolResult(ok=proc.returncode == 0, content=result)

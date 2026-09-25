@@ -44,24 +44,25 @@ async def test_send_message_returns_message_id(no_sleep):
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert request.url.path == "/botTESTTOKEN/sendMessage"
-        assert payload["parse_mode"] == "Markdown"
+        assert "parse_mode" not in payload
         return api_result({"message_id": 7})
 
     assert await bot_with(handler).send_message(1, "hi") == 7
 
 
-async def test_send_message_truncates_to_telegram_limit(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        assert len(json.loads(request.content)["text"]) == 4096
-        return api_result({"message_id": 1})
+async def test_send_message_rejects_oversize(no_sleep):
+    with pytest.raises(ValueError):
+        await bot_with(lambda request: api_result({"message_id": 1})).send_message(
+            1, "x" * 5000
+        )
 
-    await bot_with(handler).send_message(1, "x" * 5000)
 
-
-async def test_send_message_rejection_returns_none_not_raise(no_sleep):
-    assert await bot_with(lambda request: api_error("chat not found")) .send_message(
-        1, "hi"
-    ) is None
+async def test_send_message_rejection_raises_once(no_sleep):
+    with pytest.raises(TelegramError):
+        await bot_with(lambda request: api_error("chat not found")).send_message(
+            1, "hi"
+        )
+    assert no_sleep.delays == []
 
 
 async def test_edit_message_maps_failure_to_false(no_sleep):
@@ -112,9 +113,9 @@ async def test_send_document_truncates_caption(no_sleep):
         boundary = content_type.partition("boundary=")[2]
         for part in (await request.aread()).split(b"--" + boundary.encode()):
             if b'name="caption"' in part:
-                captured["caption"] = part.split(b"\r\n\r\n", 1)[1].rsplit(
-                    b"\r\n", 1
-                )[0]
+                captured["caption"] = part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[
+                    0
+                ]
         return api_result({"message_id": 3})
 
     bot = bot_with(handler)
@@ -124,7 +125,8 @@ async def test_send_document_truncates_caption(no_sleep):
 
 async def test_send_document_rejection_returns_none(no_sleep):
     bot = bot_with(lambda request: api_error("file too big"))
-    assert await bot.send_document(1, b"data", "f.txt") is None
+    with pytest.raises(TelegramError):
+        await bot.send_document(1, b"data", "f.txt")
 
 
 async def test_get_updates_parses_results(no_sleep):
@@ -133,9 +135,7 @@ async def test_get_updates_parses_results(no_sleep):
         assert payload["timeout"] == 25  # the long-poll hold
         return api_result([{"update_id": 41, "message": {}}])
 
-    assert await bot_with(handler).get_updates(40) == [
-        {"update_id": 41, "message": {}}
-    ]
+    assert await bot_with(handler).get_updates(40) == [{"update_id": 41, "message": {}}]
 
 
 async def test_send_chat_action_swallows_errors(no_sleep):
@@ -164,3 +164,47 @@ async def test_get_file_and_download_roundtrip(no_sleep):
     bot = bot_with(handler)
     entry = await bot.get_file("f1")
     assert await bot.download_file(entry["file_path"]) == b"file bytes"
+
+
+async def test_json_retry_delay_and_no_final_sleep(no_sleep):
+    bot = bot_with(
+        lambda request: httpx.Response(
+            429, json={"ok": False, "parameters": {"retry_after": 90}}
+        ),
+        max_attempts=2,
+    )
+    with pytest.raises(TelegramError):
+        await bot.send_message(1, "hi")
+    assert no_sleep.delays == [90]
+
+
+async def test_partial_chunk_delivery_raises(no_sleep):
+    count = 0
+
+    async def handler(request):
+        nonlocal count
+        count += 1
+        return api_result({"message_id": 1}) if count == 1 else api_error("rejected")
+
+    bot = bot_with(handler)
+    with pytest.raises(TelegramError):
+        await bot.send_text(1, "x" * 5000)
+    assert count == 2
+
+
+async def test_download_enforces_actual_byte_limit(no_sleep):
+    bot = bot_with(lambda request: httpx.Response(200, content=b"x" * 100))
+    bot.max_bytes = 16
+    with pytest.raises(TelegramError, match="limit"):
+        await bot.download_file("data")
+
+
+async def test_errors_never_include_token_urls(no_sleep):
+    def fail(request):
+        raise httpx.ReadError(str(request.url))
+
+    bot = bot_with(fail, max_attempts=1)
+    with pytest.raises(TelegramError) as caught:
+        await bot.send_message(1, "hello")
+    assert "TESTTOKEN" not in str(caught.value)
+    assert no_sleep.delays == []

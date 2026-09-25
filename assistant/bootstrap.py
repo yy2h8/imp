@@ -1,6 +1,6 @@
 """Bootstrap: probe the machine, render AGENTS.md, fingerprint in state.json.
 
-Environment facts are pure code, never model-guessed (D7); the model only
+Environment facts are pure code, never model-guessed ; the model only
 adapts the Operating Manual in one tailoring turn afterwards.
 """
 
@@ -14,15 +14,19 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from imp.agent import Agent, EventType
+from imp.tools.ask import Ask
+
 TEMPLATE_NAME = "AGENTS.md.template"
 ENV_BEGIN = "<!-- ENVIRONMENT:BEGIN -->"
 ENV_END = "<!-- ENVIRONMENT:END -->"
-# degradation path when the packaged template cannot be read (§6: bootstrap
+# degradation path when the packaged template cannot be read (bootstrap
 # failures degrade to a minimal manual rather than blocking startup).
 # render_manual replaces everything between the markers with fresh facts.
 MINIMAL_TEMPLATE = """# AGENTS.md
@@ -116,11 +120,11 @@ class Probe:
                         break
         except OSError:
             pass
-        shell = "unknown"
-        try:  # /proc gives the interpreter the process was started with
-            shell = Path("/proc/self/comm").read_text().strip()
-        except OSError:
-            pass
+        shell = (
+            str(Path("/bin/sh").resolve())
+            if os.name == "posix"
+            else os.getenv("COMSPEC", "cmd.exe")
+        )
         return cls(
             os_name=platform.system() or "unknown",
             arch=platform.machine() or "unknown",
@@ -170,9 +174,9 @@ class Probe:
                 f"- Kernel: `{self.kernel}`",
                 f"- Python: `{self.python_version}` (`{self.python_path}`)",
                 f"- Tools: {tools}",
-                f"- Shell: `{self.shell}` — **`ash`/BusyBox, not bash**, on the Pi target",
+                f"- Shell: `{self.shell}`",
                 f"- Home: `{self.home}`",
-                f"- Workspace (sandbox root): `{self.workspace}`",
+                f"- Workspace (file-tool root): `{self.workspace}`",
                 f"- Free disk: {self.disk} · RAM: {self.ram}",
                 f"- Network at probe time: {self.network}",
                 f"- Secrets present (presence only): {secrets}",
@@ -185,8 +189,9 @@ def render_manual(template: str, environment: str) -> str:
     """Splice the probed environment into the template's ENVIRONMENT block.
     Manual content outside the markers is preserved (hand edits survive
     re-bootstrap, per the template's own preamble)."""
-    head, marker, _ = template.partition(ENV_BEGIN)
-    if not marker:
+    head, marker, tail = template.partition(ENV_BEGIN)
+    _, end_marker, rest = tail.partition(ENV_END)
+    if not marker or not end_marker:
         return template  # malformed template: keep it verbatim
     body = (
         f"{ENV_BEGIN}\n## Environment\n\n"
@@ -194,8 +199,7 @@ def render_manual(template: str, environment: str) -> str:
         "key in state.json and restart to regenerate.\n\n"
         f"{environment}\n{ENV_END}"
     )
-    rest = template.split(ENV_END, 1)[1] if ENV_END in template else ""
-    return f"{head}{body}\n{rest}"
+    return f"{head}{body}{rest}"
 
 
 def load_template(package_dir: Path) -> str:
@@ -207,16 +211,41 @@ def load_template(package_dir: Path) -> str:
 
 def read_state(home: Path) -> dict:
     try:
-        return json.loads((home / "state.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        state = json.loads((home / "state.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    except ValueError as exc:
+        raise ValueError("Invalid state.json; repair it before restarting") from exc
+    if not isinstance(state, dict):
+        # Invalid persisted data, rather than an invalid caller argument type.
+        raise ValueError("Invalid state.json: expected an object")  # noqa: TRY004
+    return state
 
 
 def write_state(home: Path, updates: dict) -> dict:
     path = home / "state.json"
     state = read_state(home)
     state.update(updates)
-    path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=home,
+        prefix="state-",
+        suffix=".tmp",
+        delete=False,
+    ) as fh:
+        tmp = Path(fh.name)
+        try:
+            fh.write(json.dumps(state, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return state
 
 
@@ -234,23 +263,31 @@ def run_bootstrap(
     probe: Probe | None = None,
     force: bool = False,
 ) -> BootstrapResult:
-    """Probe → fingerprint check → render manual → record fingerprint (D7).
+    """Probe → fingerprint check → render manual → record fingerprint .
 
     A mismatch means the stored manual describes a machine that no longer
     exists; the manual is rewritten with fresh facts (hand-edited manual text
     outside the ENVIRONMENT block survives via render_manual). A template
-    failure degrades to a minimal manual rather than blocking startup (§6).
+    failure degrades to a minimal manual rather than blocking startup.
     """
     probe = probe or Probe.take(home)
-    changed = force or probe.fingerprint() != read_state(home).get("fingerprint")
+    path = home / "AGENTS.md"
+    changed = (
+        force
+        or not path.exists()
+        or probe.fingerprint() != read_state(home).get("fingerprint")
+    )
     if changed:
         try:
-            template = load_template(package_dir)
-        except RuntimeError:
-            template = MINIMAL_TEMPLATE
+            template = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            try:
+                template = load_template(package_dir)
+            except RuntimeError:
+                template = MINIMAL_TEMPLATE
         manual = render_manual(template, probe.render())
-        (home / "AGENTS.md").write_text(manual, encoding="utf-8")
-    write_state(home, {"fingerprint": probe.fingerprint()})
+        path.write_text(manual, encoding="utf-8")
+        write_state(home, {"fingerprint": probe.fingerprint(), "tailored": False})
     return BootstrapResult(probe=probe, changed=changed)
 
 
@@ -283,21 +320,38 @@ def needs_tailoring(state: dict) -> bool:
 
 
 async def tailor_manual(app, probe: Probe) -> None:
-    """The single bootstrap tailoring turn (spec §6.4): one agent turn that
+    """The single bootstrap tailoring turn : one agent turn that
     adapts the manual's Operating Manual section to the probed machine.
 
-    Confined to the home: app is already sandboxed to IMP_HOME; the prompt
-    hands over only real probe facts and forbids invention.
+    Polling has not started, so this turn must not ask the owner questions.
+    Shell access retains the service account's permissions.
     """
     prompt = (
         "Bootstrap tailoring turn. Adapt the Operating Manual section of "
         "AGENTS.md to this machine using ONLY the probed facts below — never "
-        "invent facts. Keep every section except Operating-Manual adaptations; "
+        "invent facts. Preserve owner instructions and the generated environment "
+        "block. This startup turn is non-interactive: do not ask questions or "
+        "wait for replies. Keep every section except Operating-Manual adaptations; "
         "write the file back with str_replace. Adapt guidance like which "
         "package manager or venv tool to use (no uv → python3 -m venv + pip), "
         "disk and RAM budgeting (small disk → prune scratch aggressively), "
         f"and the shell to target.\n\nProbed environment:\n{probe.render()}"
     )
-    async for _ in app.agent.run_turn(prompt):
-        pass  # events are rendered by the caller's UI adapter, if any
+    write_state(home=app.config.workspace, updates={"tailored": False})
+    agent = Agent(
+        config=app.config,
+        tools={
+            name: tool for name, tool in app.agent.tools.items() if name != Ask.name
+        },
+        client=app.agent.client,
+        context=app.agent.context,
+    )
+    completed = False
+    async for event in agent.run_turn(prompt):
+        if event.type is EventType.ERROR:
+            raise RuntimeError(event.error_message or "Manual tailoring failed")
+        if event.type is EventType.MODEL_RESPONSE:
+            completed = bool(event.quote and event.quote.strip())
+    if not completed:
+        raise RuntimeError("Manual tailoring ended without a final response")
     write_state(home=app.config.workspace, updates={"tailored": True})

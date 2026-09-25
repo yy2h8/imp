@@ -79,11 +79,12 @@ class TestDocuments:
         uploads, bot = make_uploads(tmp_path)
         bot.files["f1"] = b"data"
 
-        prompt = await uploads.handle(doc_message("f1", "report.pdf", caption="summarise"))
+        prompt = await uploads.handle(
+            doc_message("f1", "report.pdf", caption="summarise")
+        )
 
         assert prompt == (
-            "Owner sent a file, saved to inbox/report.pdf, "
-            "with the note: summarise"
+            "Owner sent a file, saved to inbox/report.pdf, with the note: summarise"
         )
         assert bot.sent == []  # the caption is the turn, not an ack
 
@@ -114,7 +115,9 @@ class TestDocuments:
 
         assert prompt is None
         assert bot.sent and "could not save" in bot.sent[0]
-        assert not (tmp_path / "inbox").exists() or not list((tmp_path / "inbox").iterdir())
+        assert not (tmp_path / "inbox").exists() or not list(
+            (tmp_path / "inbox").iterdir()
+        )
 
 
 class TestPhotos:
@@ -179,3 +182,25 @@ def test_size_text_units():
 def test_stt_client_is_the_real_signature():
     """Uploads accepts the real SttClient (structural check, no network)."""
     assert hasattr(SttClient, "transcribe")
+
+
+async def test_dangling_upload_link_is_not_followed(tmp_path):
+    from assistant.uploads import Uploads
+
+    class Bot:
+        async def get_file(self, file_id):
+            return {"file_path": "file"}
+
+        async def download_file(self, path):
+            return b"safe"
+
+        async def send_message(self, chat_id, text):
+            return 1
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    (inbox / "note").symlink_to(outside)
+    saved = await Uploads(Bot(), inbox)._save("file", "note")
+    assert not outside.exists()
+    assert saved is not None and saved.read_bytes() == b"safe"

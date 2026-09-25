@@ -19,7 +19,7 @@ Project goals:
 
 ## Quickstart
 
-Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                         # install deps into .venv
@@ -57,7 +57,7 @@ docker run -it --rm \
 
 `--user` runs the container as your host user so files the agent writes in the
 mounted workspace are owned by you; `-e HOME=/tmp` gives that user a writable
-home. imp writes nothing outside the workspace itself. CLI flags go after
+home. File tools are confined to the workspace; shell commands have the container user’s permissions. CLI flags go after
 the image name (`imp -y` to auto-approve tool calls).
 
 ### Usage
@@ -158,7 +158,7 @@ Environment only (see `.env.example`); no config files to parse.
 | `IMP_MAX_TOOL_OUTPUT` | `100000` | Tool output cap in chars before truncation. |
 | `IMP_MAX_TOOL_DISPLAY_LINES` | `10` | Max tool output lines shown in the UI. |
 | `IMP_MAX_REASONING_DISPLAY_LINES` | `10` | Max reasoning lines shown (last lines kept; `...` marks a crop). |
-| `IMP_MAX_HTTP_BYTES` | `10000000` | HTTP response cap in bytes. |
+| `IMP_MAX_HTTP_BYTES` | `10000000` | Byte cap for HTTP, selected file reads, replacement and transfers. |
 | `IMP_AUTO_APPROVE` | unset | Skip approvals (`1/true/yes/on/y`). Same as `-y`. |
 
 ## Extending

@@ -73,3 +73,11 @@ def test_base_prompt_kwarg_replaces_imp_prompt():
     from imp.agent.prompt import BASE_PROMPT
 
     assert build().startswith(BASE_PROMPT.splitlines()[0])  # default unchanged
+
+
+def test_actual_skill_path_used_when_metadata_name_differs():
+    prompt = build_system_prompt(
+        "/home", [], {}, [("display", "help", "skills/actual/SKILL.md")], ""
+    )
+    assert "skills/actual/SKILL.md" in prompt
+    assert ".imp/skills/<name>" not in prompt

@@ -7,6 +7,7 @@ model can act on — never exceptions.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -69,7 +70,11 @@ class ScheduleJob(Tool):
     ) -> ToolResult:
         if not str(prompt).strip():
             return ToolResult(ok=False, content="prompt must not be empty")
-        given = [name for name, value in (("at", at), ("at_local", at_local), ("every", every)) if value is not None]
+        given = [
+            name
+            for name, value in (("at", at), ("at_local", at_local), ("every", every))
+            if value is not None
+        ]
         if len(given) != 1:
             return ToolResult(
                 ok=False,
@@ -94,10 +99,11 @@ class ScheduleJob(Tool):
             elif given[0] == "at_local":
                 when = jobstore.resolve_local_time(str(at_local), self.tz)
             else:
-                every_int = int(every)
-                if every_int <= 0:
+                every_int = every
+                if type(every_int) is not int or every_int <= 0:
                     return ToolResult(
-                        ok=False, content=f"every must be a positive integer, got {every!r}"
+                        ok=False,
+                        content=f"every must be a positive integer, got {every!r}",
                     )
         except ValueError as exc:
             return ToolResult(ok=False, content=f"invalid schedule: {exc}")
@@ -108,8 +114,10 @@ class ScheduleJob(Tool):
             at=when.astimezone(UTC) if when is not None else None,
             every=every_int,
         )
-        replaced = job_id in {j.id for j in jobstore.load_jobs(home)}
-        jobstore.save_job(home, job)
+        replaced = job_id in {
+            j.id for j in (await asyncio.to_thread(jobstore.load_jobs, home))
+        }
+        await asyncio.to_thread(jobstore.save_job, home, job)
         verb = "replaced" if replaced else "scheduled"
         detail = (
             f"every {every_int}s" if every_int is not None else f"at {when.isoformat()}"
@@ -131,7 +139,9 @@ class ScheduleJob(Tool):
                 )
             return job_id
         base = jobstore.generate_id(datetime.now(UTC))
-        return jobstore.unique_id({j.id for j in jobstore.load_jobs(home)}, base)
+        return jobstore.unique_id(
+            {j.id for j in (await asyncio.to_thread(jobstore.load_jobs, home))}, base
+        )
 
     def _home(self) -> Path | None:
         if self.config is None:
@@ -156,11 +166,17 @@ class UnscheduleJob(Tool):
         home = self._home()
         if home is None:
             return ToolResult(ok=False, content="unschedule_job has no workspace")
-        for job in jobstore.load_jobs(home):
+        for job in await asyncio.to_thread(jobstore.load_jobs, home):
             if job.id == id:
+                revision = job.revision
                 job.status = "cancelled"
                 job.next_run = None
-                jobstore.save_job(home, job)
+                if not await asyncio.to_thread(
+                    jobstore.save_if_current, home, job, revision
+                ):
+                    return ToolResult(
+                        ok=False, content="Job changed; retry cancellation."
+                    )
                 return ToolResult(ok=True, content=f"cancelled job {id!r}")
         return ToolResult(
             ok=False,
