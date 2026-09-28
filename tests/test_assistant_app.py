@@ -5,7 +5,6 @@ and edited (not re-sent per event) and the final answer is a separate message.""
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -215,15 +214,15 @@ async def test_debounce_skips_edits_until_interval_passes(app, home):
 
 async def test_command_new_resets_session(app, home):
     bot = FakeBot()
-    old_transcript = app.session.writer.path
+    old_transcript = app.session.writer.name
     runner = TurnRunner(app, bot, edit_interval=0.0, status_max_chars=3500)
 
     await runner.run("/new")
 
     assert bot.sent == [
-        f"Started a fresh session. Previous transcript is saved. New transcript: `{app.session.writer.path.name}`"
+        f"Started a fresh session. Previous transcript is saved. New transcript: `{app.session.writer.name}`"
     ]
-    assert app.session.writer.path != old_transcript
+    assert app.session.writer.name != old_transcript
     assert [m.role for m in app.agent.context.messages] == ["system"]
 
 
@@ -236,7 +235,7 @@ async def test_command_status_reports_usage_and_transcript(app, home):
     used, maximum = app.usage
     expected = (
         f"*status:* {used}/{maximum} tokens ({used / maximum:.0%}) · "
-        f"transcript `{app.session.writer.path.name}`"
+        f"transcript `{app.session.writer.name}`"
     )
     assert bot.sent == [expected]
 
@@ -330,7 +329,7 @@ async def test_poll_loop_persists_offset_and_filters_non_owner(app, home):
     loop = await run_poll_loop(bot, app, cycles=2)
 
     assert loop.offset == 101  # update_id + 1
-    state = json.loads((home / "state.json").read_text())
+    state = read_state(home)
     assert state["offset"] == 101
     # only the owner's message became a turn
     assert bot.sent[0] != "stranger"
@@ -673,15 +672,8 @@ async def test_upload_intake_does_not_download_while_asking(app):
         await asyncio.gather(loop.turn_task, return_exceptions=True)
 
 
-async def test_execution_lock_keeps_waiting_request_durable(app, home):
-    loop = PollLoop(app, FakeBot())
-    async with app.execution_lock:
-        await loop._handle_update(owner_update("waiting"))
-        await asyncio.sleep(0)
-        assert read_state(home)["pending_requests"] == ["waiting"]
-        assert read_state(home).get("active_request") is None
-        loop.turn_task.cancel()
-        await asyncio.gather(loop.turn_task, return_exceptions=True)
+async def test_whole_bot_execution_lock_is_removed(app):
+    assert not hasattr(app, "execution_lock")
 
 
 async def test_failed_recovery_notice_preserves_active_marker(app, home):

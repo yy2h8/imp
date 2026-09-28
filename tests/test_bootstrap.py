@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
 import time
@@ -147,27 +146,31 @@ class TestState:
     def test_roundtrip_and_merge(self, tmp_path):
         write_state(tmp_path, {"a": 1})
         write_state(tmp_path, {"b": 2})
-        assert json.loads((tmp_path / "state.json").read_text()) == {"a": 1, "b": 2}
+        assert read_state(tmp_path) == {"a": 1, "b": 2}
+        assert (tmp_path / "state.db").is_file()
+        assert not (tmp_path / "state.json").exists()
 
     def test_missing_file_reads_as_empty(self, tmp_path):
         assert read_state(tmp_path) == {}
 
-    def test_corrupt_state_is_rejected(self, tmp_path):
-        (tmp_path / "state.json").write_text("not json")
-        with pytest.raises(ValueError, match="state.json"):
+    def test_corrupt_state_value_is_rejected(self, tmp_path):
+        write_state(tmp_path, {"valid": True})
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "state.db")
+        conn.execute("UPDATE kv SET value = 'not json' WHERE key = 'valid'")
+        conn.commit()
+        conn.close()
+        with pytest.raises(ValueError, match="valid"):
             read_state(tmp_path)
 
-    def test_failed_state_replace_keeps_previous_state(self, tmp_path, monkeypatch):
+    def test_state_updates_merge_in_kv(self, tmp_path):
         write_state(tmp_path, {"offset": 12, "pending_requests": ["waiting"]})
-
-        def fail_replace(source, destination):
-            raise OSError("disk failure")
-
-        monkeypatch.setattr("assistant.bootstrap.os.replace", fail_replace)
-        with pytest.raises(OSError, match="disk failure"):
-            write_state(tmp_path, {"offset": 13, "pending_requests": []})
-        assert read_state(tmp_path) == {"offset": 12, "pending_requests": ["waiting"]}
-        assert list(tmp_path.iterdir()) == [tmp_path / "state.json"]
+        write_state(tmp_path, {"offset": 13, "tailored": True})
+        assert read_state(tmp_path) == {
+            "offset": 13, "pending_requests": ["waiting"], "tailored": True
+        }
+        assert not (tmp_path / "state.json").exists()
 
 
 class TestRunBootstrap:
@@ -188,7 +191,7 @@ class TestRunBootstrap:
         assert result.changed is True
         assert result.probe is probe
         assert "512 MB" in (home / "AGENTS.md").read_text()
-        state = json.loads((home / "state.json").read_text())
+        state = read_state(home)
         assert state["fingerprint"] == probe.fingerprint()
 
     def test_mismatch_rewrites_manual(self, tmp_path, package_dir):
@@ -204,7 +207,7 @@ class TestRunBootstrap:
         manual_after = (home / "AGENTS.md").read_text()
         assert manual_after != manual_before
         assert "256 MB" in manual_after
-        state = json.loads((home / "state.json").read_text())
+        state = read_state(home)
         assert state["fingerprint"] == make_probe(ram="256 MB").fingerprint()
 
     def test_no_op_when_fingerprint_matches(self, tmp_path, package_dir):

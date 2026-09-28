@@ -76,8 +76,18 @@ async def test_build_assistant_pins_openrouter_and_wires_stt(tmp_path, monkeypat
         assert isinstance(app.uploads.stt, SttClient)
         assert app.uploads.stt.model == "openai/whisper-large-v3-turbo"
         assert (tmp_path / "inbox").is_dir()
+        assert app.db is not None and app.outbox is not None and app.scheduler is not None
+        assert not hasattr(app, "execution_lock")
         assert "schedule_job" in app.agent.tools
         assert "unschedule_job" in app.agent.tools
+        assert "memory_set" in app.agent.tools
+        assert "list_jobs" in app.agent.tools
+        assert "## Memory" not in app.build_prompt()
+        assert (await app.agent.tools["memory_set"].execute(
+            key="units", value="metric"
+        )).ok
+        assert "## Memory" in app.build_prompt()
+        assert "units: metric" in app.build_prompt()
         # the tools saw the same workspace the jobs land in
         assert app.agent.tools["schedule_job"].config.workspace == tmp_path
 
@@ -182,7 +192,7 @@ async def test_context_exit_closes_replacement_writer(tmp_path, monkeypatch):
     async with build_assistant(config, 7) as app:
         app.reset()
         writer = app.session.writer
-    assert writer._fh.closed
+    assert writer._conn is None
 
 
 async def test_reset_refreshes_manual(tmp_path, monkeypatch):

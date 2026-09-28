@@ -28,9 +28,7 @@ from .bootstrap import (
     write_state,
 )
 from .config import AssistantConfig
-from .db import STATE_DB_NAME, open_db
-from .outbox import Outbox
-from .scheduler import JobContext, build_scheduler, set_context, startup_recovery
+from .scheduler import set_context, startup_recovery
 
 _LOG = logging.getLogger(__name__)
 
@@ -101,7 +99,7 @@ class TurnRunner:
             return f"Started a fresh session. Previous transcript is saved. New transcript: `{name}`"
         if lowered == "/status":
             used, maximum = self.app.usage
-            name = self.app.session.writer.path.name
+            name = self.app.session.writer.name
             _LOG.info("command /status: %d/%d tokens", used, maximum)
             return (
                 f"*status:* {used}/{maximum} tokens ({used / maximum:.0%}) · "
@@ -337,7 +335,8 @@ class PollLoop:
         was ignored. ``depth`` is the queue length including this prompt.
         Best-effort: a failed acknowledgement is logged, never fatal.
         """
-        if depth <= 1 and not self.app.execution_lock.locked():
+        active = self.turn_task is not None and not self.turn_task.done()
+        if depth <= 1 and not active:
             return  # nothing ahead: this prompt runs now, no acknowledgement
         try:
             await send_text(self.bot, self.app.chat_id, queued_notice(depth))
@@ -354,20 +353,19 @@ class PollLoop:
 
     async def _work(self) -> None:
         while True:
-            async with self.app.execution_lock:
-                async with self._state_lock:
-                    if not self.pending:
-                        return
-                    prompt = self.pending[0]
-                    await self._save(
-                        pending_requests=self.pending[1:], active_request=prompt
-                    )
-                if isinstance(prompt, dict):
-                    prompt = await self.app.uploads.handle(prompt["attachment"])
-                if prompt is not None:
-                    await self._run_turn(prompt)
-                async with self._state_lock:
-                    await self._save(active_request=None)
+            async with self._state_lock:
+                if not self.pending:
+                    return
+                prompt = self.pending[0]
+                await self._save(
+                    pending_requests=self.pending[1:], active_request=prompt
+                )
+            if isinstance(prompt, dict):
+                prompt = await self.app.uploads.handle(prompt["attachment"])
+            if prompt is not None:
+                await self._run_turn(prompt)
+            async with self._state_lock:
+                await self._save(active_request=None)
 
     async def _run_turn(self, text: str) -> None:
         await TurnRunner(
@@ -409,31 +407,16 @@ async def run_bot() -> None:
             chat_id,
         )
         prune_scratch(app.assistant.home, app.assistant.scratch_ttl_days)
-        db = await open_db(app.assistant.home / STATE_DB_NAME)
-
-        async def deliver(text: str) -> None:
-            await app.bot.send_text(app.chat_id, text)
-
-        outbox = Outbox(deliver)
-        scheduler = build_scheduler(app.assistant.home, app.assistant.tz)
-        context = JobContext(
-            app=app,
-            outbox=outbox,
-            semaphore=asyncio.Semaphore(app.assistant.max_concurrent_jobs),
-            db=db,
-            db_path=app.assistant.home / STATE_DB_NAME,
-            scheduler=scheduler,
-        )
-        set_context(context)
+        context = app.job_context
+        assert context is not None
         await startup_recovery(context)
-        scheduler.start()
-        await outbox.start()
+        app.scheduler.start()
+        await app.outbox.start()
         try:
             await PollLoop(app, app.bot).poll_forever()
         finally:
-            scheduler.shutdown(wait=False)
-            await outbox.stop()
-            await db.close()
+            app.scheduler.shutdown(wait=False)
+            await app.outbox.stop()
             set_context(None)
 
 

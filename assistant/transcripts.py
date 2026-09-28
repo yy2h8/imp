@@ -39,11 +39,21 @@ class DbSessionWriter:
     def __enter__(self) -> Self:
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=False,
+            )
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS transcripts ("
+                "session_id TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL, "
+                "message TEXT NOT NULL, PRIMARY KEY (session_id, seq))"
+            )
+            conn.commit()
             self._conn = conn
-        except sqlite3.Error as exc:
+        except (OSError, sqlite3.Error) as exc:
             self._disable(exc)
         return self
 

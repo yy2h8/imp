@@ -52,7 +52,9 @@ def test_session_id_format_and_uniqueness(tmp_path):
 
 
 def test_erroring_db_disables_persistence_without_raising(tmp_path, capsys):
-    db_path = tmp_path / "missing" / "nested" / STATE_DB_NAME  # unwritable
+    occupied = tmp_path / "occupied"
+    occupied.write_text("not a directory")
+    db_path = occupied / "nested" / STATE_DB_NAME
     writer = DbSessionWriter(db_path)
     writer.__enter__()  # mkdir fails → disabled, warning on stderr
     writer.write(TextMessage(role="user", content="hello"))

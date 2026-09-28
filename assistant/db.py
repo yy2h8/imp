@@ -8,6 +8,7 @@ by ``PRAGMA user_version``: each version's DDL is idempotent, applied once.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -222,7 +223,26 @@ async def memory_digest(conn: aiosqlite.Connection) -> str:
     """Compact one-line-per-entry digest, newest entries kept, capped at
     MEMORY_DIGEST_CHARS with an overflow marker. Values truncated, never the
     stored data."""
-    entries = list(reversed(await memory_all(conn)))  # newest first
+    return _format_memory_digest(list(reversed(await memory_all(conn))))
+
+
+def memory_digest_sync(path: Path) -> str:
+    """Sync counterpart for system-prompt rebuilds on the legacy sync seam."""
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        rows = conn.execute(
+            "SELECT key, value FROM memory ORDER BY updated_at, key"
+        ).fetchall()
+        return _format_memory_digest(list(reversed(rows)))
+    except sqlite3.OperationalError:  # no schema yet (e.g. standalone test Session)
+        return ""
+    finally:
+        conn.close()
+
+
+def _format_memory_digest(entries: list[tuple[str, str]]) -> str:
     lines: list[str] = []
     dropped = 0
     for key, value in entries:

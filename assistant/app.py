@@ -10,29 +10,33 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiosqlite
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import AsyncOpenAI
 
-from imp.adapters import FileSystemAdapter, HttpClient, SessionWriter
+from imp.adapters import FileSystemAdapter, HttpClient
 from imp.agent import Agent, Context, build_system_prompt
 from imp.config import Config
 
 from .adapters import SttClient, TelegramBot
 from .adapters.telegram import send_text
 from .config import OPENROUTER_BASE_URL, AssistantConfig
-from .prompt import BASE_PROMPT
+from .db import STATE_DB_NAME, memory_digest, memory_digest_sync, open_db
+from .outbox import Outbox
+from .prompt import BASE_PROMPT, memory_section
+from .scheduler import JobContext, build_scheduler, set_context
 from .tools import build_assistant_tools
+from .transcripts import DbSessionWriter
 from .uploads import Uploads
 
 _LOG = logging.getLogger(__name__)
 
 HOME_DIRS = (
     "skills",
-    "sessions",
     "scratch",
     "scripts",
     "projects",
     "outbox",
-    "jobs",
     "inbox",
 )
 
@@ -85,12 +89,14 @@ class AskRouter:
 class Session:
     """The one interactive conversation: current writer + context."""
 
-    writer: SessionWriter
+    writer: DbSessionWriter
     context: Context
 
     @classmethod
-    def open(cls, config: Config, system_prompt: str) -> Session:
-        writer = SessionWriter(config.workspace, sessions_dir="sessions")
+    def open(
+        cls, config: Config, system_prompt: str, db_path: Path | None = None
+    ) -> Session:
+        writer = DbSessionWriter(db_path or (config.workspace / STATE_DB_NAME))
         writer.__enter__()
         context = Context(config=config, system_prompt=system_prompt, writer=writer)
         return cls(writer=writer, context=context)
@@ -109,8 +115,14 @@ class AssistantApp:
     chat_id: int
     ask_router: AskRouter
     uploads: Uploads
-    # ponytail: whole-turn lock; finer locks only if delayed jobs become unacceptable.
-    execution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    db: aiosqlite.Connection | None = None
+    outbox: Outbox | None = None
+    scheduler: AsyncIOScheduler | None = None
+    jobs_semaphore: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(2)
+    )
+    turn_state: dict[str, bool] = field(default_factory=lambda: {"active": False})
+    job_context: JobContext | None = None
 
     @property
     def usage(self) -> tuple[int, int]:
@@ -126,7 +138,7 @@ class AssistantApp:
             skills_dir="skills",
             max_bytes=self.config.max_http_bytes,
         )
-        return build_system_prompt(
+        prompt = build_system_prompt(
             str(self.config.workspace),
             fs.list_directory(level=1),
             self.agent.tools,
@@ -134,6 +146,8 @@ class AssistantApp:
             fs.gather_project_context(),
             base_prompt=BASE_PROMPT,
         )
+        digest = memory_digest_sync(self.assistant.home / STATE_DB_NAME)
+        return prompt + memory_section(digest)
 
     def refresh_prompt(self) -> None:
         self.session.context.replace_system_prompt(self.build_prompt())
@@ -143,9 +157,11 @@ class AssistantApp:
         transcript, rebuild the context from current instructions and skills."""
         self.session.writer.__exit__(None, None, None)
         system_prompt = self.build_prompt()
-        self.session = Session.open(self.config, system_prompt)
+        self.session = Session.open(
+            self.config, system_prompt, self.assistant.home / STATE_DB_NAME
+        )
         self.agent.context = self.session.context
-        return self.session.writer.path.name
+        return self.session.writer.name
 
 
 @asynccontextmanager
@@ -162,9 +178,18 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
     fs = FileSystemAdapter(
         imp_config.workspace, skills_dir="skills", max_bytes=imp_config.max_http_bytes
     )
+    db = await open_db(assistant_config.home / STATE_DB_NAME)
 
     prompt_lock = asyncio.Lock()
     ask_router = AskRouter()
+    turn_state = {"active": False}
+
+    async def deliver_job_result(text: str) -> None:
+        await send_text(bot, chat_id, text)
+
+    outbox = Outbox(deliver_job_result)
+    scheduler = build_scheduler(assistant_config.home, assistant_config.tz)
+    jobs_semaphore = asyncio.Semaphore(assistant_config.max_concurrent_jobs)
 
     async def prompt_user(message: str, markdown: bool = True) -> str:
         # mutating-tool approvals auto-approve, so this is reached
@@ -205,6 +230,9 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 http=http,
                 sender=sender,
                 tz=assistant_config.tz,
+                scheduler=scheduler,
+                db=db,
+                is_turn_active=lambda: turn_state["active"],
             )
             system_prompt = build_system_prompt(
                 str(imp_config.workspace),
@@ -213,8 +241,10 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 fs.list_skills(),
                 fs.gather_project_context(),
                 base_prompt=BASE_PROMPT,
+            ) + memory_section(await memory_digest(db))
+            session = Session.open(
+                imp_config, system_prompt, assistant_config.home / STATE_DB_NAME
             )
-            session = Session.open(imp_config, system_prompt)
             app = None
             try:
                 agent = Agent(
@@ -239,9 +269,25 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                     chat_id=chat_id,
                     ask_router=ask_router,
                     uploads=uploads,
+                    db=db,
+                    outbox=outbox,
+                    scheduler=scheduler,
+                    jobs_semaphore=jobs_semaphore,
+                    turn_state=turn_state,
                 )
+                app.job_context = JobContext(
+                    app=app,
+                    outbox=outbox,
+                    semaphore=jobs_semaphore,
+                    db=db,
+                    db_path=assistant_config.home / STATE_DB_NAME,
+                    scheduler=scheduler,
+                )
+                set_context(app.job_context)
                 yield app
             finally:
                 (app.session if app else session).writer.__exit__(None, None, None)
     finally:
+        set_context(None)
         await bot.close()
+        await db.close()
