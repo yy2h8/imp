@@ -24,6 +24,7 @@ ASSISTANT_ENV_VARS = [
     "IMP_STT_MODEL",
     "IMP_TZ",
     "IMP_LOG_LEVEL",
+    "IMP_MAX_CONCURRENT_JOBS",
 ]
 
 IMP_ENV_VARS = [
@@ -79,6 +80,23 @@ async def test_build_assistant_pins_openrouter_and_wires_stt(tmp_path, monkeypat
         assert "unschedule_job" in app.agent.tools
         # the tools saw the same workspace the jobs land in
         assert app.agent.tools["schedule_job"].config.workspace == tmp_path
+
+
+def test_max_concurrent_jobs_defaults_to_two(tmp_path, monkeypatch):
+    from assistant.config import DEFAULT_MAX_CONCURRENT_JOBS
+
+    config = make_config(tmp_path, monkeypatch)
+    assert config.max_concurrent_jobs == DEFAULT_MAX_CONCURRENT_JOBS == 2
+
+
+def test_max_concurrent_jobs_override(tmp_path, monkeypatch):
+    config = make_config(tmp_path, monkeypatch, IMP_MAX_CONCURRENT_JOBS="5")
+    assert config.max_concurrent_jobs == 5
+
+
+def test_max_concurrent_jobs_must_be_positive(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="IMP_MAX_CONCURRENT_JOBS"):
+        make_config(tmp_path, monkeypatch, IMP_MAX_CONCURRENT_JOBS="0")
 
 
 def test_minimal_config_defaults(tmp_path, monkeypatch):

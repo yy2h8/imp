@@ -14,6 +14,7 @@ DEFAULT_RESET_THRESHOLD = 0.85
 DEFAULT_SCRATCH_TTL_DAYS = 7
 DEFAULT_TZ = "Asia/Almaty"  # the owner's timezone; IMP_TZ overrides
 DEFAULT_STT_MODEL = "openai/whisper-large-v3-turbo"  # OpenRouter's whisper turbo
+DEFAULT_MAX_CONCURRENT_JOBS = 2
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"  # the only provider
 LOG_LEVELS = ("debug", "info", "warning", "error")
 DEFAULT_LOG_LEVEL = "info"
@@ -34,6 +35,7 @@ class AssistantConfig:
     stt_model: str = DEFAULT_STT_MODEL
     tz: str = DEFAULT_TZ
     log_level: str = DEFAULT_LOG_LEVEL
+    max_concurrent_jobs: int = DEFAULT_MAX_CONCURRENT_JOBS
 
     @classmethod
     def raw_token(cls) -> str:
@@ -95,6 +97,14 @@ class AssistantConfig:
             os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
         )
         ttl = int(os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS)
+        try:
+            max_jobs = int(
+                os.getenv("IMP_MAX_CONCURRENT_JOBS") or DEFAULT_MAX_CONCURRENT_JOBS
+            )
+        except ValueError as exc:
+            raise ValueError("IMP_MAX_CONCURRENT_JOBS must be an integer") from exc
+        if max_jobs < 1:
+            raise ValueError("IMP_MAX_CONCURRENT_JOBS must be >= 1")
         log_level = (os.getenv("IMP_LOG_LEVEL") or DEFAULT_LOG_LEVEL).strip().lower()
         if log_level not in LOG_LEVELS:
             raise ValueError(
@@ -117,4 +127,5 @@ class AssistantConfig:
             stt_model=os.getenv("IMP_STT_MODEL") or DEFAULT_STT_MODEL,
             tz=tz,
             log_level=log_level,
+            max_concurrent_jobs=max_jobs,
         )

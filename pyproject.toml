@@ -11,11 +11,15 @@ license = "MIT"
 authors = [{ name = "yy2h8" }]
 requires-python = ">=3.12"
 dependencies = [
+    "aiogram>=3.31",
+    "aiosqlite>=0.21",
+    "apscheduler[sqlalchemy]~=3.11",
     "httpx2>=2.12.0",
     "lxml[html-clean]>=6.1.2",
     "openai>=3.5.0",
     "prompt-toolkit>=3.0.51",
     "rich>=13.9.0",
+    "telegramify-markdown>=1.4",
 ]
 
 [project.scripts]
