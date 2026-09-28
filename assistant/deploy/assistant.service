@@ -1,7 +1,8 @@
 # systemd unit — generic Linux
 #
 # Install:
-#   1. Repo checkout at /opt/imp, venv at /opt/imp-venv (see assistant/README.md).
+#   1. Repo checkout at /opt/imp; install uv at /usr/local/bin/uv and run
+#      `cd /opt/imp && uv sync --locked --no-dev` (see assistant/README.md).
 #   2. Copy assistant/.env.example to /etc/assistant.env, fill it in, then:
 #        chmod 600 /etc/assistant.env
 #   3. cp assistant/deploy/assistant.service /etc/systemd/system/
@@ -16,7 +17,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/imp-venv/bin/python -m assistant
+ExecStart=/usr/local/bin/uv run --locked --no-sync python -m assistant
 WorkingDirectory=/opt/imp
 EnvironmentFile=/etc/assistant.env
 Restart=on-failure

@@ -385,6 +385,10 @@ async def run_bot() -> None:
         await app.outbox.start()
         await controller.start()
         try:
+            try:
+                await send_text(app.bot, chat_id, "pong")
+            except TelegramError as exc:
+                _LOG.warning("startup notification failed: %s", exc)
             await dispatcher.start_polling(
                 app.bot.client,
                 allowed_updates=dispatcher.resolve_used_update_types(),

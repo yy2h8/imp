@@ -112,11 +112,12 @@ docker compose -f assistant/deploy/compose.yaml run --rm assistant whoami
 
 Supported hosts are glibc Linux on Python 3.12 or newer, including ARM64 SBCs
 (the first target is Armbian). The systemd service runs as root. From a checkout
-at `/opt/imp`:
+at `/opt/imp`, install uv system-wide and sync the runtime environment:
 
 ```bash
-python3.12 -m venv /opt/imp-venv
-/opt/imp-venv/bin/pip install /opt/imp
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+cd /opt/imp
+uv sync --locked --no-dev
 ```
 
 Configure the systemd environment file with the Telegram token and OpenRouter
@@ -127,7 +128,7 @@ cp /opt/imp/assistant/.env.example /etc/assistant.env
 # Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY.
 chmod 600 /etc/assistant.env
 set -a; . /etc/assistant.env; set +a
-/opt/imp-venv/bin/python -m assistant whoami
+/usr/local/bin/uv run --locked --no-sync --directory /opt/imp python -m assistant whoami
 # Put the printed ID in IMP_TG_ALLOWED_USER_IDS in /etc/assistant.env.
 cp /opt/imp/assistant/deploy/assistant.service /etc/systemd/system/
 systemctl daemon-reload
