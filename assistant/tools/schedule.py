@@ -22,14 +22,14 @@ from ..scheduler import run_scheduled_job
 _ID_RE = re.compile(r"[a-z0-9-]{1,64}")
 
 SCHEDULE_HINT = (
-    "Exactly one of at / at_local / every / cron is required. "
-    "Omit unused fields; do not send empty strings or 0 as placeholders. "
-    "at: ISO-8601 with UTC offset (2026-09-24T08:00:00+06:00). "
-    "at_local: naive wall time 'YYYY-MM-DD HH:MM' in the owner's timezone. "
-    "every: recurring interval in seconds. "
-    "cron: five-field cron expression in the owner's timezone. "
+    "Use one schedule object {mode, value}; never pass at, at_local, every, or cron separately. "
+    "Choose exactly one mode. "
+    "at: ISO-8601 with UTC offset; at_local: naive 'YYYY-MM-DD HH:MM' in the owner's timezone; "
+    "every: positive interval seconds; cron: five-field expression in the owner's timezone. "
     "Jobs run in a fresh context: put everything the job needs into prompt."
 )
+
+_SCHEDULE_MODES = ("at", "at_local", "every", "cron")
 
 
 def valid_id(job_id: str) -> bool:
@@ -71,28 +71,25 @@ class ScheduleJob(Tool):
             "type": "string",
             "description": "Self-contained instructions for the scheduled run.",
         },
-        "at": {
-            "type": "string",
-            "description": "One-shot ISO-8601 timestamp with UTC offset.",
-        },
-        "at_local": {
-            "type": "string",
-            "description": "One-shot local wall time in the owner's timezone.",
-        },
-        "every": {
-            "type": "integer",
-            "description": "Recurring interval in seconds (> 0).",
-        },
-        "cron": {
-            "type": "string",
-            "description": "Recurring five-field cron expression in the owner's timezone.",
+        "schedule": {
+            "type": "object",
+            "description": SCHEDULE_HINT,
+            "properties": {
+                "mode": {"type": "string", "enum": list(_SCHEDULE_MODES)},
+                "value": {
+                    "type": "string",
+                    "description": "Schedule value for the selected mode; interval seconds as digits.",
+                },
+            },
+            "required": ["mode", "value"],
+            "additionalProperties": False,
         },
         "id": {
             "type": "string",
             "description": "Optional slug id ([a-z0-9-], max 64 chars).",
         },
     }
-    required: ClassVar[list[str]] = ["prompt"]
+    required: ClassVar[list[str]] = ["prompt", "schedule"]
 
     def __init__(
         self,
@@ -109,54 +106,68 @@ class ScheduleJob(Tool):
     async def execute(
         self,
         prompt: str,
-        at: str | None = None,
-        at_local: str | None = None,
-        every: int | None = None,
-        cron: str | None = None,
+        schedule: dict[str, Any] | None = None,
         id: str | None = None,
     ) -> ToolResult:
         if not prompt.strip():
             return ToolResult(ok=False, content="prompt must not be empty")
         if self.scheduler is None or self.db is None:
             return ToolResult(ok=False, content="scheduler is unavailable")
-        given = [
-            name
-            for name, value in (
-                ("at", at), ("at_local", at_local), ("every", every), ("cron", cron)
-            )
-            if value is not None and value != ""
-        ]
-        if len(given) > 1 and every == 0:
-            given.remove("every")
-        if len(given) != 1:
+        if not isinstance(schedule, dict) or set(schedule) != {"mode", "value"}:
             return ToolResult(
                 ok=False,
-                content=f"exactly one of at/at_local/every/cron is required, got {given or 'none'}. {SCHEDULE_HINT}",
+                content="schedule must contain only mode and value",
+            )
+        mode, value = schedule["mode"], schedule["value"]
+        if mode not in _SCHEDULE_MODES:
+            return ToolResult(
+                ok=False,
+                content=f"schedule mode must be one of {_SCHEDULE_MODES}, got {mode!r}",
             )
         try:
-            if given[0] == "at":
-                when = datetime.fromisoformat(str(at).strip())
+            if mode == "at":
+                if not isinstance(value, str) or not value.strip():
+                    return ToolResult(ok=False, content="at value must be a timestamp")
+                when = datetime.fromisoformat(value.strip())
                 if when.tzinfo is None:
                     return ToolResult(
                         ok=False,
-                        content=f"at must carry a UTC offset (e.g. +00:00); got {at!r}",
+                        content=f"at must carry a UTC offset (e.g. +00:00); got {value!r}",
                     )
                 trigger = DateTrigger(run_date=when.astimezone(UTC))
                 detail = f"at {when.astimezone(UTC).isoformat()}"
-            elif given[0] == "at_local":
-                when = resolve_local_time(str(at_local), self.tz)
+            elif mode == "at_local":
+                if not isinstance(value, str) or not value.strip():
+                    return ToolResult(ok=False, content="at_local value must be a local timestamp")
+                when = resolve_local_time(value, self.tz)
                 trigger = DateTrigger(run_date=when)
                 detail = f"at {when.isoformat()}"
-            elif given[0] == "every":
-                if type(every) is not int or every <= 0:
+            elif mode == "every":
+                if type(value) is int:
+                    seconds = value
+                elif isinstance(value, str):
+                    try:
+                        seconds = int(value.strip())
+                    except ValueError:
+                        return ToolResult(
+                            ok=False,
+                            content=f"every must be a positive integer, got {value!r}",
+                        )
+                else:
                     return ToolResult(
-                        ok=False, content=f"every must be a positive integer, got {every!r}"
+                        ok=False, content=f"every must be a positive integer, got {value!r}"
                     )
-                trigger = IntervalTrigger(seconds=every)
-                detail = f"every {every}s"
+                if seconds <= 0:
+                    return ToolResult(
+                        ok=False, content=f"every must be a positive integer, got {value!r}"
+                    )
+                trigger = IntervalTrigger(seconds=seconds)
+                detail = f"every {seconds}s"
             else:
-                trigger = CronTrigger.from_crontab(str(cron), timezone=ZoneInfo(self.tz))
-                detail = f"cron {cron!r} ({self.tz})"
+                if not isinstance(value, str) or not value.strip():
+                    return ToolResult(ok=False, content="cron value must not be empty")
+                trigger = CronTrigger.from_crontab(value.strip(), timezone=ZoneInfo(self.tz))
+                detail = f"cron {value!r} ({self.tz})"
         except (ValueError, ZoneInfoNotFoundError) as exc:
             return ToolResult(ok=False, content=f"invalid schedule: {exc}")
 
