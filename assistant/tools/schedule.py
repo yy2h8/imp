@@ -1,35 +1,70 @@
-"""Scheduler tools: the model-facing way to add and cancel jobs.
-
-The only writers of jobs/ from the model's side; storage and schema live in
-assistant/jobstore.py. All validation failures return ToolResult error text the
-model can act on — never exceptions.
-"""
+"""Scheduler tools: the model-facing way to add and cancel durable jobs."""
 
 from __future__ import annotations
 
-import asyncio
+import re
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import aiosqlite
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from imp.tools.base import Tool, ToolResult
 
-from .. import jobstore
+from ..db import jobs_meta_get, jobs_meta_list, jobs_meta_update, jobs_meta_upsert
+from ..scheduler import run_scheduled_job
+
+_ID_RE = re.compile(r"[a-z0-9-]{1,64}")
 
 SCHEDULE_HINT = (
-    "Exactly one of at / at_local / every is required. "
+    "Exactly one of at / at_local / every / cron is required. "
     "at: ISO-8601 with UTC offset (2026-09-24T08:00:00+06:00). "
     "at_local: naive wall time 'YYYY-MM-DD HH:MM' in the owner's timezone. "
     "every: recurring interval in seconds. "
+    "cron: five-field cron expression in the owner's timezone. "
     "Jobs run in a fresh context: put everything the job needs into prompt."
 )
 
 
+def valid_id(job_id: str) -> bool:
+    return bool(_ID_RE.fullmatch(job_id))
+
+
+def resolve_local_time(value: str, tz_name: str) -> datetime:
+    """Local wall time → aware UTC datetime."""
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+        zone = ZoneInfo(tz_name)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(
+            f"cannot resolve local time {value!r} in timezone {tz_name!r}: {exc}"
+        ) from exc
+    local = parsed.replace(tzinfo=zone) if parsed.tzinfo is None else parsed
+    return local.astimezone(UTC)
+
+
+def generate_id(now: datetime) -> str:
+    return f"job-{now.astimezone(UTC):%Y%m%d-%H%M%S}"
+
+
+def unique_id(existing: set[str], base: str) -> str:
+    candidate, n = base, 1
+    while candidate in existing:
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
 class ScheduleJob(Tool):
     name = "schedule_job"
-    description = "Schedule an agent run: one-shot at a time or recurring."
+    description = "Schedule an agent run: one-shot, interval, or cron."
     instructions = SCHEDULE_HINT
-    mutating = True  # serializes within a batch: jobs/ has no locking
+    mutating = True
     parameters: ClassVar[dict[str, Any]] = {
         "prompt": {
             "type": "string",
@@ -41,24 +76,34 @@ class ScheduleJob(Tool):
         },
         "at_local": {
             "type": "string",
-            "description": "One-shot naive local time, 'YYYY-MM-DD HH:MM', "
-            "resolved in the owner's timezone (IMP_TZ).",
+            "description": "One-shot local wall time in the owner's timezone.",
         },
         "every": {
             "type": "integer",
             "description": "Recurring interval in seconds (> 0).",
         },
+        "cron": {
+            "type": "string",
+            "description": "Recurring five-field cron expression in the owner's timezone.",
+        },
         "id": {
             "type": "string",
-            "description": "Optional slug id ([a-z0-9-], max 64 chars). An "
-            "existing id is replaced wholesale; omit to auto-generate.",
+            "description": "Optional slug id ([a-z0-9-], max 64 chars).",
         },
     }
     required: ClassVar[list[str]] = ["prompt"]
 
-    def __init__(self, tz: str, **kwargs) -> None:
+    def __init__(
+        self,
+        tz: str,
+        scheduler: AsyncIOScheduler | None = None,
+        db: aiosqlite.Connection | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.tz = tz
+        self.scheduler = scheduler
+        self.db = db
 
     async def execute(
         self,
@@ -66,29 +111,26 @@ class ScheduleJob(Tool):
         at: str | None = None,
         at_local: str | None = None,
         every: int | None = None,
+        cron: str | None = None,
         id: str | None = None,
     ) -> ToolResult:
-        if not str(prompt).strip():
+        if not prompt.strip():
             return ToolResult(ok=False, content="prompt must not be empty")
+        if self.scheduler is None or self.db is None:
+            return ToolResult(ok=False, content="scheduler is unavailable")
         given = [
             name
-            for name, value in (("at", at), ("at_local", at_local), ("every", every))
+            for name, value in (
+                ("at", at), ("at_local", at_local), ("every", every), ("cron", cron)
+            )
             if value is not None
         ]
         if len(given) != 1:
             return ToolResult(
                 ok=False,
-                content=f"exactly one of at/at_local/every is required, got {given or 'none'}. {SCHEDULE_HINT}",
+                content=f"exactly one of at/at_local/every/cron is required, got {given or 'none'}. {SCHEDULE_HINT}",
             )
-        home = self._home()
-        if home is None:
-            return ToolResult(ok=False, content="schedule_job has no workspace")
-        job_id = await self._resolve_id(home, id)
-        if isinstance(job_id, ToolResult):
-            return job_id
         try:
-            when: datetime | None = None
-            every_int: int | None = None
             if given[0] == "at":
                 when = datetime.fromisoformat(str(at).strip())
                 if when.tzinfo is None:
@@ -96,94 +138,96 @@ class ScheduleJob(Tool):
                         ok=False,
                         content=f"at must carry a UTC offset (e.g. +00:00); got {at!r}",
                     )
+                trigger = DateTrigger(run_date=when.astimezone(UTC))
+                detail = f"at {when.astimezone(UTC).isoformat()}"
             elif given[0] == "at_local":
-                when = jobstore.resolve_local_time(str(at_local), self.tz)
-            else:
-                every_int = every
-                if type(every_int) is not int or every_int <= 0:
+                when = resolve_local_time(str(at_local), self.tz)
+                trigger = DateTrigger(run_date=when)
+                detail = f"at {when.isoformat()}"
+            elif given[0] == "every":
+                if type(every) is not int or every <= 0:
                     return ToolResult(
-                        ok=False,
-                        content=f"every must be a positive integer, got {every!r}",
+                        ok=False, content=f"every must be a positive integer, got {every!r}"
                     )
-        except ValueError as exc:
+                trigger = IntervalTrigger(seconds=every)
+                detail = f"every {every}s"
+            else:
+                trigger = CronTrigger.from_crontab(str(cron), timezone=ZoneInfo(self.tz))
+                detail = f"cron {cron!r} ({self.tz})"
+        except (ValueError, ZoneInfoNotFoundError) as exc:
             return ToolResult(ok=False, content=f"invalid schedule: {exc}")
 
-        job = jobstore.Job(
+        job_id = await self._resolve_id(id)
+        if isinstance(job_id, ToolResult):
+            return job_id
+        replaced = self.scheduler.get_job(job_id) is not None
+        self.scheduler.add_job(
+            run_scheduled_job,
+            trigger=trigger,
+            args=[job_id, prompt.strip()],
             id=job_id,
-            prompt=str(prompt).strip(),
-            at=when.astimezone(UTC) if when is not None else None,
-            every=every_int,
+            replace_existing=True,
         )
-        replaced = job_id in {
-            j.id for j in (await asyncio.to_thread(jobstore.load_jobs, home))
-        }
-        await asyncio.to_thread(jobstore.save_job, home, job)
+        await jobs_meta_upsert(
+            self.db,
+            schedule_id=job_id,
+            label=prompt.strip()[:80],
+            prompt=prompt.strip(),
+            tz=self.tz,
+            state="scheduled",
+        )
         verb = "replaced" if replaced else "scheduled"
-        detail = (
-            f"every {every_int}s" if every_int is not None else f"at {when.isoformat()}"
-        )
         return ToolResult(
             ok=True,
             content=f"{verb} job {job_id!r} ({detail}); the owner will get the result as a message.",
         )
 
-    async def _resolve_id(self, home, id: str | None):
-        """Explicit ids validate against the slug rule; generated ids never
-        replace an existing job (they get -2/-3... suffixes instead)."""
-        if id is not None:
-            job_id = str(id).strip()
-            if not jobstore.valid_id(job_id):
+    async def _resolve_id(self, requested: str | None) -> str | ToolResult:
+        if requested is not None:
+            job_id = str(requested).strip()
+            if not valid_id(job_id):
                 return ToolResult(
                     ok=False,
                     content=f"invalid id {job_id!r}: use lowercase letters, digits, hyphens (max 64)",
                 )
             return job_id
-        base = jobstore.generate_id(datetime.now(UTC))
-        return jobstore.unique_id(
-            {j.id for j in (await asyncio.to_thread(jobstore.load_jobs, home))}, base
-        )
-
-    def _home(self) -> Path | None:
-        if self.config is None:
-            return None
-        return Path(self.config.workspace)
+        assert self.scheduler is not None and self.db is not None
+        existing = {job.id for job in self.scheduler.get_jobs()}
+        existing.update(row["schedule_id"] for row in await jobs_meta_list(self.db))
+        return unique_id(existing, generate_id(datetime.now(UTC)))
 
 
 class UnscheduleJob(Tool):
     name = "unschedule_job"
-    description = "Cancel a scheduled job by id; the job file is kept as a record."
-    instructions = (
-        "Cancelling sets status=cancelled and clears next_run; the file stays in "
-        "jobs/ as a record. List jobs with list_dir/read_file on jobs/."
-    )
+    description = "Cancel a scheduled job by id; its result record is kept."
+    instructions = "Use list_jobs to see current ids; cancelled jobs remain in history."
     mutating = True
     parameters: ClassVar[dict[str, Any]] = {
         "id": {"type": "string", "description": "The job id to cancel."}
     }
     required: ClassVar[list[str]] = ["id"]
 
-    async def execute(self, id: str) -> ToolResult:
-        home = self._home()
-        if home is None:
-            return ToolResult(ok=False, content="unschedule_job has no workspace")
-        for job in await asyncio.to_thread(jobstore.load_jobs, home):
-            if job.id == id:
-                revision = job.revision
-                job.status = "cancelled"
-                job.next_run = None
-                if not await asyncio.to_thread(
-                    jobstore.save_if_current, home, job, revision
-                ):
-                    return ToolResult(
-                        ok=False, content="Job changed; retry cancellation."
-                    )
-                return ToolResult(ok=True, content=f"cancelled job {id!r}")
-        return ToolResult(
-            ok=False,
-            content=f"no job with id {id!r}; list jobs/ to see current ids.",
-        )
+    def __init__(
+        self,
+        scheduler: AsyncIOScheduler | None = None,
+        db: aiosqlite.Connection | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.scheduler = scheduler
+        self.db = db
 
-    def _home(self) -> Path | None:
-        if self.config is None:
-            return None
-        return Path(self.config.workspace)
+    async def execute(self, id: str) -> ToolResult:
+        if self.scheduler is None or self.db is None:
+            return ToolResult(ok=False, content="scheduler is unavailable")
+        try:
+            self.scheduler.remove_job(id)
+        except JobLookupError:
+            current = ", ".join(job.id for job in self.scheduler.get_jobs()) or "none"
+            return ToolResult(
+                ok=False, content=f"no job with id {id!r}; current ids: {current}."
+            )
+        row = await jobs_meta_get(self.db, id)
+        if row is not None:
+            await jobs_meta_update(self.db, id, state="cancelled")
+        return ToolResult(ok=True, content=f"cancelled job {id!r}")

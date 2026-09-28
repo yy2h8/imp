@@ -1,142 +1,180 @@
-"""schedule_job / unschedule_job tools: strict schema, atomic store, cancel."""
+"""schedule_job / unschedule_job over APScheduler + jobs_meta (+ cron)."""
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
-from assistant.jobstore import load_jobs
+import pytest
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from assistant.db import STATE_DB_NAME, jobs_meta_get, open_db
 from assistant.tools.schedule import ScheduleJob, UnscheduleJob
 from imp.config import Config
 
-
-def make_tool(tmp_path: Path, tz: str = "Asia/Almaty") -> ScheduleJob:
-    return ScheduleJob(config=Config(api_key="k", workspace=tmp_path), tz=tz)
+_OPEN_CONNECTIONS = []
 
 
-def make_unschedule(tmp_path: Path) -> UnscheduleJob:
-    return UnscheduleJob(config=Config(api_key="k", workspace=tmp_path))
+@pytest.fixture(autouse=True)
+async def close_test_databases():
+    yield
+    while _OPEN_CONNECTIONS:
+        await _OPEN_CONNECTIONS.pop().close()
+
+
+class FakeScheduler:
+    def __init__(self) -> None:
+        self.jobs: dict[str, tuple] = {}
+
+    def add_job(self, func, trigger=None, args=None, id=None, **kwargs):
+        self.jobs[id] = (func, trigger, tuple(args or ()), kwargs)
+        return SimpleNamespace(id=id)
+
+    def get_jobs(self):
+        return [SimpleNamespace(id=job_id) for job_id in self.jobs]
+
+    def get_job(self, job_id):
+        return SimpleNamespace(id=job_id) if job_id in self.jobs else None
+
+    def remove_job(self, job_id):
+        if job_id not in self.jobs:
+            raise JobLookupError(job_id)
+        del self.jobs[job_id]
+
+
+async def make_db(tmp_path: Path):
+    conn = await open_db(tmp_path / STATE_DB_NAME)
+    _OPEN_CONNECTIONS.append(conn)
+    return conn
+
+
+def make_tool(tmp_path: Path, scheduler: FakeScheduler, conn, tz="Asia/Almaty"):
+    return ScheduleJob(
+        config=Config(api_key="k", workspace=tmp_path),
+        tz=tz,
+        scheduler=scheduler,
+        db=conn,
+    )
+
+
+def make_unschedule(tmp_path: Path, scheduler: FakeScheduler, conn):
+    return UnscheduleJob(
+        config=Config(api_key="k", workspace=tmp_path),
+        scheduler=scheduler,
+        db=conn,
+    )
 
 
 class TestScheduleJob:
     async def test_at_local_resolves_via_tz(self, tmp_path):
-        result = await make_tool(tmp_path).execute(
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
             prompt="digest", at_local="2026-09-24 08:00"
         )
         assert result.ok
-        (job,) = load_jobs(tmp_path)
-        # Almaty is UTC+5 (since 2024): 08:00 local = 03:00 UTC
-        assert job.at == datetime(2026, 9, 24, 3, 0, tzinfo=UTC)
-        assert job.status == "pending" and job.every is None
-
-    async def test_at_requires_offset(self, tmp_path):
-        result = await make_tool(tmp_path).execute(prompt="x", at="2026-09-24T08:00:00")
-        assert not result.ok
-        assert "offset" in result.content
-        assert load_jobs(tmp_path) == []
+        (job_id, prompt) = next(iter(scheduler.jobs.values()))[2]
+        assert prompt == "digest"
+        trigger = next(iter(scheduler.jobs.values()))[1]
+        assert isinstance(trigger, DateTrigger)
+        assert trigger.run_date == datetime(2026, 9, 24, 3, 0, tzinfo=UTC)
+        row = await jobs_meta_get(conn, job_id)
+        assert row["state"] == "scheduled" and row["tz"] == "Asia/Almaty"
 
     async def test_at_with_offset_is_kept_in_utc(self, tmp_path):
-        result = await make_tool(tmp_path).execute(
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
             prompt="x", at="2026-09-24T08:00:00+06:00"
         )
         assert result.ok
-        (job,) = load_jobs(tmp_path)
-        assert job.at == datetime(2026, 9, 24, 2, 0, tzinfo=UTC)
+        (_, trigger, _, _) = next(iter(scheduler.jobs.values()))
+        assert isinstance(trigger, DateTrigger)
+        assert trigger.run_date == datetime(2026, 9, 24, 2, 0, tzinfo=UTC)
 
-    async def test_every_recurring(self, tmp_path):
-        result = await make_tool(tmp_path).execute(prompt="tick", every=300)
+    async def test_every_uses_interval(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
+            prompt="tick", every=300
+        )
         assert result.ok
-        (job,) = load_jobs(tmp_path)
-        assert job.every == 300 and job.at is None
+        (_, trigger, _, _) = next(iter(scheduler.jobs.values()))
+        assert isinstance(trigger, IntervalTrigger)
+        assert trigger.interval.total_seconds() == 300
 
-    async def test_every_must_be_positive(self, tmp_path):
-        for bad in (0, -5):
-            result = await make_tool(tmp_path).execute(prompt="x", every=bad)
-            assert not result.ok
-        assert load_jobs(tmp_path) == []
+    async def test_cron_in_owner_tz(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
+            prompt="daily report", cron="0 9 * * *"
+        )
+        assert result.ok
+        (_, trigger, _, _) = next(iter(scheduler.jobs.values()))
+        assert isinstance(trigger, CronTrigger)
+        assert "hour='9'" in str(trigger)
 
     async def test_exactly_one_schedule_required(self, tmp_path):
-        tool = make_tool(tmp_path)
-        none = await tool.execute(prompt="x")
-        both = await tool.execute(prompt="x", at="2026-09-24T08:00:00+00:00", every=60)
-        assert not none.ok and not both.ok
-        assert load_jobs(tmp_path) == []
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        tool = make_tool(tmp_path, scheduler, conn)
+        none_given = await tool.execute(prompt="x")
+        assert not none_given.ok and "exactly one" in none_given.content
+        two_given = await tool.execute(prompt="x", every=60, cron="0 9 * * *")
+        assert not two_given.ok and "exactly one" in two_given.content
+        assert scheduler.jobs == {}
 
-    async def test_empty_prompt_rejected(self, tmp_path):
-        result = await make_tool(tmp_path).execute(prompt="  ", every=60)
-        assert not result.ok
-
-    async def test_explicit_id_validated(self, tmp_path):
-        ok = await make_tool(tmp_path).execute(prompt="x", every=60, id="morning-news")
-        assert ok.ok
-        bad = await make_tool(tmp_path).execute(prompt="x", every=60, id="Bad_ID!")
-        assert not bad.ok
-        assert {j.id for j in load_jobs(tmp_path)} == {"morning-news"}
-
-    async def test_same_id_replaces_wholesale(self, tmp_path):
-        tool = make_tool(tmp_path)
-        await tool.execute(prompt="v1", every=60, id="digest")
-        # pretend it ran once: replace must clear the run state
-        path = tmp_path / "jobs" / "digest.json"
-        data = json.loads(path.read_text())
-        data["last_run"] = "2026-09-23T00:00:00+00:00"
-        data["status"] = "error"
-        path.write_text(json.dumps(data))
-        result = await tool.execute(
-            prompt="v2", at="2026-09-25T08:00:00+00:00", id="digest"
+    async def test_invalid_cron_is_tool_error(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
+            prompt="x", cron="not a cron"
         )
-        assert result.ok and "replaced" in result.content
-        (job,) = load_jobs(tmp_path)
-        assert job.prompt == "v2" and job.status == "pending"
-        assert job.last_run is None and job.every is None
+        assert not result.ok
+        assert "invalid schedule" in result.content.lower()
 
-    async def test_generated_id_never_replaces(self, tmp_path):
-        tool = make_tool(tmp_path)
+    async def test_generated_ids_never_collide_explicit_replaces(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        tool = make_tool(tmp_path, scheduler, conn)
         first = await tool.execute(prompt="a", every=60)
-        second = await tool.execute(prompt="b", every=60)
-        assert first.ok and second.ok
-        jobs = load_jobs(tmp_path)
-        assert len(jobs) == 2
-        assert {j.prompt for j in jobs} == {"a", "b"}
-        for job in jobs:  # job-YYYYmmdd-HHMMSS, slug-safe
-            assert job.id.startswith("job-")
-            assert job.id == job.id.lower()
+        assert first.ok
+        second = await tool.execute(prompt="b", every=60)  # next second id
+        assert second.ok
+        assert len(scheduler.jobs) == 2
+        replaced = await tool.execute(prompt="c", every=60, id="daily")
+        assert replaced.ok and "replaced" not in replaced.content
+        again = await tool.execute(prompt="d", every=90, id="daily")
+        assert again.ok and "replaced" in again.content
+        assert len(scheduler.jobs) == 3
+        row = await jobs_meta_get(conn, "daily")
+        assert row["prompt"] == "d"
 
-    async def test_at_local_without_valid_tz_errors(self, tmp_path):
-        result = await make_tool(tmp_path, tz="Not/AZone").execute(
-            prompt="x", at_local="2026-09-24 08:00"
+    async def test_invalid_id_rejected(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
+            prompt="x", every=60, id="Bad ID!"
         )
-        assert not result.ok
-        assert "cannot resolve local time" in result.content
-
-    async def test_store_is_atomic_shape(self, tmp_path):
-        await make_tool(tmp_path).execute(prompt="x", every=60, id="shaped")
-        data = json.loads((tmp_path / "jobs" / "shaped.json").read_text())
-        assert set(data) == {
-            "id",
-            "prompt",
-            "at",
-            "every",
-            "last_run",
-            "next_run",
-            "status",
-            "revision",
-            "result",
-            "delivery_error",
-            "transcript",
-        }
-        assert not list((tmp_path / "jobs").glob("*.tmp"))
+        assert not result.ok and "id" in result.content.lower()
 
 
 class TestUnscheduleJob:
-    async def test_cancel_sets_status_keeps_file(self, tmp_path):
-        await make_tool(tmp_path).execute(prompt="x", every=60, id="j1")
-        result = await make_unschedule(tmp_path).execute(id="j1")
+    async def test_cancels_and_marks_cancelled(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        await make_tool(tmp_path, scheduler, conn).execute(prompt="x", every=60, id="daily")
+        result = await make_unschedule(tmp_path, scheduler, conn).execute(id="daily")
         assert result.ok
-        (job,) = load_jobs(tmp_path)  # the file stays; compute_next ignores it
-        assert job.id == "j1"
+        assert "daily" not in scheduler.jobs
+        row = await jobs_meta_get(conn, "daily")
+        assert row["state"] == "cancelled"
 
-    async def test_missing_id_is_an_error(self, tmp_path):
-        result = await make_unschedule(tmp_path).execute(id="nope")
+    async def test_missing_id_lists_current(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        await make_tool(tmp_path, scheduler, conn).execute(prompt="x", every=60, id="daily")
+        result = await make_unschedule(tmp_path, scheduler, conn).execute(id="nope")
+        assert not result.ok
+        assert "daily" in result.content
+
+    async def test_no_scheduler_is_tool_error(self, tmp_path):
+        tool = ScheduleJob(
+            config=Config(api_key="k", workspace=tmp_path), tz="UTC"
+        )
+        result = await tool.execute(prompt="x", every=60)
         assert not result.ok

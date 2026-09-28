@@ -6,6 +6,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+import aiosqlite
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from imp.adapters import FileSystemAdapter, HttpClient
 from imp.config import Config
 from imp.tools import Tool, build_tools
@@ -21,13 +24,19 @@ def build_assistant_tools(
     http: HttpClient,
     sender: Callable[[Path, str], Awaitable[str | None]],
     tz: str,
+    scheduler: AsyncIOScheduler | None = None,
+    db: aiosqlite.Connection | None = None,
 ) -> dict[str, Tool]:
     tools = build_tools(config=config, fs=fs, prompt_user=prompt_user, http=http)
     tools[SendFile.name] = SendFile(
         config=config, fs=fs, prompt_user=prompt_user, sender=sender
     )
-    tools[ScheduleJob.name] = ScheduleJob(config=config, tz=tz)
-    tools[UnscheduleJob.name] = UnscheduleJob(config=config)
+    tools[ScheduleJob.name] = ScheduleJob(
+        config=config, tz=tz, scheduler=scheduler, db=db
+    )
+    tools[UnscheduleJob.name] = UnscheduleJob(
+        config=config, scheduler=scheduler, db=db
+    )
     return tools
 
 
