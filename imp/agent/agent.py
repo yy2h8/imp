@@ -86,6 +86,7 @@ class Agent:
                 type=EventType.MODEL_RESPONSE,
                 quote=reply.text,
                 token_usage=self.context.get_usage(),
+                usage=reply.usage,
             )
 
             if not reply.tool_calls:

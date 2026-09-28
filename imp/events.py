@@ -18,6 +18,17 @@ class EventType(Enum):
 
 
 @dataclass(slots=True, frozen=True)
+class Usage:
+    """Provider-reported usage for one model call; cost_usd is OpenRouter's
+    billed USD amount and is None when the provider does not report one."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float | None
+
+
+@dataclass(slots=True, frozen=True)
 class AgentEvent:
     type: EventType
     token_usage: tuple[int, int]
@@ -26,3 +37,4 @@ class AgentEvent:
     error_message: str | None = None
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
+    usage: Usage | None = None

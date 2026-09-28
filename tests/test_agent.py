@@ -8,6 +8,7 @@ from imp.agent import Agent, EventType
 from imp.agent.context import Context
 from imp.agent.executor import _truncate_tool_output
 from imp.entities import ReasoningMessage, ToolMessage
+from imp.events import Usage
 from imp.tools import Tool, ToolResult
 from imp.tools.fs import WriteFile
 
@@ -55,8 +56,21 @@ def function_call_item(call_id: str, name: str, arguments: dict):
     )
 
 
-def response(items: list):
-    return SimpleNamespace(output=items)
+def response(items: list, usage=None):
+    return SimpleNamespace(output=items, usage=usage)
+
+
+def usage_ns(input: int = 0, output: int = 0, total: int = 0, cost=None):
+    """Stand-in for the SDK usage block; cost is OpenRouter-specific and may
+    be absent entirely (built dynamically only when provided)."""
+    attrs = {
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": total,
+    }
+    if cost is not None:
+        attrs["cost"] = cost
+    return SimpleNamespace(**attrs)
 
 
 class StubClient:
@@ -140,6 +154,29 @@ async def test_cancelling_turn_joins_read_tools(config):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_model_response_event_carries_usage(config):
+    reply = response([message_item("ok")], usage=usage_ns(10, 5, 15, cost=0.0123))
+    agent, _ = make_agent(config, {}, [reply])
+    events = await collect(agent, "hi")
+    assert events[-1].type is EventType.MODEL_RESPONSE
+    assert events[-1].usage == Usage(10, 5, 15, 0.0123)
+
+
+async def test_model_response_event_without_usage(config):
+    reply = response([message_item("ok")], usage=None)
+    agent, _ = make_agent(config, {}, [reply])
+    events = await collect(agent, "hi")
+    assert events[-1].type is EventType.MODEL_RESPONSE
+    assert events[-1].usage is None
+
+
+async def test_usage_cost_absent_yields_none(config):
+    reply = response([message_item("ok")], usage=usage_ns(10, 5, 15))  # no cost attr
+    agent, _ = make_agent(config, {}, [reply])
+    events = await collect(agent, "hi")
+    assert events[-1].usage == Usage(10, 5, 15, None)
 
 
 async def test_text_only_turn(config):

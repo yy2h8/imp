@@ -15,6 +15,7 @@ from ..entities import (
     ReasoningMessage,
     ToolCall,
 )
+from ..events import Usage
 from ..tools import Tool
 
 
@@ -23,6 +24,18 @@ class ModelReply:
     messages: list[ConversationMessage]  # output items in order, replayable
     tool_calls: list[ToolCall]
     text: str | None
+    usage: Usage | None = None
+
+
+def _parse_usage(raw: Any) -> Usage | None:
+    if raw is None:
+        return None
+    return Usage(
+        input_tokens=int(getattr(raw, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(raw, "output_tokens", 0) or 0),
+        total_tokens=int(getattr(raw, "total_tokens", 0) or 0),
+        cost_usd=getattr(raw, "cost", None),
+    )
 
 
 def _parse_output(output: Iterable[Any]) -> ModelReply:
@@ -84,6 +97,12 @@ async def call_model(
             f"Model response {status}: {getattr(response, 'incomplete_details', None) or getattr(response, 'error', None)}"
         )
     reply = _parse_output(response.output)
+    reply = ModelReply(
+        messages=reply.messages,
+        tool_calls=reply.tool_calls,
+        text=reply.text,
+        usage=_parse_usage(getattr(response, "usage", None)),
+    )
     seen = {item.call_id for item in messages if isinstance(item, ToolCall)}
     for call in reply.tool_calls:
         if not call.call_id or call.call_id in seen:
