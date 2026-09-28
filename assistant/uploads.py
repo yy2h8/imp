@@ -1,15 +1,9 @@
-"""Owner uploads: documents, photos, and voice notes landing in inbox/.
-
-Downloaded via the Bot API's getFile/download_file (20 MB platform cap),
-saved under a sanitized original name with -2/-3... collision suffixes. Voice
-notes go through STT and become the next prompt — the audio file is deleted on
-success and kept on failure. A caption on a document/photo becomes the prompt
-for a new turn; without one the save is only acknowledged.
-"""
+"""Download all owner-shared Telegram media into inbox/ and synthesize turns."""
 
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import re
 from pathlib import Path
 
@@ -18,7 +12,15 @@ from imp.adapters import FileSystemAdapter
 from .adapters.stt import SttClient
 from .adapters.telegram import send_text
 
-VOICE_PREFIX = "voice-"
+_EXTENSIONS = {
+    "photo": ".jpg",
+    "video": ".mp4",
+    "audio": ".m4a",
+    "voice": ".ogg",
+    "video_note": ".mp4",
+    "animation": ".mp4",
+    "sticker": ".webp",
+}
 
 
 def _size_text(size: int) -> str:
@@ -30,7 +32,7 @@ def _size_text(size: int) -> str:
 
 
 class Uploads:
-    """Saves owner uploads into the workspace; bot injectable for tests."""
+    """Saves owner uploads into the workspace inbox; transport injectable."""
 
     def __init__(
         self,
@@ -47,75 +49,81 @@ class Uploads:
         self.chat_id = chat_id
         self.inbox.mkdir(parents=True, exist_ok=True)
 
-    async def handle(self, message: dict) -> str | None:
-        """Route one incoming message's attachment.
+    async def handle(self, attachments: list[dict], caption: str = "") -> str | None:
+        """Save every attachment; captions and available audio transcripts
+        become one prompt. Uncaptioned non-audio files are saved and acked."""
+        saved: list[tuple[dict, Path]] = []
+        transcripts: list[str] = []
+        for item in attachments:
+            name = self._filename(item)
+            path = await self._save(item.get("file_id"), name)
+            if path is None:
+                continue
+            saved.append((item, path))
+            if item.get("kind") in {"voice", "audio"} and self.stt is not None:
+                await self.bot.send_chat_action(self.chat_id, "typing")
+                transcript = await self.stt.transcribe(path)
+                if transcript.startswith("STT failed"):
+                    await send_text(
+                        self.bot,
+                        self.chat_id,
+                        f"*error:* {transcript} — the audio is kept at {self._rel(path)}.",
+                    )
+                else:
+                    transcripts.append(transcript)
+                    if item.get("kind") == "voice":
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass  # a failed cleanup must not kill the queued turn
 
-        Returns the prompt for a new agent turn, or None when the attachment
-        was only saved and acknowledged (or the message had none)."""
-        voice = message.get("voice")
-        if voice is not None:
-            return await self._voice(message, voice)
-        document = message.get("document")
-        if document is not None:
-            return await self._document(message, document, prefix="")
-        photo = message.get("photo")
-        if photo is not None:
-            return await self._document(message, photo[-1], prefix="photo-")
-        return None
+        if not saved:
+            return None
+        caption = caption.strip() or next(
+            (item.get("caption", "").strip() for item, _ in saved if item.get("caption")),
+            "",
+        )
+        if not caption and not transcripts:
+            if len(saved) == 1:
+                await self._ack(saved[0][1])
+            else:
+                names = ", ".join(self._rel(path) for _, path in saved)
+                await send_text(self.bot, self.chat_id, f"Saved {names}.")
+            return None
 
-    async def _document(self, message: dict, item: dict, prefix: str) -> str | None:
-        caption = (message.get("caption") or "").strip()
+        details = ", ".join(self._rel(path) for _, path in saved)
+        forwards = sorted(
+            {item["forward_origin"] for item, _ in saved if item.get("forward_origin")}
+        )
+        source = f" forwarded from {', '.join(forwards)}" if forwards else ""
+        parts = [f"Owner sent{source} file(s) saved to {details}."]
+        if caption:
+            parts.append(f"Note: {caption}")
+        if transcripts:
+            parts.append("Audio transcription: " + "\n".join(transcripts))
+        return "\n".join(parts)
+
+    def _filename(self, item: dict) -> str:
+        kind = str(item.get("kind") or "file")
         name = str(item.get("file_name") or "")
         if not name or name != Path(name).name:
-            unique = item.get("file_unique_id")
-            name = f"{prefix or 'file'}-{unique or item.get('file_id', 'unknown')}"
+            suffix = Path(name).suffix if name else _EXTENSIONS.get(kind, "")
+            mime_type = str(item.get("mime_type") or "")
+            if not suffix and mime_type == "application/x-tgsticker":
+                suffix = ".tgs"
+            elif not suffix and mime_type:
+                suffix = mimetypes.guess_extension(mime_type) or ""
+            unique = item.get("file_unique_id") or item.get("file_id") or "unknown"
+            name = f"{kind}-{unique}{suffix}"
         name = re.sub(r"[^\w. -]", "_", name)[:200]
-        if name in {".", "..", ""}:
-            name = "file"
-        saved = await self._save(item.get("file_id"), name)
-        if saved is None:
-            return None
-        if not caption:
-            await self._ack(saved)
-            return None
-        return (
-            f"Owner sent a file, saved to {self._rel(saved)}, with the note: {caption}"
-        )
+        return name if name not in {".", "..", ""} else f"{kind}-file"
 
-    async def _voice(self, message: dict, voice: dict) -> str | None:
-        if self.stt is None:
-            return None  # STT unavailable: silently skip (voice is optional)
-        saved = await self._save(
-            voice.get("file_id"),
-            f"{VOICE_PREFIX}{message.get('message_id', 'note')}.ogg",
-        )
-        if saved is None:
-            return None
-        await self.bot.send_chat_action(self.chat_id, "typing")
-        transcript = await self.stt.transcribe(saved)
-        if transcript.startswith("STT failed"):
-            await send_text(
-                self.bot,
-                self.chat_id,
-                f"*error:* {transcript} — the audio is kept at {self._rel(saved)}.",
-            )
-            return None
-        try:
-            saved.unlink(missing_ok=True)  # success: the audio has served its purpose
-        except OSError:
-            pass  # a file that would not delete must never kill the poll loop
-        return (
-            "Owner sent a voice note (the audio file is deleted after "
-            f"transcription), saying: {transcript}"
-        )
-
-    async def _save(self, file_id, name: str) -> Path | None:
-        """Download and store one attachment; None (plus owner notice) on failure."""
+    async def _save(self, file_id: str | None, name: str) -> Path | None:
         if not file_id:
+            await send_text(self.bot, self.chat_id, "Could not save attachment: missing file id.")
             return None
         try:
-            entry = await self.bot.get_file(file_id)
-            data = await self.bot.download_file(entry["file_path"])
+            data = await self.bot.download(file_id)
             return await asyncio.to_thread(self._create, name, data)
         except Exception as exc:
             await send_text(
@@ -132,7 +140,6 @@ class Uploads:
                 continue
 
     def _target(self, name: str) -> Path:
-        """inbox/<name>, numeric suffix on collision."""
         candidate, n = self.inbox / name, 1
         while candidate.exists() or candidate.is_symlink():
             n += 1
