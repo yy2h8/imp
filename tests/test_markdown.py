@@ -1,111 +1,54 @@
-"""markdown: Telegram HTML rendering and fence-aware chunking."""
+"""telegramify-markdown wrappers: entity rendering and long-message split."""
 
 from __future__ import annotations
 
-import pytest
-
-from assistant.adapters.markdown import MAX_MESSAGE_CHARS, chunks, to_html, units
-
-
-class TestToHtml:
-    def test_plain_text_is_escaped(self):
-        assert to_html("a < b & c > d") == "a &lt; b &amp; c &gt; d"
-
-    def test_inline_code(self):
-        assert to_html("run `make all` now") == "run <code>make all</code> now"
-
-    def test_inline_code_content_is_escaped(self):
-        assert to_html("`<script>`") == "<code>&lt;script&gt;</code>"
-
-    def test_bold(self):
-        assert to_html("**bold** and **a b**") == "<b>bold</b> and <b>a b</b>"
-
-    def test_italic_single_asterisks(self):
-        assert to_html("a *fine* point") == "a <i>fine</i> point"
-
-    def test_italic_needs_non_space_edges(self):
-        assert to_html("2 * 3 * 4") == "2 * 3 * 4"
-
-    def test_snake_case_stays_literal(self):
-        assert to_html("some_var_name and __dunder__") == (
-            "some_var_name and __dunder__"
-        )
-
-    def test_italic_not_glued_to_word_characters(self):
-        assert to_html("2*3*4") == "2*3*4"
-
-    def test_link(self):
-        assert to_html("see [docs](https://example.com/x?a=1)") == (
-            'see <a href="https://example.com/x?a=1">docs</a>'
-        )
-
-    def test_link_ampersand_in_url_is_escaped(self):
-        assert to_html("[x](https://e.com/?a=1&b=2)") == (
-            '<a href="https://e.com/?a=1&amp;b=2">x</a>'
-        )
-
-    def test_header_renders_bold(self):
-        assert to_html("## The Title") == "<b>The Title</b>"
-
-    def test_fenced_code_block(self):
-        text = "before\n```python\nprint('<hi>')\n```\nafter"
-        assert to_html(text) == (
-            'before\n<pre><code class="language-python">'
-            "print('&lt;hi&gt;')</code></pre>\nafter"
-        )
-
-    def test_unterminated_fence_flushes(self):
-        assert to_html("```\ncode") == "<pre>code</pre>"
-
-    def test_markdown_inside_code_block_stays_literal(self):
-        assert to_html("```\n**not bold**\n```") == (
-            "<pre>**not bold**</pre>"
-        )
-
-    def test_emphasis_inside_code_span_stays_literal(self):
-        assert to_html("`**not bold**`") == "<code>**not bold**</code>"
-
-    def test_empty_text(self):
-        assert to_html("") == ""
+from assistant.adapters.markdown import (
+    MAX_TEXT_CHARS,
+    RenderedFile,
+    RenderedText,
+    render,
+    render_long,
+)
 
 
-class TestChunks:
-    def test_short_text_is_one_chunk(self):
-        assert chunks("hello") == ["hello"]
+def test_render_bold_and_code_as_entities():
+    text, entities = render("**b** `c`")
+    assert text == "b c"
+    assert [e["type"] for e in entities] == ["bold", "code"]
 
-    def test_empty_text_yields_no_chunks(self):
-        assert chunks("") == []
 
-    def test_lossless_line_boundaries(self):
-        text = "\n".join(f"line {i} " + "x" * 50 for i in range(300))
-        parts = chunks(text)
-        assert "\n".join(parts) == text  # no fences: nothing added or lost
-        assert all(units(part) <= MAX_MESSAGE_CHARS for part in parts)
-        assert len(parts) > 1
+def test_render_fenced_block_is_pre_with_language():
+    text, entities = render("```js\nvar x = 1\n```")
+    pre = next(e for e in entities if e["type"] == "pre")
+    assert pre["language"] == "js"
+    assert "var x = 1" in text
 
-    def test_never_splits_inside_a_fence(self):
-        text = "intro\n```python\n" + "\n".join(f"print({i})" for i in range(400))
-        text += "\n```\noutro"
-        parts = chunks(text)
-        assert len(parts) > 1
-        assert parts[0].startswith("intro\n```python\n")
-        assert parts[0].endswith("```")  # fence closed at the cut
-        assert parts[1].startswith("```python\n")  # and reopened above
-        assert parts[-1].endswith("```\noutro")
 
-    def test_each_chunk_converts_to_valid_standalone_html(self):
-        text = "```py\n" + "\n".join(f"print({i})" for i in range(500)) + "\n```"
-        for part in chunks(text):
-            html = to_html(part)
-            assert html.count("<pre") == html.count("</pre>")
+def test_render_plain_text_has_no_entities():
+    text, entities = render("just words")
+    assert text == "just words"
+    assert entities == []
 
-    def test_oversized_line_is_hard_split(self):
-        text = "word " * 3000  # one 15000-unit line, no newlines
-        parts = chunks(text)
-        assert len(parts) > 1
-        assert all(units(part) <= MAX_MESSAGE_CHARS for part in parts)
-        assert "".join(part.rstrip() + " " for part in parts).startswith("word")
 
-    def test_rejects_tiny_limits(self):
-        with pytest.raises(ValueError):
-            chunks("text", limit=1)
+async def test_render_long_splits_within_limit():
+    long_md = "\n\n".join(f"paragraph {i} " + "word " * 60 for i in range(40))
+    items = await render_long(long_md)
+    assert len(items) >= 2
+    assert all(isinstance(i, RenderedText) for i in items)
+    for item in items:
+        assert len(item.text.encode("utf-16-le")) // 2 <= MAX_TEXT_CHARS
+
+
+async def test_render_long_extracts_big_code_block_as_file():
+    long_md = (
+        "explanation\n\n```python\n"
+        + "\n".join(f"print({i})" for i in range(300))
+        + "\n```"
+    )
+    items = await render_long(long_md)
+    texts = [i for i in items if isinstance(i, RenderedText)]
+    files = [i for i in items if isinstance(i, RenderedFile)]
+    assert texts and files
+    assert files[0].file_name.endswith(".py")
+    assert isinstance(files[0].file_data, bytes)
+    assert b"print(299)" in files[0].file_data

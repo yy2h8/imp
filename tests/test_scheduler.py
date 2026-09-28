@@ -213,6 +213,10 @@ class _StubBot:
         self.sent.append((chat_id, text))
         return 1
 
+    async def send_text(self, chat_id: int, text: str):
+        self.sent.append((chat_id, text))
+        return [1]
+
 
 def test_run_job_delivers_answer_and_reschedules(tmp_path):
     client = StubClient([response([message_item("digest ready")])])
@@ -486,6 +490,9 @@ async def test_running_job_recovery_never_executes_again(tmp_path):
 async def test_delivery_failure_preserves_result_without_rerun(tmp_path):
     class FailedBot:
         async def send_message(self, *args):
+            return None
+
+        async def send_text(self, *args):
             return None
 
     app = make_app(

@@ -399,7 +399,13 @@ async def test_startup_retries_failed_tailoring_then_skips_success(
         notices.append(text)
         return 1
 
-    tailoring_app.bot = SimpleNamespace(send_message=send_message)
+    async def send_text(chat_id, text):
+        notices.append(text)
+        return [1]
+
+    tailoring_app.bot = SimpleNamespace(
+        send_message=send_message, send_text=send_text
+    )
     builds = []
 
     @asynccontextmanager

@@ -18,6 +18,10 @@ class StubBot:
         self.sent.append(text)
         return len(self.sent)
 
+    async def send_text(self, chat_id: int, text: str) -> list[int]:
+        self.sent.append(text)
+        return [len(self.sent)]
+
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         pass
 
@@ -196,6 +200,9 @@ async def test_dangling_upload_link_is_not_followed(tmp_path):
 
         async def send_message(self, chat_id, text):
             return 1
+
+        async def send_text(self, chat_id, text):
+            return [1]
 
     inbox = tmp_path / "inbox"
     inbox.mkdir()

@@ -41,6 +41,10 @@ class FakeBot:
         self.sent.append(text)
         return len(self.sent)  # message_id
 
+    async def send_text(self, chat_id: int, text: str) -> list[int]:
+        self.sent.append(text)
+        return [len(self.sent)]
+
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
         self._edit_ok += 1
         if self.fail_edits_after is not None and self._edit_ok > self.fail_edits_after:
@@ -685,6 +689,9 @@ async def test_failed_recovery_notice_preserves_active_marker(app, home):
 
     class FailedBot(FakeBot):
         async def send_message(self, *args):
+            return None
+
+        async def send_text(self, *args):
             return None
 
     write_state(

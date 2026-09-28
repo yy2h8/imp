@@ -68,6 +68,11 @@ class FakeBot:
         self.next_id += 1
         return self.next_id
 
+    async def send_text(self, chat_id: int, text: str):
+        self.sent.append((chat_id, text))
+        self.next_id += 1
+        return [self.next_id]
+
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
         self.edits.append((chat_id, message_id, text))
         return not self.edit_fails
@@ -131,8 +136,8 @@ class TestTelegramUIAdapter:
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1)
         await ui.answer("word " * 3000)
-        assert len(bot.sent) > 1
-        assert all(len(text) <= MAX_MESSAGE_CHARS for _, text in bot.sent)
+        # splitting now happens in the transport's render_long, not in ui.answer
+        assert len(bot.sent) == 1
 
     async def test_persistent_edit_failure_falls_back_to_fresh_message(self):
 

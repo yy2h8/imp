@@ -51,7 +51,7 @@ def make_config(
 ) -> AssistantConfig:
     for var in ASSISTANT_ENV_VARS + IMP_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST-TOKEN")
     monkeypatch.setenv("IMP_TG_ALLOWED_USER_IDS", "7")
     monkeypatch.setenv("IMP_HOME", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -101,7 +101,7 @@ def test_max_concurrent_jobs_must_be_positive(tmp_path, monkeypatch):
 
 def test_minimal_config_defaults(tmp_path, monkeypatch):
     config = make_config(tmp_path, monkeypatch)
-    assert config.bot_token == "t"
+    assert config.bot_token == "123456:TEST-TOKEN"
     assert config.allowed_user_ids == frozenset({7})
     assert config.home == tmp_path
     assert config.stt_model == DEFAULT_STT_MODEL == "openai/whisper-large-v3-turbo"
@@ -146,7 +146,7 @@ def test_missing_token_raises(tmp_path, monkeypatch):
 
 def test_raw_token_reads_only_the_token(tmp_path, monkeypatch):
     make_config(tmp_path, monkeypatch)
-    assert AssistantConfig.raw_token() == "t"
+    assert AssistantConfig.raw_token() == "123456:TEST-TOKEN"
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
     assert AssistantConfig.raw_token() == ""
 

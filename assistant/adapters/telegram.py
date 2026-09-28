@@ -1,37 +1,35 @@
-"""Telegram Bot API transport: one method per endpoint the assistant uses.
-
-No SDK and no framework — raw POSTs over the shared httpx client family,
-long-polling via getUpdates. Message text is markdown: send_message and
-edit_message render it as Telegram HTML with a literal-text fallback, so
-formatting can never lose a message. Status composition lives in ui.py.
+"""Telegram transport over aiogram: one method per endpoint the assistant
+uses. No parse_mode anywhere — markdown is rendered to (text, entities) by
+adapters.markdown, with literal-text fallbacks when Telegram rejects an
+entity rendering, so formatting can never lose a message. Status composition
+lives in ui.py; long-answer splitting in markdown.render_long.
 """
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Awaitable
 
-import httpx2 as httpx
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BufferedInputFile, MessageEntity
 
 from imp.config import DEFAULT_MAX_HTTP_BYTES
 
-from .markdown import chunks, to_html, units
+from .markdown import render, render_long
 
-API_BASE = "https://api.telegram.org/bot{token}/{method}"
-POLL_TIMEOUT_S = 25  # long-poll server hold; must stay below the HTTP timeout
-# transport failures back off exponentially before retrying
-BACKOFF_BASE_S = 1.0
-BACKOFF_MAX_S = 60.0
+POLL_TIMEOUT_S = 25  # long-poll server hold
+
+MAX_MESSAGE_CHARS = 4096
+CAPTION_CHARS = 1024
 
 
 class TelegramError(RuntimeError):
-    """A Bot API call failed after retries; message describes the cause."""
+    """A Bot API call failed; message describes the cause."""
 
 
-MAX_MESSAGE_CHARS = 4096
-
-# room for the tags to_html adds (a <pre> pair with a language class), so
-# converted chunks fit the cap instead of falling back to plain text
-_HTML_HEADROOM = 64
+def units(text: str) -> int:
+    """UTF-16 code units: Telegram's size currency."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
@@ -40,187 +38,215 @@ def split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
         raise ValueError("chunk limit must be at least 2")
     chunks, start, size = [], 0, 0
     for index, char in enumerate(text):
-        units = 2 if ord(char) > 0xFFFF else 1
-        if size + units > limit:
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if size + char_units > limit:
             chunks.append(text[start:index])
             start, size = index, 0
-        size += units
+        size += char_units
     if start < len(text):
         chunks.append(text[start:])
     return chunks
 
 
-async def send_text(bot, chat_id: int, text: str) -> list[int]:
-    ids = []
-    for chunk in chunks(text, MAX_MESSAGE_CHARS - _HTML_HEADROOM):
-        message_id = await bot.send_message(chat_id, chunk)
-        if message_id is None:
-            raise TelegramError("Required message delivery failed")
-        ids.append(message_id)
-    return ids
+def _entities(entities: list[dict]) -> list[MessageEntity]:
+    return [MessageEntity(**entity) for entity in entities]
+
+
+def _as_dict(result):
+    """aiogram typed results → plain dicts (fakes may already return dicts)."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, list):
+        return [_as_dict(item) for item in result]
+    dumper = getattr(result, "model_dump", None)
+    return dumper(exclude_none=True) if dumper else result
 
 
 class TelegramBot:
-    """Bot API client. Required sends raise on rejection or exhausted retries;
+    """aiogram Bot wrapper. Required sends raise TelegramError on rejection;
     cosmetic edits and typing indicators may fail without aborting a turn."""
 
     def __init__(
         self,
         token: str,
         timeout: float = 60.0,
-        max_attempts: int = 4,
         max_bytes: int = DEFAULT_MAX_HTTP_BYTES,
+        client=None,
     ) -> None:
         self.max_bytes = max_bytes
         self.token = token
-        self.max_attempts = max_attempts
-        self.client = httpx.AsyncClient(timeout=timeout)
-
-    async def call(self, method: str, *, files=None, **payload) -> dict:
-        """Shared bounded retry policy for JSON and multipart requests."""
-        url = API_BASE.format(token=self.token, method=method)
-        last = "unknown failure"
-        for attempt in range(self.max_attempts):
-            delay = min(BACKOFF_BASE_S * 2**attempt, BACKOFF_MAX_S)
-            retry = True
-            try:
-                kwargs = (
-                    {"data": payload, "files": files} if files else {"json": payload}
-                )
-                response = await self.client.post(url, **kwargs)
-                try:
-                    data = response.json()
-                except ValueError:
-                    data = {}
-                if not isinstance(data, dict):
-                    data = {}
-                if response.is_success and data.get("ok"):
-                    return data["result"]
-                code = data.get("error_code", response.status_code)
-                last = f"HTTP/API {code}"
-                retry = code == 429 or (isinstance(code, int) and code >= 500)
-                if code == 429:
-                    parameters = data.get("parameters") or {}
-                    requested = parameters.get(
-                        "retry_after", response.headers.get("retry-after")
-                    )
-                    try:
-                        delay = (
-                            max(delay, float(requested))
-                            if requested is not None
-                            else delay
-                        )
-                    except (TypeError, ValueError):
-                        pass
-            except httpx.HTTPError as exc:
-                last = type(exc).__name__  # request URLs contain the bot token
-            if not retry or attempt + 1 == self.max_attempts:
-                break
-            await asyncio.sleep(delay)
-        raise TelegramError(f"{method} failed after {attempt + 1} attempts: {last}")
-
-    async def get_updates(self, offset: int) -> list[dict]:
-        """Long-poll for updates newer than ``offset`` (empty list on timeout)."""
-        updates = await self.call(
-            "getUpdates", offset=offset, timeout=POLL_TIMEOUT_S, allowed_updates=[]
+        self.client = client if client is not None else Bot(
+            token=token, request_timeout=timeout
         )
-        return list(updates)
+
+    async def _call(self, method: str, coro: Awaitable):
+        try:
+            return await coro
+        except TelegramAPIError as exc:
+            raise TelegramError(f"{method} failed: {exc}") from None
 
     async def send_message(self, chat_id: int, text: str) -> int:
-        """Markdown in: rendered as Telegram HTML, falling back to the
-        literal text when Telegram rejects the rendering or escaping
-        outgrows the size cap."""
-        if not text or len(text.encode("utf-16-le")) // 2 > MAX_MESSAGE_CHARS:
+        """Markdown in: rendered as text + entities, falling back to the
+        literal text when Telegram rejects the rendering or the input is
+        oversize."""
+        if not text or units(text) > MAX_MESSAGE_CHARS:
             raise ValueError("Telegram message must contain 1..4096 UTF-16 units")
-        rendered = to_html(text)
+        rendered, entities = render(text)
         try:
-            if units(rendered) <= MAX_MESSAGE_CHARS:
-                result = await self._send_raw(chat_id, rendered, "HTML")
-            else:  # escaping inflated past the cap: send the text as-is
-                result = await self._send_raw(chat_id, text)
+            return (
+                await self._call(
+                    "sendMessage",
+                    self.client.send_message(
+                        chat_id=chat_id,
+                        text=rendered,
+                        entities=_entities(entities),
+                        disable_web_page_preview=True,
+                    ),
+                )
+            ).message_id
         except TelegramError:
-            result = await self._send_raw(chat_id, text)
-        return result["message_id"]
-
-    async def _send_raw(self, chat_id: int, text: str, parse_mode: str | None = None):
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        return await self.call("sendMessage", **payload)
+            result = await self._call(
+                "sendMessage",
+                self.client.send_message(
+                    chat_id=chat_id, text=text, disable_web_page_preview=True
+                ),
+            )
+            return result.message_id
 
     async def send_text(self, chat_id: int, text: str) -> list[int]:
-        return await send_text(self, chat_id, text)
+        """Long/markdown answers: render_long items — texts as entity
+        messages, extracted code files as documents."""
+        ids: list[int] = []
+        for item in await render_long(text):
+            if hasattr(item, "file_data"):
+                ids.append(
+                    await self.send_document(
+                        chat_id,
+                        item.file_data,
+                        item.file_name,
+                        caption=item.caption,
+                    )
+                )
+            else:
+                if not item.text.strip():
+                    continue
+                result = await self._call(
+                    "sendMessage",
+                    self.client.send_message(
+                        chat_id=chat_id,
+                        text=item.text,
+                        entities=_entities(item.entities),
+                        disable_web_page_preview=True,
+                    ),
+                )
+                ids.append(result.message_id)
+        return ids or [await self.send_message(chat_id, text)]
 
-    async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
+    async def edit_message(
+        self, chat_id: int, message_id: int, text: str
+    ) -> bool:
+        """Edit the status message with entities; a parse rejection retries
+        the literal text; both failing returns False (cosmetic)."""
         plain = split(text)[0] if text else " "
-        rendered = to_html(plain)
-        payload = {"text": rendered, "parse_mode": "HTML"}
-        if units(rendered) > MAX_MESSAGE_CHARS:
-            payload = {"text": plain}
+        rendered, entities = render(plain)
         try:
-            await self.call(
+            await self._call(
                 "editMessageText",
-                chat_id=chat_id,
-                message_id=message_id,
-                **payload,
-            )
-        except TelegramError:
-            try:  # a parse rejection still leaves the literal text editable
-                await self.call(
-                    "editMessageText",
+                self.client.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=plain,
+                    text=rendered,
+                    entities=_entities(entities),
+                ),
+            )
+            return True
+        except TelegramError:
+            try:
+                await self._call(
+                    "editMessageText",
+                    self.client.edit_message_text(
+                        chat_id=chat_id, message_id=message_id, text=plain
+                    ),
                 )
+                return True
             except TelegramError:
                 return False
-        return True
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         try:
-            await self.call("sendChatAction", chat_id=chat_id, action=action)
+            await self._call(
+                "sendChatAction",
+                self.client.send_chat_action(chat_id=chat_id, action=action),
+            )
         except TelegramError:
             pass  # cosmetic; never worth failing a turn over
 
     async def send_document(
         self, chat_id: int, data: bytes, filename: str, caption: str = ""
     ) -> int:
-        result = await self.call(
+        result = await self._call(
             "sendDocument",
-            files={"document": (filename, data)},
-            chat_id=chat_id,
-            caption=split(caption, 1024)[0] if caption else "",
+            self.client.send_document(
+                chat_id=chat_id,
+                document=BufferedInputFile(data, filename=filename),
+                caption=split(caption, CAPTION_CHARS)[0] if caption else "",
+            ),
         )
-        return result["message_id"]
+        return result.message_id
 
     async def get_me(self) -> dict:
         """The bot's own identity; whoami uses it to validate the token."""
-        return await self.call("getMe")
+        return _as_dict(await self._call("getMe", self.client.get_me()))
+
+    async def get_updates(self, offset: int) -> list[dict]:
+        """Long-poll for updates newer than ``offset`` (empty list on timeout)."""
+        updates = await self._call(
+            "getUpdates",
+            self.client.get_updates(
+                offset=offset, timeout=POLL_TIMEOUT_S, allowed_updates=[]
+            ),
+        )
+        return _as_dict(list(updates))
 
     async def get_file(self, file_id: str) -> dict:
         """Look up a file entry (file_path) for downloading."""
-        return await self.call("getFile", file_id=file_id)
+        return _as_dict(
+            await self._call("getFile", self.client.get_file(file_id=file_id))
+        )
+
+    async def download(self, file_id: str) -> bytes:
+        """Resolve and fetch raw bytes for one attachment, enforcing the
+        configured byte cap (bounded by Telegram's 20 MB platform limit)."""
+        entry = await self.get_file(file_id)
+        data = await self._call(
+            "download",
+            self.client.download(file=entry),
+        )
+        payload = data.getvalue() if hasattr(data, "getvalue") else data.read()
+        if len(payload) > self.max_bytes:
+            raise TelegramError(f"Download exceeds byte limit ({self.max_bytes})")
+        return payload
 
     async def download_file(self, file_path: str) -> bytes:
-        """Fetch raw bytes for a file previously resolved via get_file."""
-        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        try:
-            async with self.client.stream("GET", url) as response:
-                response.raise_for_status()
-                data = bytearray()
-                async for chunk in response.aiter_bytes(chunk_size=65536):
-                    if len(data) + len(chunk) > self.max_bytes:
-                        raise TelegramError(
-                            f"Download exceeds byte limit ({self.max_bytes})"
-                        )
-                    data.extend(chunk)
-                return bytes(data)
-        except httpx.HTTPError as exc:
-            raise TelegramError(f"Download failed: {type(exc).__name__}") from None
+        """Fetch raw bytes for a resolved file_path (v1 seam; uploads)."""
+        data = await self._call(
+            "downloadFile",
+            self.client.download_file(file_path),
+        )
+        payload = data.getvalue() if hasattr(data, "getvalue") else data.read()
+        if len(payload) > self.max_bytes:
+            raise TelegramError(f"Download exceeds byte limit ({self.max_bytes})")
+        return payload
 
     async def close(self) -> None:
-        await self.client.aclose()
+        session = getattr(self.client, "session", None)
+        if session is not None:
+            await session.close()
+
+
+async def send_text(bot: TelegramBot, chat_id: int, text: str) -> list[int]:
+    """Required delivery: raise on failure, never silently drop."""
+    ids = await bot.send_text(chat_id, text)
+    if not ids or any(i is None for i in ids):
+        raise TelegramError("Required message delivery failed")
+    return ids

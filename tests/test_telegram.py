@@ -1,272 +1,185 @@
+"""TelegramBot over aiogram: entity-based sends with plain-text fallbacks.
+
+The client is injectable (`client=None` builds a real aiogram Bot) so tests
+drive a fake exposing the aiogram method surface.
+"""
+
 from __future__ import annotations
 
-import json
+import io
 
-import httpx2 as httpx
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
-from assistant.adapters.telegram import BACKOFF_BASE_S, TelegramBot, TelegramError
-
-
-def bot_with(handler, max_attempts: int = 4) -> TelegramBot:
-    transport = httpx.MockTransport(handler)
-    bot = TelegramBot("TESTTOKEN", max_attempts=max_attempts)
-    bot.client = httpx.AsyncClient(transport=transport, timeout=5.0)
-    return bot
+from assistant.adapters.telegram import TelegramBot, TelegramError
 
 
-def api_result(payload: dict):
-    return httpx.Response(200, json={"ok": True, "result": payload})
+class FakeClient:
+    """Records aiogram-style calls; scriptable per-method results/errors."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.rules: dict[str, list] = {}
+
+    def script(self, method: str, *outcomes) -> None:
+        self.rules[method] = list(outcomes)
+
+    async def _record(self, method: str, **kwargs):
+        self.calls.append((method, kwargs))
+        rule = self.rules.get(method)
+        if rule:
+            outcome = rule.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        raise AssertionError(f"unexpected call: {method}")
+
+    async def send_message(self, chat_id, text, **kwargs):
+        return await self._record(
+            "send_message", chat_id=chat_id, text=text, **kwargs
+        )
+
+    async def edit_message_text(self, **kwargs):
+        return await self._record("edit_message_text", **kwargs)
+
+    async def send_chat_action(self, **kwargs):
+        return await self._record("send_chat_action", **kwargs)
+
+    async def send_document(self, **kwargs):
+        return await self._record("send_document", **kwargs)
+
+    async def get_me(self, **kwargs):
+        return await self._record("get_me", **kwargs)
+
+    async def get_updates(self, **kwargs):
+        return await self._record("get_updates", **kwargs)
+
+    async def get_file(self, **kwargs):
+        return await self._record("get_file", **kwargs)
+
+    async def download(self, file, destination=None, **kwargs):
+        return await self._record("download", file=file, destination=destination)
+
+    async def download_file(self, file_path, destination=None, **kwargs):
+        return await self._record(
+            "download_file", file_path=file_path, destination=destination
+        )
 
 
-def api_error(description: str, status: int = 400):
-    return httpx.Response(status, json={"ok": False, "description": description})
+class Msg:
+    def __init__(self, message_id: int) -> None:
+        self.message_id = message_id
 
 
-class NoSleep:
-    """Cut the exponential backoff out of retry tests."""
-
-    def __init__(self):
-        self.delays: list[float] = []
-
-    async def __call__(self, delay: float) -> None:
-        self.delays.append(delay)
+def bad_request(message: str = "can't parse entities") -> TelegramBadRequest:
+    return TelegramBadRequest(method="sendMessage", message=message)
 
 
-@pytest.fixture
-def no_sleep(monkeypatch):
-    sleeper = NoSleep()
-    monkeypatch.setattr("assistant.adapters.telegram.asyncio.sleep", sleeper)
-    return sleeper
+def bot(client: FakeClient, max_bytes: int = 10_000_000) -> TelegramBot:
+    return TelegramBot("TESTTOKEN", max_bytes=max_bytes, client=client)
 
 
-async def test_send_message_renders_markdown_as_html(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        assert request.url.path == "/botTESTTOKEN/sendMessage"
-        assert payload["parse_mode"] == "HTML"
-        assert payload["text"] == "<b>bold</b> and <code>x &lt; y</code>"
-        return api_result({"message_id": 7})
-
-    assert await bot_with(handler).send_message(1, "**bold** and `x < y`") == 7
+def kinds(client: FakeClient, method: str) -> list[dict]:
+    return [kwargs for name, kwargs in client.calls if name == method]
 
 
-async def test_send_message_falls_back_to_plain_text(no_sleep):
-    calls: list[dict] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        calls.append(payload)
-        if "parse_mode" in payload:  # Telegram rejects the rendering
-            return api_error("Bad Request: can't parse entities")
-        return api_result({"message_id": 9})
-
-    assert await bot_with(handler).send_message(1, "**kept**") == 9
-    assert calls[1]["text"] == "**kept**"  # literal text delivered instead
-    assert "parse_mode" not in calls[1]
+async def test_send_message_uses_entities_without_parse_mode():
+    client = FakeClient()
+    client.script("send_message", Msg(7))
+    assert await bot(client).send_message(1, "**bold**") == 7
+    (kwargs,) = kinds(client, "send_message")
+    assert [e.type for e in kwargs["entities"]] == ["bold"]
+    assert not kwargs.get("parse_mode")
 
 
-async def test_send_message_inflated_html_sends_plain(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        assert "parse_mode" not in payload  # &-escaping outgrew the cap
-        assert payload["text"] == "&" * 3000
-        return api_result({"message_id": 4})
+async def test_send_message_falls_back_to_plain_on_entity_rejection():
+    client = FakeClient()
+    client.script("send_message", bad_request(), Msg(9))
+    assert await bot(client).send_message(1, "**kept**") == 9
+    first, second = kinds(client, "send_message")
+    assert first["entities"]
+    assert second.get("entities") is None
+    assert second["text"] == "**kept**"  # literal markdown text delivered
 
-    assert await bot_with(handler).send_message(1, "&" * 3000) == 4
 
-
-async def test_send_message_rejects_oversize(no_sleep):
+async def test_send_message_rejects_oversize_input():
+    client = FakeClient()
     with pytest.raises(ValueError):
-        await bot_with(lambda request: api_result({"message_id": 1})).send_message(
-            1, "x" * 5000
-        )
+        await bot(client).send_message(1, "x" * 5000)
+    assert kinds(client, "send_message") == []
 
 
-async def test_send_message_rejection_raises_once(no_sleep):
-    with pytest.raises(TelegramError):
-        await bot_with(lambda request: api_error("chat not found")).send_message(
-            1, "hi"
-        )
-    assert no_sleep.delays == []
+async def test_edit_message_renders_entities_then_plain_false():
+    client = FakeClient()
+    client.script("edit_message_text", bad_request(), bad_request())
+    assert await bot(client).edit_message(1, 2, "*error:* boom") is False
+    first, second = kinds(client, "edit_message_text")
+    assert [e.type for e in first["entities"]] == ["italic"]
+    assert second.get("entities") is None
 
 
-async def test_edit_message_maps_failure_to_false(no_sleep):
-    bot = bot_with(lambda request: api_error("message is not modified"))
-    assert await bot.edit_message(1, 2, "text") is False
+async def test_edit_message_succeeds_with_entities():
+    client = FakeClient()
+    client.script("edit_message_text", Msg(2))
+    assert await bot(client).edit_message(1, 2, "🧠 working") is True
 
 
-async def test_edit_message_renders_html_with_plain_retry(no_sleep):
-    calls: list[dict] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        calls.append(payload)
-        if "parse_mode" in payload:
-            return api_error("can't parse entities")
-        return api_result(True)
-
-    assert await bot_with(handler).edit_message(1, 2, "*error:* boom") is True
-    assert calls[0]["text"] == "<i>error:</i> boom"
-    assert calls[1]["text"] == "*error:* boom"  # literal retry after rejection
+async def test_send_chat_action_swallows_errors():
+    client = FakeClient()
+    client.script("send_chat_action", bad_request("nope"))
+    await bot(client).send_chat_action(1, "typing")  # never raises
 
 
-async def test_call_retries_5xx_then_succeeds(no_sleep):
-    calls = {"n": 0}
+async def test_get_me_and_get_updates_return_dicts():
+    from types import SimpleNamespace
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if calls["n"] < 3:
-            return httpx.Response(502)
-        return api_result({"message_id": 5})
+    class UpdateObj(SimpleNamespace):
+        def model_dump(self, **_):
+            return self.__dict__.copy()
 
-    assert await bot_with(handler).send_message(1, "hi") == 5
-    assert calls["n"] == 3
-    assert no_sleep.delays[:2] == [BACKOFF_BASE_S, BACKOFF_BASE_S * 2]
-
-
-async def test_call_honors_429_retry_after(no_sleep):
-    calls = {"n": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return httpx.Response(429, headers={"retry-after": "7"})
-        return api_result({"message_id": 5})
-
-    assert await bot_with(handler).send_message(1, "hi") == 5
-    assert no_sleep.delays[0] == 7.0
+    client = FakeClient()
+    client.script("get_me", {"id": 42, "username": "my_bot"})
+    client.script("get_updates", [UpdateObj(update_id=41)])
+    assert await bot(client).get_me() == {"id": 42, "username": "my_bot"}
+    assert await bot(client).get_updates(40) == [{"update_id": 41}]
 
 
-async def test_call_raises_telegram_error_after_max_attempts(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
-
-    with pytest.raises(TelegramError, match="failed after 2 attempts"):
-        await bot_with(handler, max_attempts=2).get_updates(0)
-
-
-async def test_send_document_truncates_caption(no_sleep):
-    captured: dict = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        content_type = request.headers["content-type"]
-        boundary = content_type.partition("boundary=")[2]
-        for part in (await request.aread()).split(b"--" + boundary.encode()):
-            if b'name="caption"' in part:
-                captured["caption"] = part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[
-                    0
-                ]
-        return api_result({"message_id": 3})
-
-    bot = bot_with(handler)
-    assert await bot.send_document(1, b"data", "f.txt", "c" * 2000) == 3
-    assert len(captured["caption"]) == 1024  # Telegram's caption limit
+async def test_send_document_truncates_caption():
+    client = FakeClient()
+    client.script("send_document", Msg(3))
+    assert await bot(client).send_document(1, b"data", "f.txt", "c" * 2000) == 3
+    (kwargs,) = kinds(client, "send_document")
+    assert len(kwargs["caption"].encode("utf-16-le")) // 2 <= 1024
+    assert kwargs["document"].filename == "f.txt"
 
 
-async def test_send_document_rejection_returns_none(no_sleep):
-    bot = bot_with(lambda request: api_error("file too big"))
-    with pytest.raises(TelegramError):
-        await bot.send_document(1, b"data", "f.txt")
-
-
-async def test_get_updates_parses_results(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        assert payload["timeout"] == 25  # the long-poll hold
-        return api_result([{"update_id": 41, "message": {}}])
-
-    assert await bot_with(handler).get_updates(40) == [{"update_id": 41, "message": {}}]
-
-
-async def test_send_chat_action_swallows_errors(no_sleep):
-    bot = bot_with(lambda request: api_error("nope"))
-    await bot.send_chat_action(1, "typing")  # no raise
-
-
-async def test_get_me_returns_bot_identity(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/botTESTTOKEN/getMe"
-        return api_result({"id": 42, "username": "my_bot", "first_name": "My Bot"})
-
-    me = await bot_with(handler).get_me()
-    assert me["username"] == "my_bot"
-    assert me["id"] == 42
-
-
-async def test_get_file_and_download_roundtrip(no_sleep):
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/getFile"):
-            assert json.loads(request.content)["file_id"] == "f1"
-            return api_result({"file_id": "f1", "file_path": "docs/f1.txt"})
-        assert request.url.path == "/file/botTESTTOKEN/docs/f1.txt"
-        return httpx.Response(200, content=b"file bytes")
-
-    bot = bot_with(handler)
-    entry = await bot.get_file("f1")
-    assert await bot.download_file(entry["file_path"]) == b"file bytes"
-
-
-async def test_json_retry_delay_and_no_final_sleep(no_sleep):
-    bot = bot_with(
-        lambda request: httpx.Response(
-            429, json={"ok": False, "parameters": {"retry_after": 90}}
-        ),
-        max_attempts=2,
-    )
-    with pytest.raises(TelegramError):
-        await bot.send_message(1, "hi")
-    # one sleep between the two attempts of each delivery try (HTML, then
-    # the plain fallback); never after the final attempt
-    assert no_sleep.delays == [90.0, 90.0]
-
-
-async def test_partial_chunk_delivery_raises(no_sleep):
-    count = 0
-
-    async def handler(request):
-        nonlocal count
-        count += 1
-        return api_result({"message_id": 1}) if count == 1 else api_error("rejected")
-
-    bot = bot_with(handler)
-    with pytest.raises(TelegramError):
-        await bot.send_text(1, "x" * 5000)
-    # chunk 2 is tried as HTML, then retried as plain text; both rejected
-    assert count == 3
-
-
-async def test_send_text_never_splits_inside_a_fence(no_sleep):
-    calls: list[str] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(json.loads(request.content)["text"])
-        return api_result({"message_id": 1})
-
-    text = "```python\n" + "\n".join(f"print({i})" for i in range(400)) + "\n```"
-    await bot_with(handler).send_text(1, text)
-    assert len(calls) > 1
-    # each chunk converts to balanced, standalone HTML: the code block is
-    # closed at the boundary and reopened in the next chunk
-    for call in calls:
-        assert call.startswith("<pre>")
-        assert call.endswith("</pre>")
-        assert call.count("<pre") == call.count("</pre>")
-
-
-async def test_download_enforces_actual_byte_limit(no_sleep):
-    bot = bot_with(lambda request: httpx.Response(200, content=b"x" * 100))
-    bot.max_bytes = 16
+async def test_download_enforces_byte_limit():
+    client = FakeClient()
+    client.script("get_file", {"file_id": "f1", "file_path": "docs/f1.txt"})
+    client.script("download", io.BytesIO(b"x" * 100))
     with pytest.raises(TelegramError, match="limit"):
-        await bot.download_file("data")
+        await bot(client, max_bytes=16).download("f1")
 
 
-async def test_errors_never_include_token_urls(no_sleep):
-    def fail(request):
-        raise httpx.ReadError(str(request.url))
+async def test_send_text_routes_text_and_files():
+    client = FakeClient()
+    client.script("send_message", Msg(1))
+    client.script("send_document", Msg(2))
+    long_md = (
+        "explanation\n\n```python\n"
+        + "\n".join(f"print({i})" for i in range(300))
+        + "\n```"
+    )
+    ids = await bot(client).send_text(1, long_md)
+    assert ids == [1, 2]
+    assert kinds(client, "send_message") and kinds(client, "send_document")
 
-    bot = bot_with(fail, max_attempts=1)
-    with pytest.raises(TelegramError) as caught:
-        await bot.send_message(1, "hello")
-    assert "TESTTOKEN" not in str(caught.value)
-    assert no_sleep.delays == []
+
+async def test_whoami_style_polling_works():
+    """get_updates passes the long-poll timeout and offset through."""
+    client = FakeClient()
+    client.script("get_updates", [])
+    assert await bot(client).get_updates(7) == []
+    (kwargs,) = kinds(client, "get_updates")
+    assert kwargs["offset"] == 7
+    assert kwargs["timeout"] >= 25
