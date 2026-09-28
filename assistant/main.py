@@ -8,6 +8,7 @@ while the bot is stopped — two getUpdates consumers fight over the stream).
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from contextlib import aclosing
 from datetime import UTC, datetime
@@ -29,6 +30,15 @@ from .bootstrap import (
 from .config import AssistantConfig
 from .scheduler import Scheduler
 
+_LOG = logging.getLogger(__name__)
+
+TYPING_INTERVAL_S = 4.0  # Telegram's typing indicator fades after ~5 s
+
+
+def _preview(text: str, limit: int = 60) -> str:
+    line = " ".join(text.split())
+    return line[:limit] + ("…" if len(line) > limit else "")
+
 
 def turn_summary(tools: int, started: float, ok: bool = True) -> str:
     """The one-line status collapse at turn end ."""
@@ -38,6 +48,18 @@ def turn_summary(tools: int, started: float, ok: bool = True) -> str:
 
 def command_token(text: str) -> str:
     return text.split()[0].lower() if text.split() else ""
+
+
+def queued_notice(depth: int) -> str:
+    """Owner-facing acknowledgement for a prompt accepted while work runs.
+
+    ``depth`` is the queue length including the prompt just accepted, so the
+    number of requests ahead of it is ``depth - 1``.
+    """
+    ahead = max(depth - 1, 0)
+    if ahead == 0:
+        return "Принято — в очереди."
+    return f"Принято — в очереди (перед вами ещё {ahead})."
 
 
 class TurnRunner:
@@ -59,9 +81,11 @@ class TurnRunner:
         if command is not None:
             await send_text(self.bot, self.app.chat_id, command)
             return
+        _LOG.info("turn start: %s", _preview(prompt))
         await asyncio.to_thread(self.app.refresh_prompt)
         notice = await asyncio.to_thread(self._reset_if_needed)
         if notice is not None:
+            _LOG.info("context near full; session reset before answering")
             await send_text(self.bot, self.app.chat_id, notice)
         await self._agent_turn(prompt)
 
@@ -71,10 +95,12 @@ class TurnRunner:
         lowered = command_token(prompt)
         if lowered == "/new":
             name = self.app.reset()
+            _LOG.info("command /new: fresh transcript %s", name)
             return f"Started a fresh session. Previous transcript is saved. New transcript: `{name}`"
         if lowered == "/status":
             used, maximum = self.app.usage
             name = self.app.session.writer.path.name
+            _LOG.info("command /status: %d/%d tokens", used, maximum)
             return (
                 f"*status:* {used}/{maximum} tokens ({used / maximum:.0%}) · "
                 f"transcript `{name}`"
@@ -96,6 +122,8 @@ class TurnRunner:
             edit_interval=self.edit_interval,
             max_chars=self.status_max_chars,
         )
+        await ui.begin()  # visible from the first second, before any event
+        typing = asyncio.create_task(self._keep_typing())
         tools = 0
         error: str | None = None
         reply = ""
@@ -104,6 +132,7 @@ class TurnRunner:
                 async for event in events:
                     if event.type is EventType.TOOL_START:
                         tools += 1
+                        _LOG.info("tool: %s", event.tool_name)
                     if event.type is EventType.ERROR:
                         error = event.error_message
                     if event.type is EventType.MODEL_RESPONSE:
@@ -114,13 +143,30 @@ class TurnRunner:
                     await ui.flush()
         except Exception as exc:
             error = str(exc)
+        finally:
+            typing.cancel()
+            await asyncio.gather(typing, return_exceptions=True)
+        _LOG.info(
+            "turn finished: ok=%s tools=%d elapsed=%ds",
+            error is None,
+            tools,
+            int(datetime.now(UTC).timestamp() - started),
+        )
         if error is not None:
+            _LOG.warning("turn failed: %s", error)
             await send_text(self.bot, self.app.chat_id, f"*error:* {error}")
             await ui.end_turn("✗ failed")
             return
         await ui.end_turn(turn_summary(tools, started))
         if reply:
             await ui.answer(reply)
+
+    async def _keep_typing(self) -> None:
+        """Refresh the typing indicator for the whole turn: it fades after
+        ~5 s, and a single slow model call outlives a one-shot action."""
+        while True:
+            await self.bot.send_chat_action(self.app.chat_id, "typing")
+            await asyncio.sleep(TYPING_INTERVAL_S)
 
 
 def valid_request(value) -> bool:
@@ -188,6 +234,9 @@ class PollLoop:
     async def poll_forever(self) -> None:
         try:
             if self.active is not None:
+                _LOG.warning(
+                    "request interrupted by the previous shutdown; not rerun"
+                )
                 await send_text(
                     self.bot,
                     self.app.chat_id,
@@ -202,7 +251,8 @@ class PollLoop:
             while True:
                 try:
                     updates = await self.bot.get_updates(self.offset)
-                except TelegramError:
+                except TelegramError as exc:
+                    _LOG.warning("getUpdates failed: %s", exc)
                     await asyncio.sleep(5)
                     continue
                 for update in updates:
@@ -263,7 +313,34 @@ class PollLoop:
             await self._save(offset=update_id + 1, pending_requests=pending)
             if answering and not self.app.ask_router.deliver(prompt, question):
                 await self._save(pending_requests=self.pending + [prompt])
+        if answering:
+            _LOG.info("owner reply routed to the pending question")
+        elif prompt is not None:
+            kind = (
+                "attachment"
+                if isinstance(prompt, dict)
+                else f"message ({len(prompt)} chars)"
+            )
+            _LOG.info("queued %s; depth %d", kind, len(self.pending))
+            await self._ack_queued(len(self.pending))
+        else:
+            _LOG.debug("ignored update %s", update_id)
         await self._drain_queue()
+
+    async def _ack_queued(self, depth: int) -> None:
+        """Acknowledge a prompt accepted while other work is still running.
+
+        Without this the owner sees only silence (or a typing indicator) until
+        the active turn or scheduled job finishes, which looks like the message
+        was ignored. ``depth`` is the queue length including this prompt.
+        Best-effort: a failed acknowledgement is logged, never fatal.
+        """
+        if depth <= 1 and not self.app.execution_lock.locked():
+            return  # nothing ahead: this prompt runs now, no acknowledgement
+        try:
+            await send_text(self.bot, self.app.chat_id, queued_notice(depth))
+        except TelegramError as exc:
+            _LOG.warning("queued acknowledgement failed: %s", exc)
 
     async def _drain_queue(self) -> None:
         if self.turn_task is not None:
@@ -317,11 +394,18 @@ class PollLoop:
 async def run_bot() -> None:
     """The bot flow: bootstrap, then poll forever with the scheduler beside it."""
     assistant_config = AssistantConfig.from_env()
+    logging.getLogger().setLevel(assistant_config.log_level.upper())
     chat_id = next(iter(assistant_config.allowed_user_ids))
     ensure_home(assistant_config.home)  # first run: the home does not exist yet
     validate_queue(read_state(assistant_config.home))
     await startup(assistant_config, chat_id, force=False)
     async with build_assistant(assistant_config, chat_id) as app:
+        _LOG.info(
+            "assistant ready: model=%s home=%s owner=%s",
+            app.config.model,
+            app.assistant.home,
+            chat_id,
+        )
         prune_scratch(app.assistant.home, app.assistant.scratch_ttl_days)
         scheduler = asyncio.create_task(Scheduler(app).run())
         try:
@@ -413,6 +497,11 @@ async def whoami() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     args = sys.argv[1:] if argv is None else argv
     command = args[0] if args else ""
     if command == "whoami":

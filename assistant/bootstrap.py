@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import shutil
@@ -22,6 +23,8 @@ from pathlib import Path
 
 from imp.agent import Agent, EventType
 from imp.tools.ask import Ask
+
+_LOG = logging.getLogger(__name__)
 
 TEMPLATE_NAME = "AGENTS.md.template"
 ENV_BEGIN = "<!-- ENVIRONMENT:BEGIN -->"
@@ -278,6 +281,9 @@ def run_bootstrap(
         or probe.fingerprint() != read_state(home).get("fingerprint")
     )
     if changed:
+        _LOG.info(
+            "bootstrap: environment manual (re)generated from a fresh probe"
+        )
         try:
             template = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -338,6 +344,7 @@ async def tailor_manual(app, probe: Probe) -> None:
         f"and the shell to target.\n\nProbed environment:\n{probe.render()}"
     )
     write_state(home=app.config.workspace, updates={"tailored": False})
+    _LOG.info("bootstrap: tailoring turn started (this can take a while)")
     agent = Agent(
         config=app.config,
         tools={
@@ -355,3 +362,4 @@ async def tailor_manual(app, probe: Probe) -> None:
     if not completed:
         raise RuntimeError("Manual tailoring ended without a final response")
     write_state(home=app.config.workspace, updates={"tailored": True})
+    _LOG.info("bootstrap: manual tailored")

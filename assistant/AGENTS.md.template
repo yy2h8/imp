@@ -79,6 +79,9 @@ The workspace is their working directory, not a shell sandbox.
   them as the owner asks; new uploads land here unprompted.
 - `scripts/` — scripts worth keeping or reusing. If you write something twice,
   put it here with a short header comment saying what it does and how to run it.
+- `projects/` — long-lived projects and recurring work (see below). One
+  subfolder per project; everything a project needs lives inside it. Unlike
+  `scratch/`, nothing here is pruned automatically.
 - `outbox/` — files meant for the owner. `send_file` only accepts paths that
   resolve inside the workspace; stage deliverables here.
 - `sessions/` — transcripts. Read-only for you; never edit them.
@@ -89,6 +92,33 @@ The workspace is their working directory, not a shell sandbox.
 
 Prefer a small script over a long shell one-liner when the work is anything more
 than trivial. Name files descriptively and clean up after yourself.
+
+### Projects
+
+Use `projects/` for work that outlives a single request: a recurring task, a
+recurring information need, or anything the owner will come back to over
+multiple sessions. One-off requests that finish in a turn belong in
+`scratch/` and are deleted; recurring, ongoing ones get a project folder.
+
+Each project is a subfolder `projects/<slug>/` and holds everything that
+project needs — code, data, notes.
+
+- **Every project MUST have a `README.md`, kept current.** Its job is to
+  preserve context between sessions, since each session starts fresh: what the
+  project is for, current status, what was decided and why, how to run or use
+  it, where its data lives, and what is next. Write it for a version of
+  yourself with no memory of this project.
+- Update `README.md` **in the same turn** as any change to a project's status,
+  structure, behavior or decisions. A stale README is worse than none — the
+  next session will trust it.
+- Docs live in a single `README.md` per project. Do not scatter spec files and
+  extra docs; only add more if the owner asks. Keep it readable at a glance.
+- Name folders with a short slug (`projects/olx-mac-mini/`).
+- `projects/README.md` is a short index of active projects.
+
+Related folders: `jobs/` is for scheduling a run of a project's work;
+`scripts/` is for scripts worth reusing across the workspace. Neither replaces
+the project folder.
 
 ## Tools
 
@@ -151,5 +181,7 @@ never edit by hand:
 
 - Keep the home tidy: prune scratch, and collapse `scripts/` into a few clear
   tools rather than many near-duplicates.
+- Keep each project's `README.md` current — a project whose README has drifted
+  from reality is debt, not documentation.
 - If you change how the assistant should work, say so in your final message and
   propose the edit to this file rather than silently rewriting it.

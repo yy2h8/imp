@@ -1,4 +1,4 @@
-"""Plain-text Telegram status rendering with event-driven throttling."""
+"""Plain-markdown Telegram status rendering with event-driven throttling."""
 
 from __future__ import annotations
 
@@ -45,9 +45,10 @@ class _Transport(Protocol):
 
 
 class TelegramUIAdapter:
-    """Renders imp's agent events to Telegram: a typing action, one lazily
-    created status message edited on a throttle, and the final answer as its
-    own message(s)."""
+    """Renders imp's agent events to Telegram: one status message created
+    eagerly at turn start and edited on a throttle, and the final answer as
+    its own message(s). Typing is the turn runner's job (it must outlive
+    individual events)."""
 
     def __init__(
         self,
@@ -65,10 +66,20 @@ class TelegramUIAdapter:
         self._last_flush = 0.0
         self._dirty = False  # text changed since the last successful edit
 
+    async def begin(self) -> None:
+        """Create the status message up front, so the owner sees activity
+        during the first (often long) model call; flushes then edit it."""
+        if self.status_message_id is None:
+            try:
+                self.status_message_id = await self.bot.send_message(
+                    self.chat_id, "…"
+                )
+                self._last_flush = time.monotonic()
+            except TelegramError:
+                pass  # cosmetic; the first flush retries creation
+
     async def handle(self, event: AgentEvent) -> None:
-        if event.type is EventType.THINKING:
-            await self.bot.send_chat_action(self.chat_id, "typing")
-        elif event.type is EventType.REASONING:
+        if event.type is EventType.REASONING:
             self._add(self._tail(event.quote or "", 3))
         elif event.type is EventType.MODEL_RESPONSE:
             if event.quote:

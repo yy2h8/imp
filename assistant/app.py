@@ -4,6 +4,7 @@ session holder (current Context + SessionWriter, resettable)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -22,7 +23,18 @@ from .prompt import BASE_PROMPT
 from .tools import build_assistant_tools
 from .uploads import Uploads
 
-HOME_DIRS = ("skills", "sessions", "scratch", "scripts", "outbox", "jobs", "inbox")
+_LOG = logging.getLogger(__name__)
+
+HOME_DIRS = (
+    "skills",
+    "sessions",
+    "scratch",
+    "scripts",
+    "projects",
+    "outbox",
+    "jobs",
+    "inbox",
+)
 
 RESET_NOTICE = (
     "Context was nearly full — started a fresh session. "
@@ -162,7 +174,10 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
             future = ask_router.start()
             try:
                 await send_text(bot, chat_id, message)
-                return await future
+                _LOG.info("ask: question sent; waiting for the owner's reply")
+                answer = await future
+                _LOG.info("ask: owner replied (%d chars)", len(answer))
+                return answer
             finally:
                 ask_router.clear()
 

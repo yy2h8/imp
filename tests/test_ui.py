@@ -160,12 +160,15 @@ class TestTelegramUIAdapter:
         assert len(bot.sent) == 2
         assert ui.status_message_id == bot.next_id
 
-    async def test_thinking_sends_typing_action(self):
+    async def test_begin_creates_status_message_eagerly(self):
 
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1)
-        await ui.handle(AgentEvent(type=EventType.THINKING, token_usage=(0, 100)))
-        assert bot.actions == ["typing"]
+        await ui.begin()
+        assert bot.sent == [(1, "…")]  # visible from the first second
+        assert ui.status_message_id is not None
+        await ui.begin()  # idempotent: no second status message
+        assert bot.sent == [(1, "…")]
 
     async def test_error_renders_bold_line(self):
 

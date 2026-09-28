@@ -178,13 +178,15 @@ async def test_full_turn_single_status_message_then_separate_answer(app, home):
 
     await runner.run("do the thing")
 
-    # exactly two outbound messages: the one status message and the answer
+    # exactly two outbound messages: the eager status message and the answer
     assert len(bot.sent) == 2
-    status = bot.sent[0]
-    assert "🔧 `fake` x=1" in status  # tool start rendered into the status
+    assert bot.sent[0] == "…"  # created at turn start, before any event
+    assert "🔧 `fake` x=1" in bot.edits[0]  # tool start rendered into it
     assert bot.edits[-1] == "✓ done · 1 tools · 0 s"  # collapsed one-liner
     # the final answer is its own message, sent after the collapse
     assert bot.sent[1] == "All **done**."
+    # the typing indicator was refreshed while the turn ran
+    assert bot.chat_actions.count("typing") >= 1
 
 
 async def test_debounce_skips_edits_until_interval_passes(app, home):
@@ -200,8 +202,9 @@ async def test_debounce_skips_edits_until_interval_passes(app, home):
 
     await runner.run("go")
 
-    # events: THINKING, TOOL_START, TOOL_RESULT, MODEL_RESPONSE — but with a
-    # 60 s debounce only the forced end_turn collapse is ever edited
+    # events: TOOL_START, TOOL_RESULT, MODEL_RESPONSE — with a 60 s debounce
+    # only the forced end_turn collapse is ever edited (the eager "…" message
+    # is created directly, never edited before that)
     assert len(bot.edits) == 1
     assert bot.edits[0].startswith("✓ done ·")
 

@@ -23,6 +23,7 @@ ASSISTANT_ENV_VARS = [
     "IMP_SCRATCH_TTL_DAYS",
     "IMP_STT_MODEL",
     "IMP_TZ",
+    "IMP_LOG_LEVEL",
 ]
 
 IMP_ENV_VARS = [
@@ -96,6 +97,21 @@ def test_stt_and_tz_overrides(tmp_path, monkeypatch):
     )
     assert config.stt_model == "openai/whisper-1"
     assert config.tz == "UTC"
+
+
+def test_log_level_defaults_to_info(tmp_path, monkeypatch):
+    config = make_config(tmp_path, monkeypatch)
+    assert config.log_level == "info"
+
+
+def test_log_level_override_is_normalized(tmp_path, monkeypatch):
+    config = make_config(tmp_path, monkeypatch, IMP_LOG_LEVEL="DEBUG")
+    assert config.log_level == "debug"
+
+
+def test_invalid_log_level_is_a_config_error(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="IMP_LOG_LEVEL"):
+        make_config(tmp_path, monkeypatch, IMP_LOG_LEVEL="chatty")
 
 
 def test_invalid_tz_is_a_config_error(tmp_path, monkeypatch):

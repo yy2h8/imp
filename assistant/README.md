@@ -11,15 +11,18 @@ operating manual, and an internal scheduler for deferred work.
   served, in that owner’s private chat; groups and other senders are ignored.
 - **Telegram as the interface.** Long-polling against the Bot API directly over
   `httpx2` — no Telegram framework dependency.
-- **A single debounced status message** shows reasoning and tool activity while a
-  turn runs, then collapses to a one-line summary. The final answer is its own
-  message in plain text, split without changing its contents.
+- **A single debounced status message** appears at turn start, shows
+  reasoning and tool activity while the turn runs (typing indicator kept
+  alive), then collapses to a one-line summary. The final answer is its own
+  message rendered from markdown as Telegram HTML (code, bold, italic,
+  links); splitting never cuts a code block apart, and a rejected rendering
+  falls back to the literal text.
 - **Tools:** imp's `list_dir` / `read_file` / `write_file` / `str_replace` /
   `run_shell` / `web_fetch` / `web_search`, plus `ask`, `send_file`,
   `schedule_job` and `unschedule_job`.
 - **Self-configuring:** on first start it probes the machine and writes
   `<IMP_HOME>/AGENTS.md`, which shapes how it organises work (`scratch/`,
-  `scripts/`, `outbox/`, `jobs/`, `inbox/`). A model turn tailors the manual
+  `scripts/`, `projects/`, `outbox/`, `jobs/`, `inbox/`). A model turn tailors the manual
   without asking questions. Environment refreshes preserve the existing manual
   outside the generated block. Failed tailoring is reported and retried at the
   next startup; the bot continues with the existing manual.
@@ -38,6 +41,10 @@ operating manual, and an internal scheduler for deferred work.
 - **Uploads and voice:** documents, photos and voice notes the owner sends land
   in `inbox/`; voice notes are transcribed (OpenRouter STT) into the next
   prompt, and the audio file is deleted after a successful transcription.
+- **Queued prompts** are acknowledged: a message accepted while a turn or a
+  scheduled job is running gets a short reply (`Принято — в очереди …`) so the
+  owner knows it was received and is waiting, not ignored. A prompt that runs
+  immediately is not acknowledged.
 - **Request recovery:** waiting prompts are persisted in `state.json` and run in
   arrival order, independently of long polling. After restart they resume in a
   fresh conversation. A request interrupted during execution is reported and
@@ -68,7 +75,7 @@ assistant/
 ├── bootstrap.py        scheduler.py   jobstore.py    uploads.py
 ├── adapters/  telegram.py  ui.py  stt.py
 ├── tools/     send_file.py  schedule.py   (ask is reused from imp)
-└── deploy/    assistant.service  S99assistant
+└── deploy/    assistant.service  S99assistant  compose.yaml
 ```
 
 ## Running it
@@ -96,7 +103,8 @@ The assistant talks to **OpenRouter only**: the base URL is pinned to
 `https://openrouter.ai/api/v1`. imp's documented env vars (`OPENAI_MODEL`,
 `IMP_MAX_CONTEXT`, `IMP_REASONING_EFFORT`, …) apply. The assistant model default
 is `openai/gpt-5-mini`; OPENAI_MODEL overrides it. IMP_WORKSPACE is CLI-only;
-the assistant uses IMP_HOME.
+the assistant uses IMP_HOME. Logs go to stderr (`IMP_LOG_LEVEL`, default
+`info`) — startup, turns, tools, jobs, delivery failures.
 
 In a fresh chat the assistant answers `/status`; a busy bot replies with a
 one-line `✓ done · N tools · X s` status before the answer.
@@ -111,10 +119,26 @@ See `.env.example` for every variable.
 Targets a Raspberry Pi Zero 2W (musl/aarch64, Python 3.12, Dropbear, BusyBox)
 and any generic Linux/Unix box with Python 3.12+.
 
-**Install:** verify wheel availability on the target before deployment. `lxml`,
-`jiter`, and `pydantic-core` include native components; this repository’s local
-checks do not establish Raspberry Pi/musl compatibility. The root Dockerfile
-builds the CLI image, not an assistant service image.
+**Docker (local sandbox):** run the assistant contained on your machine —
+shell and file tools reach only the container and mounted volumes, not the
+host; mount host directories deliberately if the assistant should manage them.
+
+```bash
+cp assistant/.env.example assistant/deploy/assistant.env   # fill in values
+docker build --target assistant -t imp-assistant .
+docker compose -f assistant/deploy/compose.yaml up -d      # logs: ... logs -f
+```
+
+State (manual, sessions, jobs, inbox/outbox) persists in a named volume at
+`IMP_HOME=/data`. Find your Telegram id first with
+`docker run --rm -it -e TELEGRAM_BOT_TOKEN=... imp-assistant whoami` (only
+while the bot is stopped).
+
+**Install (bare metal):** verify wheel availability on the target before
+deployment. `lxml`, `jiter`, and `pydantic-core` include native components;
+this repository's local checks do not establish Raspberry Pi/musl
+compatibility. The root Dockerfile's default build remains the CLI image;
+`--target assistant` (above) builds the service image.
 
 ```bash
 python3 -m venv /opt/imp-venv

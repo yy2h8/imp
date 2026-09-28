@@ -40,14 +40,40 @@ def no_sleep(monkeypatch):
     return sleeper
 
 
-async def test_send_message_returns_message_id(no_sleep):
+async def test_send_message_renders_markdown_as_html(no_sleep):
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert request.url.path == "/botTESTTOKEN/sendMessage"
-        assert "parse_mode" not in payload
+        assert payload["parse_mode"] == "HTML"
+        assert payload["text"] == "<b>bold</b> and <code>x &lt; y</code>"
         return api_result({"message_id": 7})
 
-    assert await bot_with(handler).send_message(1, "hi") == 7
+    assert await bot_with(handler).send_message(1, "**bold** and `x < y`") == 7
+
+
+async def test_send_message_falls_back_to_plain_text(no_sleep):
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if "parse_mode" in payload:  # Telegram rejects the rendering
+            return api_error("Bad Request: can't parse entities")
+        return api_result({"message_id": 9})
+
+    assert await bot_with(handler).send_message(1, "**kept**") == 9
+    assert calls[1]["text"] == "**kept**"  # literal text delivered instead
+    assert "parse_mode" not in calls[1]
+
+
+async def test_send_message_inflated_html_sends_plain(no_sleep):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "parse_mode" not in payload  # &-escaping outgrew the cap
+        assert payload["text"] == "&" * 3000
+        return api_result({"message_id": 4})
+
+    assert await bot_with(handler).send_message(1, "&" * 3000) == 4
 
 
 async def test_send_message_rejects_oversize(no_sleep):
@@ -68,6 +94,21 @@ async def test_send_message_rejection_raises_once(no_sleep):
 async def test_edit_message_maps_failure_to_false(no_sleep):
     bot = bot_with(lambda request: api_error("message is not modified"))
     assert await bot.edit_message(1, 2, "text") is False
+
+
+async def test_edit_message_renders_html_with_plain_retry(no_sleep):
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if "parse_mode" in payload:
+            return api_error("can't parse entities")
+        return api_result(True)
+
+    assert await bot_with(handler).edit_message(1, 2, "*error:* boom") is True
+    assert calls[0]["text"] == "<i>error:</i> boom"
+    assert calls[1]["text"] == "*error:* boom"  # literal retry after rejection
 
 
 async def test_call_retries_5xx_then_succeeds(no_sleep):
@@ -175,7 +216,9 @@ async def test_json_retry_delay_and_no_final_sleep(no_sleep):
     )
     with pytest.raises(TelegramError):
         await bot.send_message(1, "hi")
-    assert no_sleep.delays == [90]
+    # one sleep between the two attempts of each delivery try (HTML, then
+    # the plain fallback); never after the final attempt
+    assert no_sleep.delays == [90.0, 90.0]
 
 
 async def test_partial_chunk_delivery_raises(no_sleep):
@@ -189,7 +232,26 @@ async def test_partial_chunk_delivery_raises(no_sleep):
     bot = bot_with(handler)
     with pytest.raises(TelegramError):
         await bot.send_text(1, "x" * 5000)
-    assert count == 2
+    # chunk 2 is tried as HTML, then retried as plain text; both rejected
+    assert count == 3
+
+
+async def test_send_text_never_splits_inside_a_fence(no_sleep):
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["text"])
+        return api_result({"message_id": 1})
+
+    text = "```python\n" + "\n".join(f"print({i})" for i in range(400)) + "\n```"
+    await bot_with(handler).send_text(1, text)
+    assert len(calls) > 1
+    # each chunk converts to balanced, standalone HTML: the code block is
+    # closed at the boundary and reopened in the next chunk
+    for call in calls:
+        assert call.startswith("<pre>")
+        assert call.endswith("</pre>")
+        assert call.count("<pre") == call.count("</pre>")
 
 
 async def test_download_enforces_actual_byte_limit(no_sleep):

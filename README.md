@@ -60,6 +60,10 @@ mounted workspace are owned by you; `-e HOME=/tmp` gives that user a writable
 home. File tools are confined to the workspace; shell commands have the container user’s permissions. CLI flags go after
 the image name (`imp -y` to auto-approve tool calls).
 
+To run the Telegram assistant in Docker instead, see
+[`assistant/README.md`](./assistant/README.md): `docker build --target assistant .`
+plus the compose file in `assistant/deploy/`.
+
 ### Usage
 
 A banner shows the model, workspace, and key hints, then you get a `>` prompt.

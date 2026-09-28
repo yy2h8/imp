@@ -15,6 +15,8 @@ DEFAULT_SCRATCH_TTL_DAYS = 7
 DEFAULT_TZ = "Asia/Almaty"  # the owner's timezone; IMP_TZ overrides
 DEFAULT_STT_MODEL = "openai/whisper-large-v3-turbo"  # OpenRouter's whisper turbo
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"  # the only provider
+LOG_LEVELS = ("debug", "info", "warning", "error")
+DEFAULT_LOG_LEVEL = "info"
 
 
 @dataclass(slots=True)
@@ -31,6 +33,7 @@ class AssistantConfig:
     scratch_ttl_days: int = DEFAULT_SCRATCH_TTL_DAYS
     stt_model: str = DEFAULT_STT_MODEL
     tz: str = DEFAULT_TZ
+    log_level: str = DEFAULT_LOG_LEVEL
 
     @classmethod
     def raw_token(cls) -> str:
@@ -92,6 +95,11 @@ class AssistantConfig:
             os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
         )
         ttl = int(os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS)
+        log_level = (os.getenv("IMP_LOG_LEVEL") or DEFAULT_LOG_LEVEL).strip().lower()
+        if log_level not in LOG_LEVELS:
+            raise ValueError(
+                f"IMP_LOG_LEVEL must be one of: {', '.join(LOG_LEVELS)}"
+            )
         if not 1 <= status_size <= 4096:
             raise ValueError("IMP_TG_STATUS_MAX_CHARS must be in 1..4096")
         if ttl <= 0:
@@ -108,4 +116,5 @@ class AssistantConfig:
             scratch_ttl_days=ttl,
             stt_model=os.getenv("IMP_STT_MODEL") or DEFAULT_STT_MODEL,
             tz=tz,
+            log_level=log_level,
         )

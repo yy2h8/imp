@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache
 .ruff_cache
 .env
+assistant/deploy/assistant.env
 .python-version
 .imp

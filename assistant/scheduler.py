@@ -27,6 +27,13 @@ from .jobstore import Job, advance, load_jobs, next_due, save_if_current
 
 IDLE_POLL_S = 30.0  # re-read jobs/ this often while nothing is due
 
+_LOG = logging.getLogger(__name__)
+
+
+def _preview(text: str, limit: int = 60) -> str:
+    line = " ".join(text.split())
+    return line[:limit] + ("…" if len(line) > limit else "")
+
 
 class Scheduler:
     """The never-dying scheduler task; owns no resources beyond the app."""
@@ -41,6 +48,7 @@ class Scheduler:
     async def run(self) -> None:
         for job in await asyncio.to_thread(load_jobs, self.home):
             if job.status == "running":
+                _LOG.info("job %s interrupted by shutdown; marked error", job.id)
                 revision = job.revision
                 job.status = "error"
                 job.result = "Interrupted by shutdown; actions may already have occurred. Reschedule manually."
@@ -53,7 +61,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logging.getLogger(__name__).exception("Scheduler cycle failed")
+                _LOG.exception("Scheduler cycle failed")
                 await asyncio.sleep(IDLE_POLL_S)  # a failure never stops us
 
     async def _cycle(self) -> None:
@@ -79,15 +87,18 @@ class Scheduler:
             if not await asyncio.to_thread(save_if_current, self.home, job, revision):
                 return
             revision = job.revision
+            _LOG.info("job %s started: %s", job.id, _preview(job.prompt))
             try:
                 job.result = await self._execute(job)
             except Exception as exc:
+                _LOG.warning("job %s failed: %s", job.id, exc)
                 job.status = "error"
                 job.last_run = datetime.now(UTC)
                 job.next_run = None
                 job.result = f"Job {job.id} failed: {exc}"
             else:
                 advance(job, datetime.now(UTC))
+                _LOG.info("job %s finished; next run %s", job.id, job.next_run)
             if await asyncio.to_thread(save_if_current, self.home, job, revision):
                 await self._deliver(job)
 
@@ -101,7 +112,7 @@ class Scheduler:
             job.delivery_error = ""
         except Exception as exc:
             job.delivery_error = str(exc)
-            logging.getLogger(__name__).error("Job %s delivery failed: %s", job.id, exc)
+            _LOG.error("Job %s delivery failed: %s", job.id, exc)
         await asyncio.to_thread(save_if_current, self.home, job, revision)
 
     async def _execute(self, job: Job) -> str:

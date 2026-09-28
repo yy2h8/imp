@@ -1,7 +1,9 @@
 """Telegram Bot API transport: one method per endpoint the assistant uses.
 
 No SDK and no framework — raw POSTs over the shared httpx client family,
-long-polling via getUpdates. Transport and lossless delivery; status rendering lives in ui.py.
+long-polling via getUpdates. Message text is markdown: send_message and
+edit_message render it as Telegram HTML with a literal-text fallback, so
+formatting can never lose a message. Status composition lives in ui.py.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ import asyncio
 import httpx2 as httpx
 
 from imp.config import DEFAULT_MAX_HTTP_BYTES
+
+from .markdown import chunks, to_html, units
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 POLL_TIMEOUT_S = 25  # long-poll server hold; must stay below the HTTP timeout
@@ -24,6 +28,10 @@ class TelegramError(RuntimeError):
 
 
 MAX_MESSAGE_CHARS = 4096
+
+# room for the tags to_html adds (a <pre> pair with a language class), so
+# converted chunks fit the cap instead of falling back to plain text
+_HTML_HEADROOM = 64
 
 
 def split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
@@ -44,7 +52,7 @@ def split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
 
 async def send_text(bot, chat_id: int, text: str) -> list[int]:
     ids = []
-    for chunk in split(text):
+    for chunk in chunks(text, MAX_MESSAGE_CHARS - _HTML_HEADROOM):
         message_id = await bot.send_message(chat_id, chunk)
         if message_id is None:
             raise TelegramError("Required message delivery failed")
@@ -119,26 +127,57 @@ class TelegramBot:
         return list(updates)
 
     async def send_message(self, chat_id: int, text: str) -> int:
+        """Markdown in: rendered as Telegram HTML, falling back to the
+        literal text when Telegram rejects the rendering or escaping
+        outgrows the size cap."""
         if not text or len(text.encode("utf-16-le")) // 2 > MAX_MESSAGE_CHARS:
             raise ValueError("Telegram message must contain 1..4096 UTF-16 units")
-        result = await self.call(
-            "sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True
-        )
+        rendered = to_html(text)
+        try:
+            if units(rendered) <= MAX_MESSAGE_CHARS:
+                result = await self._send_raw(chat_id, rendered, "HTML")
+            else:  # escaping inflated past the cap: send the text as-is
+                result = await self._send_raw(chat_id, text)
+        except TelegramError:
+            result = await self._send_raw(chat_id, text)
         return result["message_id"]
+
+    async def _send_raw(self, chat_id: int, text: str, parse_mode: str | None = None):
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return await self.call("sendMessage", **payload)
 
     async def send_text(self, chat_id: int, text: str) -> list[int]:
         return await send_text(self, chat_id, text)
 
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
+        plain = split(text)[0] if text else " "
+        rendered = to_html(plain)
+        payload = {"text": rendered, "parse_mode": "HTML"}
+        if units(rendered) > MAX_MESSAGE_CHARS:
+            payload = {"text": plain}
         try:
             await self.call(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=message_id,
-                text=split(text)[0] if text else " ",
+                **payload,
             )
         except TelegramError:
-            return False
+            try:  # a parse rejection still leaves the literal text editable
+                await self.call(
+                    "editMessageText",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=plain,
+                )
+            except TelegramError:
+                return False
         return True
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:

@@ -1,8 +1,9 @@
 .git
 .github
 .venv
-__pycache__/
-*.pyc
+**/__pycache__/
+**/*.pyc
+assistant/deploy/assistant.env
 .pytest_cache
 .ruff_cache
 .env
