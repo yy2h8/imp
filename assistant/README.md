@@ -81,8 +81,8 @@ the default model is `openai/gpt-5-mini`, overridden by `OPENAI_MODEL`. See
 - `OPENAI_API_KEY` (an OpenRouter key).
 - `IMP_TZ` (timezone for `at_local` and cron; default `Asia/Almaty`).
 - `IMP_MAX_CONCURRENT_JOBS` (background job cap; default `2`).
-- `IMP_HOME` (state and file-tool root; shell commands retain service-account
-  access).
+- `IMP_HOME` (state and file-tool root; shell commands run with the service's
+  privileges).
 
 ## Configure and run with Docker
 
@@ -111,41 +111,39 @@ docker compose -f assistant/deploy/compose.yaml run --rm assistant whoami
 ## Configure and run on a dedicated Linux machine
 
 Supported hosts are glibc Linux on Python 3.12 or newer, including ARM64 SBCs
-(the first target is Armbian). From a checkout at `/opt/imp`:
+(the first target is Armbian). The systemd service runs as root. From a checkout
+at `/opt/imp`:
 
 ```bash
 python3.12 -m venv /opt/imp-venv
 /opt/imp-venv/bin/pip install /opt/imp
 ```
 
-Create a dedicated service user and writable assistant home, then configure
-the systemd environment file. First set the Telegram token and OpenRouter key,
-then run `whoami` to discover the owner ID before enabling the service:
+Configure the systemd environment file with the Telegram token and OpenRouter
+key, then run `whoami` to discover the owner ID before enabling the service:
 
 ```bash
-useradd --system --create-home --home-dir /var/lib/assistant assistant
-install -d -o assistant -g assistant /var/lib/assistant/assistant
 cp /opt/imp/assistant/.env.example /etc/assistant.env
-# Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY; set IMP_HOME below.
-TELEGRAM_BOT_TOKEN=... /opt/imp-venv/bin/python -m assistant whoami
-# Put the printed ID in IMP_TG_ALLOWED_USER_IDS and set IMP_HOME.
-chown root:assistant /etc/assistant.env
-chmod 640 /etc/assistant.env
+# Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY.
+chmod 600 /etc/assistant.env
+set -a; . /etc/assistant.env; set +a
+/opt/imp-venv/bin/python -m assistant whoami
+# Put the printed ID in IMP_TG_ALLOWED_USER_IDS in /etc/assistant.env.
 cp /opt/imp/assistant/deploy/assistant.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now assistant
 ```
 The service starts at boot and restarts on failure. Follow logs with
-`journalctl -u assistant -f`. Set `IMP_HOME` to a directory writable by the
-service user; it holds `state.db` and is the file-tool root. To run `whoami`
-again, stop the service first.
+`journalctl -u assistant -f`. `IMP_HOME` defaults to `~/assistant` under root's
+home; it holds `state.db` and is the file-tool root. To run `whoami` again, stop
+the service first.
 
 ## Security
 
-**Execution boundary:** shell commands are approved automatically and inherit
-the service account's filesystem, network, and environment access, including
-credentials. IMP_HOME confines file tools, not shell commands. Run only one bot
-process per home/token.
+**Execution boundary:** shell commands are approved automatically and run as
+root, with root's filesystem, network, and environment access, including
+credentials. `IMP_HOME` confines file tools, not shell commands. Run only one
+bot process per home/token.
 
 ## Development and smoke checks
 

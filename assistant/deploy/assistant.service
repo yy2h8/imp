@@ -2,8 +2,8 @@
 #
 # Install:
 #   1. Repo checkout at /opt/imp, venv at /opt/imp-venv (see assistant/README.md).
-#   2. Create assistant account/home (see README), then env file at /etc/assistant.env (copy assistant/.env.example and fill it in):
-#        chmod 600 /etc/assistant.env && chown assistant:assistant /etc/assistant.env
+#   2. Copy assistant/.env.example to /etc/assistant.env, fill it in, then:
+#        chmod 600 /etc/assistant.env
 #   3. cp assistant/deploy/assistant.service /etc/systemd/system/
 #      systemctl daemon-reload && systemctl enable --now assistant
 #
@@ -16,16 +16,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=assistant
-Group=assistant
 ExecStart=/opt/imp-venv/bin/python -m assistant
 WorkingDirectory=/opt/imp
 EnvironmentFile=/etc/assistant.env
 Restart=on-failure
 RestartSec=5
 
-# The agent runs shell commands by design; keep the service user-scoped.
-# IMP_HOME (default ~/assistant) must be writable by this user.
+# The agent runs shell commands as root by design.
 NoNewPrivileges=yes
 PrivateTmp=yes
 
