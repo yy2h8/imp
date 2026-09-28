@@ -1,17 +1,23 @@
+"""Turn status rendering: thinking header, tool-only live log, cost summary."""
+
 from __future__ import annotations
 
-from assistant.adapters.telegram import MAX_MESSAGE_CHARS
+from assistant.adapters.markdown import MAX_TEXT_CHARS
+from assistant.adapters.telegram import MAX_MESSAGE_CHARS, split
 from assistant.adapters.ui import (
+    STATUS_LINES,
     StatusBuffer,
     TelegramUIAdapter,
-    split,
+    tool_subject,
+    turn_summary,
 )
 from imp.events import AgentEvent, EventType
-from imp.tools.base import ToolResult
 
 
-def ToolResult_ok(content: str) -> ToolResult:
-    return ToolResult(ok=True, content=content)
+def event(**kwargs) -> AgentEvent:
+    kwargs.setdefault("type", EventType.TOOL_START)
+    kwargs.setdefault("token_usage", (0, 100))
+    return AgentEvent(**kwargs)
 
 
 def test_split_preserves_arbitrary_content():
@@ -53,6 +59,62 @@ class TestStatusBuffer:
         buffer.collapse("way too long summary")
         assert buffer.render() == "way t"
 
+    def test_line_cap_marks_overflow(self):
+        buffer = StatusBuffer(max_chars=1000)
+        for i in range(12):
+            buffer.append(f"line {i}")
+        rendered = buffer.render()
+        assert rendered.startswith("… +4 earlier\n")
+        assert "line 11" in rendered and "line 4" in rendered
+        assert "line 3" not in rendered  # only STATUS_LINES kept
+
+
+class TestTurnSummary:
+    def test_success_with_cost(self):
+        assert turn_summary(3, 47, True, 0.0134) == "✓ done · 3 tools · 47 s · $0.0134"
+
+    def test_success_without_cost(self):
+        assert turn_summary(1, 2, True, None) == "✓ done · 1 tools · 2 s"
+
+    def test_failure(self):
+        assert turn_summary(3, 12, False, None) == "✗ failed · 3 tools · 12 s"
+        assert turn_summary(3, 12, False, 0.5) == "✗ failed · 3 tools · 12 s"
+
+
+class TestToolSubject:
+    def test_path_tools_take_path(self):
+        assert tool_subject("read_file", {"path": "imp/agent/model.py"}) == (
+            "imp/agent/model.py"
+        )
+
+    def test_long_path_falls_back_to_basename(self):
+        long = "assistant/deeply/nested/directory/tree/that/keeps/going/model.py"
+        assert len(long) > 40
+        assert tool_subject("read_file", {"path": long}) == "model.py"
+
+    def test_run_shell_takes_first_command_line(self):
+        subject = tool_subject(
+            "run_shell", {"command": "ruff check imp/\n# a long tail\nmore"}
+        )
+        assert subject == "ruff check imp/"
+
+    def test_run_shell_command_truncated(self):
+        assert tool_subject("run_shell", {"command": "x" * 80}) == "x" * 40
+
+    def test_web_subjects(self):
+        assert tool_subject("web_fetch", {"url": "https://example.com/a"}) == (
+            "example.com"
+        )
+        assert tool_subject("web_search", {"query": "q" * 80}) == "q" * 40
+
+    def test_misc_subjects(self):
+        assert tool_subject("send_file", {"path": "out/report.txt"}) == "report.txt"
+        assert tool_subject("schedule_job", {"id": "daily"}) == "daily"
+        assert tool_subject("ask", {"question": "Proceed?\nmore"}) == "Proceed?"
+        assert tool_subject("memory_set", {"key": "server"}) == "server"
+        assert tool_subject("cost_report", {"period": "week"}) == "week"
+        assert tool_subject("unknown_tool", None) == ""
+
 
 class FakeBot:
     """Records calls; optionally refuses edits."""
@@ -78,112 +140,115 @@ class FakeBot:
         return not self.edit_fails
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
-        self.actions = getattr(self, "actions", [])
-        self.actions.append(action)
+        pass
+
+
+def tool_event(name: str, args: dict | None = None) -> AgentEvent:
+    return event(
+        type=EventType.TOOL_START, tool_name=name, tool_args=args or {}
+    )
 
 
 class TestTelegramUIAdapter:
-    async def test_status_created_once_and_edited_after_debounce(self):
-
-        bot = FakeBot()
-        ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=3600, max_chars=500)
-        await ui.handle(
-            AgentEvent(
-                type=EventType.TOOL_START,
-                token_usage=(0, 100),
-                tool_name="run_shell",
-                tool_args={"command": "ls"},
-            )
-        )
-        await ui.flush()  # first flush creates the message regardless of debounce
-        assert len(bot.sent) == 1
-        message_id = bot.sent[0] and ui.status_message_id
-        await ui.handle(
-            AgentEvent(
-                type=EventType.TOOL_RESULT,
-                token_usage=(0, 100),
-                tool_name="run_shell",
-                tool_result=ToolResult_ok("out"),
-            )
-        )
-        await ui.flush()  # within the debounce window: skipped
-        assert len(bot.edits) == 0
-        await ui.flush(force=True)  # forced: edits in place
-        assert len(bot.sent) == 1  # no second message
-        assert bot.edits[-1][1] == message_id
-
-    async def test_final_answer_is_separate_message(self):
-
-        bot = FakeBot()
-        ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=3600, max_chars=500)
-        await ui.handle(
-            AgentEvent(
-                type=EventType.MODEL_RESPONSE,
-                token_usage=(0, 100),
-                quote="thinking out loud",
-            )
-        )
-        await ui.flush()
-        await ui.end_turn("✓ done · 0 tools · 1 s")
-        await ui.answer("Here is **the answer**.")
-        assert bot.sent[0][1].startswith("💭")  # status line for the thought
-        assert bot.sent[-1][1] == "Here is **the answer**."  # separate message
-        assert len(bot.sent) == 2
-        assert bot.edits == [(1, ui.status_message_id, "✓ done · 0 tools · 1 s")]
-
-    async def test_answer_splits_long_text(self):
-
+    async def test_begin_sends_thinking_header(self):
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1)
-        await ui.answer("word " * 3000)
-        # splitting now happens in the transport's render_long, not in ui.answer
+        await ui.begin()
+        assert bot.sent == [(1, "🧠 thinking…")]
+        assert ui.status_message_id is not None
+        await ui.begin()  # idempotent
         assert len(bot.sent) == 1
 
-    async def test_persistent_edit_failure_falls_back_to_fresh_message(self):
+    async def test_tool_line_in_mono_block_with_working_header(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
+        await ui.begin()
+        await ui.handle(tool_event("read_file", {"path": "imp/agent/model.py"}))
+        await ui.flush(force=True)
+        text = bot.edits[-1][2]
+        assert text.startswith("🧠 working\n```")
+        assert "read" in text and "imp/agent/model.py" in text
+        assert text.rstrip().endswith("```")
 
+    async def test_reasoning_and_model_response_change_nothing(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
+        await ui.begin()
+        await ui.handle(event(type=EventType.REASONING, quote="deep thought"))
+        await ui.handle(event(type=EventType.MODEL_RESPONSE, quote="aloud"))
+        await ui.handle(event(type=EventType.THINKING))
+        await ui.flush(force=True)
+        assert bot.edits == []  # nothing dirty: status stays at thinking
+
+    async def test_tool_overflow_keeps_last_eight(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=4000)
+        await ui.begin()
+        for i in range(12):
+            await ui.handle(tool_event("run_shell", {"command": f"cmd {i}"}))
+        await ui.flush(force=True)
+        text = bot.edits[-1][2]
+        assert "… +4 earlier" in text
+        assert f"cmd {11}" in text
+        assert "cmd 3" not in text
+
+    async def test_error_line_rendered(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
+        await ui.begin()
+        await ui.handle(event(type=EventType.ERROR, error_message="model exploded"))
+        await ui.flush(force=True)
+        assert "*error:* model exploded" in bot.edits[-1][2]
+
+    async def test_end_turn_collapses_to_summary(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
+        await ui.begin()
+        await ui.handle(tool_event("read_file", {"path": "a.py"}))
+        await ui.end_turn("✓ done · 1 tools · 3 s")
+        assert bot.edits[-1][2] == "✓ done · 1 tools · 3 s"
+
+    async def test_persistent_edit_failure_falls_back_to_fresh_message(self):
         bot = FakeBot()
         bot.edit_fails = True
         ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=0.0, max_chars=500)
-        await ui.handle(
-            AgentEvent(
-                type=EventType.TOOL_START,
-                token_usage=(0, 100),
-                tool_name="list_dir",
-                tool_args={},
-            )
-        )
+        await ui.handle(tool_event("list_dir", {"path": "."}))
         await ui.flush()
-        await ui.handle(
-            AgentEvent(
-                type=EventType.TOOL_RESULT,
-                token_usage=(0, 100),
-                tool_name="list_dir",
-                tool_result=ToolResult_ok("[]"),
-            )
-        )
+        await ui.handle(tool_event("read_file", {"path": "x"}))
         await ui.flush(force=True)  # edit fails → fresh message, editing stops
         assert len(bot.sent) == 2
         assert ui.status_message_id == bot.next_id
 
-    async def test_begin_creates_status_message_eagerly(self):
-
+    async def test_throttle_skips_then_forced_edits(self):
         bot = FakeBot()
-        ui = TelegramUIAdapter(bot, chat_id=1)
-        await ui.begin()
-        assert bot.sent == [(1, "…")]  # visible from the first second
-        assert ui.status_message_id is not None
-        await ui.begin()  # idempotent: no second status message
-        assert bot.sent == [(1, "…")]
+        ui = TelegramUIAdapter(bot, chat_id=1, edit_interval=3600, max_chars=500)
+        await ui.handle(tool_event("run_shell", {"command": "ls"}))
+        await ui.flush()  # first flush creates regardless of debounce
+        assert len(bot.sent) == 1
+        message_id = ui.status_message_id
+        await ui.handle(tool_event("read_file", {"path": "x"}))
+        await ui.flush()  # within debounce window: skipped
+        assert len(bot.edits) == 0
+        await ui.flush(force=True)
+        assert len(bot.sent) == 1  # still one message
+        assert bot.edits[-1][1] == message_id
 
-    async def test_error_renders_bold_line(self):
-
+    async def test_answer_is_separate_message(self):
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
-        await ui.handle(
-            AgentEvent(
-                type=EventType.ERROR,
-                token_usage=(0, 100),
-                error_message="model exploded",
+        await ui.begin()
+        await ui.end_turn("✓ done · 0 tools · 1 s")
+        await ui.answer("Here is **the answer**.")
+        assert bot.sent[-1][1] == "Here is **the answer**."
+        assert bot.sent[0][1] == "🧠 thinking…"
+
+    async def test_status_text_fits_one_message(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=MAX_TEXT_CHARS)
+        await ui.begin()
+        for i in range(STATUS_LINES + 4):
+            await ui.handle(
+                tool_event("read_file", {"path": f"some/deep/dir/file{i}.py"})
             )
-        )
-        assert "*error:* model exploded" in ui.buffer.render()
+        await ui.flush(force=True)
+        assert len(bot.edits[-1][2].encode("utf-16-le")) // 2 <= MAX_MESSAGE_CHARS

@@ -184,8 +184,8 @@ async def test_full_turn_single_status_message_then_separate_answer(app, home):
 
     # exactly two outbound messages: the eager status message and the answer
     assert len(bot.sent) == 2
-    assert bot.sent[0] == "…"  # created at turn start, before any event
-    assert "🔧 `fake` x=1" in bot.edits[0]  # tool start rendered into it
+    assert bot.sent[0] == "🧠 thinking…"  # created at turn start, before any event
+    assert "🧠 working" in bot.edits[0] and "fake" in bot.edits[0]  # tool line rendered
     assert bot.edits[-1] == "✓ done · 1 tools · 0 s"  # collapsed one-liner
     # the final answer is its own message, sent after the collapse
     assert bot.sent[1] == "All **done**."
