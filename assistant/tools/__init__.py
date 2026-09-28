@@ -13,6 +13,7 @@ from imp.adapters import FileSystemAdapter, HttpClient
 from imp.config import Config
 from imp.tools import Tool, build_tools
 
+from .inspect import CostReport, ListJobs, QueueStatus, SearchTranscripts
 from .memory import MemoryDelete, MemoryList, MemorySet
 from .schedule import ScheduleJob, UnscheduleJob
 from .send_file import SendFile
@@ -27,6 +28,7 @@ def build_assistant_tools(
     tz: str,
     scheduler: AsyncIOScheduler | None = None,
     db: aiosqlite.Connection | None = None,
+    is_turn_active: Callable[[], bool] | None = None,
 ) -> dict[str, Tool]:
     tools = build_tools(config=config, fs=fs, prompt_user=prompt_user, http=http)
     tools[SendFile.name] = SendFile(
@@ -41,14 +43,24 @@ def build_assistant_tools(
     tools[MemorySet.name] = MemorySet(config=config, db=db)
     tools[MemoryList.name] = MemoryList(config=config, db=db)
     tools[MemoryDelete.name] = MemoryDelete(config=config, db=db)
+    tools[ListJobs.name] = ListJobs(config=config, db=db, scheduler=scheduler)
+    tools[SearchTranscripts.name] = SearchTranscripts(config=config, db=db)
+    tools[CostReport.name] = CostReport(config=config, db=db)
+    tools[QueueStatus.name] = QueueStatus(
+        config=config, db=db, is_turn_active=is_turn_active
+    )
     return tools
 
 
 __all__ = [
+    "CostReport",
+    "ListJobs",
     "MemoryDelete",
     "MemoryList",
     "MemorySet",
+    "QueueStatus",
     "ScheduleJob",
+    "SearchTranscripts",
     "SendFile",
     "UnscheduleJob",
     "build_assistant_tools",
