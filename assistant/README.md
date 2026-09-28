@@ -1,232 +1,145 @@
 # assistant
 
-A general personal assistant reached over **Telegram**, built on `imp/` as a
-library. It keeps imp's capability set — read/write files, run shell, fetch and
-search the web — and adds Telegram tools, a bootstrap step that writes its own
-operating manual, and an internal scheduler for deferred work.
+A personal assistant reached over Telegram, built on `imp/` as a library. It
+uses aiogram for Telegram transport and OpenRouter for model calls.
 
-## What it is
+## What it does
 
-- **One owner, one conversation.** Exactly one positive user ID in `IMP_TG_ALLOWED_USER_IDS` is
-  served, in that owner’s private chat; groups and other senders are ignored.
-- **Telegram as the interface.** Long-polling against the Bot API directly over
-  `httpx2` — no Telegram framework dependency.
-- **A single debounced status message** appears at turn start, shows
-  reasoning and tool activity while the turn runs (typing indicator kept
-  alive), then collapses to a one-line summary. The final answer is its own
-  message rendered from markdown as Telegram HTML (code, bold, italic,
-  links); splitting never cuts a code block apart, and a rejected rendering
-  falls back to the literal text.
-- **Tools:** imp's `list_dir` / `read_file` / `write_file` / `str_replace` /
-  `run_shell` / `web_fetch` / `web_search`, plus `ask`, `send_file`,
-  `schedule_job` and `unschedule_job`.
-- **Self-configuring:** on first start it probes the machine and writes
+- **One owner, one private chat.** Set exactly one positive user ID in
+  `IMP_TG_ALLOWED_USER_IDS`; group chats and other senders are ignored.
+- **Turn status.** A persistent `🧠 thinking…` message stays until the turn is
+  over. While tools run, it shows only compact tool names and subjects in a
+  short monospace log. The final status includes tool count, seconds, and the
+  provider-reported USD cost when available. Reasoning text is never shown.
+- **Markdown and files.** `telegramify-markdown` renders answers as Telegram
+  entities and splits long replies safely. aiogram handles Bot API requests,
+  uploads, and downloads. Documents, photos, videos, audio (including m4a),
+  voice notes, video notes, animations, and stickers are accepted. Forwarded
+  source details are retained, and media albums are merged into one request.
+  Voice notes and playable audio are transcribed when STT is available.
+- **Tools.** imp's `list_dir`, `read_file`, `write_file`, `str_replace`,
+  `run_shell`, `web_fetch`, `web_search`, and `ask`, plus `send_file`,
+  `schedule_job`, `unschedule_job`, `list_jobs`, `search_transcripts`,
+  `cost_report`, `queue_status`, and durable memory tools (`memory_set`,
+  `memory_list`, `memory_delete`).
+- **Durable memory.** The assistant can save concise preferences and facts that
+  survive `/new`, restarts, and scheduled runs. A capped digest is included in
+  each system prompt. Values are limited to 2,048 characters; at most 200 keys.
+- **Self-configuring.** On first start it probes the machine and writes
   `<IMP_HOME>/AGENTS.md`, which shapes how it organises work (`scratch/`,
-  `scripts/`, `projects/`, `outbox/`, `jobs/`, `inbox/`). A model turn tailors the manual
-  without asking questions. Environment refreshes preserve the existing manual
-  outside the generated block. Failed tailoring is reported and retried at the
-  next startup; the bot continues with the existing manual.
-- **Deferred work:** the agent schedules runs with the `schedule_job` tool call;
-  an internal scheduler executes `jobs/*.json` — one-shot `at`/`at_local` or
-  `every` interval — with a fresh context per run. Scheduled runs cannot use
-  `ask`; include all necessary information in the job prompt. If essential
-  information is missing, the job reports what prevented completion.
-  The first interval deadline is persisted; subsequent intervals start at run
-  completion. Jobs and interactive turns execute one at a time. Polling notices
-  newly due jobs within 30 seconds, plus time spent waiting for active work or
-  an unanswered question. Cancellation prevents future runs; it cannot undo
-  actions already performed. Interrupted jobs become errors and require manual
-  rescheduling. Job JSON stores the last result, transcript and delivery error;
-  a failed send never causes execution to repeat.
-- **Uploads and voice:** documents, photos and voice notes the owner sends land
-  in `inbox/`; voice notes are transcribed (OpenRouter STT) into the next
-  prompt, and the audio file is deleted after a successful transcription.
-- **Queued prompts** are acknowledged: a message accepted while a turn or a
-  scheduled job is running gets a short reply (`Принято — в очереди …`) so the
-  owner knows it was received and is waiting, not ignored. A prompt that runs
-  immediately is not acknowledged.
-- **Request recovery:** waiting prompts are persisted in `state.json` and run in
-  arrival order, independently of long polling. After restart they resume in a
-  fresh conversation. A request interrupted during execution is reported and
-  never automatically replayed: it may already have performed actions. Check
-  its transcript before resubmitting. Corrupt state stops startup and requires
-  repair; deleting it loses queued work and the saved Telegram cursor.
-- **Questions:** only text received while a question is pending answers it.
-  Earlier messages, uploads, `/new`, and `/status` remain queued requests.
-- **Commands:** `/new` starts a fresh session (previous transcript stays on
-  disk); `/status` reports context usage and the transcript name.
+  `scripts/`, `projects/`, `outbox/`, `inbox/`). A model turn tailors the manual
+  without asking questions. Edits outside the generated block survive refresh.
+- **Scheduled jobs.** `schedule_job` supports one-shot `at`/`at_local`, interval
+  `every`, and five-field `cron` in `IMP_TZ`. APScheduler persists schedules in
+  `state.db`. Each job gets a fresh context and cannot use `ask`. Jobs can run
+  concurrently with an interactive turn and with other jobs (default maximum
+  two); results queue until the active interactive turn ends.
+- **Interactive FIFO.** Owner requests are accepted into a durable queue and
+  run one at a time. Busy requests receive `Принято — в очереди …`. A request
+  interrupted during execution is reported after restart and never replayed;
+  waiting requests resume in order.
+- **Turn costs.** Each turn's API-reported tokens, USD cost, tool count,
+  duration, and outcome are recorded in the database. `/status` continues to
+  show context estimate and the transcript ID.
+- **Commands.** `/new` starts a fresh conversation (the transcript remains in
+  the database); `/status` reports context use and transcript ID.
 
-## Design
+## State and files
 
-`AGENTS.md.template` is rendered by bootstrap into `<IMP_HOME>/AGENTS.md`;
-`.env.example` lists every environment variable.
+`<IMP_HOME>/state.db` is the assistant's single state artifact (SQLite WAL):
 
-The assistant reuses imp's `Agent`, `Context`, `build_system_prompt`, `entities`,
-`events`, `build_tools` and `Tool`, and builds its own composition root
-and UI adapter. imp exposes three backward-compatible keyword-argument seams:
-`build_system_prompt(..., base_prompt=...)`, `FileSystemAdapter(workspace,
-skills_dir=...)`, `SessionWriter(workspace, sessions_dir=...)`.
+- `kv`: bootstrap fingerprint and tailoring state, plus Telegram redelivery
+  deduplication (Telegram update offset itself is managed by aiogram).
+- `queue`: waiting and active owner requests.
+- `jobs_meta` and APScheduler's job table: job metadata, results, schedule state.
+- `turns`: per-turn usage, cost, tools, duration, and outcome.
+- `transcripts`: ordered JSON message rows, replacing `sessions/*.jsonl`.
+- `memory`: durable agent memory.
 
-## Layout
+The agent still works with ordinary workspace files: `AGENTS.md`, skills,
+`inbox/`, `outbox/`, `scratch/`, `scripts/`, and `projects/`. SQLite contains
+assistant state and transcripts, not user documents or workspace content.
 
-```
-assistant/
-├── main.py             app.py         config.py      prompt.py
-├── bootstrap.py        scheduler.py   jobstore.py    uploads.py
-├── adapters/  telegram.py  ui.py  stt.py
-├── tools/     send_file.py  schedule.py   (ask is reused from imp)
-└── deploy/    assistant.service  S99assistant  compose.yaml
-```
+The v2 assistant starts fresh. Existing v1 `state.json` and `jobs/*.json` are
+left untouched and not imported; recreate any schedules with `schedule_job`.
+To back up state, stop the bot and copy `state.db`.
 
 ## Running it
 
-`assistant/` lives inside the imp repository and reuses imp's dependencies, so
-install imp as usual. Wheels include both packages and the manual template:
+`assistant/` lives inside the imp repository and reuses its dependencies.
 
 ```bash
 export TELEGRAM_BOT_TOKEN=...
 export IMP_TG_ALLOWED_USER_IDS=123456789
 export OPENAI_API_KEY=sk-or-...       # an OpenRouter key
-export IMP_TZ=Asia/Almaty            # default; resolves at_local schedules
-export BRAVE_API_KEY=...            # optional: enables web_search
-uv sync                             # or: pip install . into a venv
-uv run python -m assistant          # long-polling bot
-python -m assistant whoami          # print sender IDs; Ctrl-C to exit
+export IMP_TZ=Asia/Almaty             # default; used by at_local and cron
+export BRAVE_API_KEY=...              # optional: enables web_search
+uv sync
+uv run python -m assistant
+python -m assistant whoami            # run while the bot is stopped
 ```
 
-**Finding your Telegram id:** run `python -m assistant whoami` (only
-`TELEGRAM_BOT_TOKEN` needed) **while the bot is stopped** — two `getUpdates`
-consumers fight over the same update stream — send the bot any message, and its
-sender id prints. Put that id into `IMP_TG_ALLOWED_USER_IDS` and start the bot.
+See `.env.example` for every variable. The assistant pins the OpenRouter base
+URL to `https://openrouter.ai/api/v1`; the default model is
+`openai/gpt-5-mini`, overridden by `OPENAI_MODEL`. `IMP_HOME` is the file-tool
+confinement root; shell commands run with the service account's permissions.
+Set `IMP_MAX_CONCURRENT_JOBS` to change the job concurrency cap (default `2`).
 
-The assistant talks to **OpenRouter only**: the base URL is pinned to
-`https://openrouter.ai/api/v1`. imp's documented env vars (`OPENAI_MODEL`,
-`IMP_MAX_CONTEXT`, `IMP_REASONING_EFFORT`, …) apply. The assistant model default
-is `openai/gpt-5-mini`; OPENAI_MODEL overrides it. IMP_WORKSPACE is CLI-only;
-the assistant uses IMP_HOME. Logs go to stderr (`IMP_LOG_LEVEL`, default
-`info`) — startup, turns, tools, jobs, delivery failures.
+## Deployment
 
-In a fresh chat the assistant answers `/status`; a busy bot replies with a
-one-line `✓ done · N tools · X s` status before the answer.
+Supported target: glibc Linux, including ARM64 SBCs. The first deployment
+target is Armbian on ARM64. BusyBox/musl deployment is not supported.
 
-Re-tailoring the operating manual (the old `--rebootstrap`): stop the bot,
-delete the `fingerprint` key from `<IMP_HOME>/state.json`, start the bot.
-
-See `.env.example` for every variable.
-
-## Deploying
-
-Targets a Raspberry Pi Zero 2W (musl/aarch64, Python 3.12, Dropbear, BusyBox)
-and any generic Linux/Unix box with Python 3.12+.
-
-**Docker (local sandbox):** run the assistant contained on your machine —
-shell and file tools reach only the container and mounted volumes, not the
-host; mount host directories deliberately if the assistant should manage them.
+**Docker:**
 
 ```bash
-cp assistant/.env.example assistant/deploy/assistant.env   # fill in values
+cp assistant/.env.example assistant/deploy/assistant.env  # fill in values
 docker build --target assistant -t imp-assistant .
-docker compose -f assistant/deploy/compose.yaml up -d      # logs: ... logs -f
+docker compose -f assistant/deploy/compose.yaml up -d
 ```
 
-State (manual, sessions, jobs, inbox/outbox) persists in a named volume at
-`IMP_HOME=/data`. Find your Telegram id first with
-`docker run --rm -it -e TELEGRAM_BOT_TOKEN=... imp-assistant whoami` (only
-while the bot is stopped).
+Docker keeps assistant files and `state.db` in the `/data` volume. The shell
+and file tools operate inside the container and mounted volumes.
 
-**Install (bare metal):** verify wheel availability on the target before
-deployment. `lxml`, `jiter`, and `pydantic-core` include native components;
-this repository's local checks do not establish Raspberry Pi/musl
-compatibility. The root Dockerfile's default build remains the CLI image;
-`--target assistant` (above) builds the service image.
-
-```bash
-python3 -m venv /opt/imp-venv
-/opt/imp-venv/bin/pip install /opt/imp     # the repo, scp'd to /opt/imp
-```
-
-**Transferring to the Pi:** Dropbear needs the legacy SCP protocol:
-
-```bash
-scp -O -r /path/to/imp root@pi-zero:/opt/imp
-```
-
-**Execution boundary:** the bot is trusted host automation. Shell commands are
-approved automatically and inherit the service account’s filesystem, network
-and environment access, including credentials. IMP_HOME confines file tools,
-not shell commands. Run only one bot process per home/token. The BusyBox script
-runs as its invoking account (normally root); the systemd unit uses `assistant`.
-Systemd’s PrivateTmp and NoNewPrivileges settings still apply.
-
-Before using the systemd unit, create its account and writable home (as an
-administrator; adjust paths for your distribution):
+**Bare-metal systemd:** use `assistant/deploy/assistant.service`, create a
+dedicated service account and writable home, place variables in
+`/etc/assistant.env`, then enable the service. For example:
 
 ```bash
 useradd --system --create-home --home-dir /var/lib/assistant assistant
 install -d -o assistant -g assistant /var/lib/assistant/assistant
 # Set IMP_HOME=/var/lib/assistant/assistant in /etc/assistant.env.
+cp assistant/deploy/assistant.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now assistant
 ```
 
-**Autostart:**
+**Execution boundary:** shell commands are approved automatically and inherit
+the service account's filesystem, network, and environment access, including
+credentials. IMP_HOME confines file tools, not shell commands. Run only one bot
+process per home/token.
 
-- Generic Linux (systemd): `assistant/deploy/assistant.service` — copy to
-  `/etc/systemd/system/`, put env in `/etc/assistant.env`,
-  `systemctl daemon-reload && systemctl enable --now assistant`.
-- Pi (BusyBox init): `assistant/deploy/S99assistant` — copy to
-  `/etc/init.d/S99assistant`, `chmod +x`, env in `/etc/assistant.env`; it starts
-  the bot at boot and supports `start|stop|restart|status`.
-
-**BusyBox notes:** `run_shell` executes through `/bin/sh` on POSIX. The probe
-records that executable’s resolved path; it does not guess the shell flavor. The init script above uses only BusyBox applets (`start-stop-daemon`,
-`sh`, `sleep`).
-
-## Development
-
-The workflow mirrors imp's:
+## Development and smoke checks
 
 ```bash
-uv run ruff check .      # or: ruff check assistant/ tests/
-uv run python -m pytest  # imp + assistant suites
+uv run ruff check .
+uv run python -m pytest
 ```
 
-imp's suite stays green; the three seams have one test each, and the assistant
-modules are covered in `tests/test_bootstrap.py`, `tests/test_scheduler.py`,
-`tests/test_schedule.py`, `tests/test_send_file.py`, `tests/test_telegram.py`,
-`tests/test_stt.py`, `tests/test_uploads.py`, `tests/test_whoami.py`,
-`tests/test_assistant_config.py` and `tests/test_assistant_app.py`.
+Before deploying, verify with an approved test owner/chat and provider budget:
 
-## Limits and verification
+1. Owner private messages work; other senders and groups are ignored.
+2. Answer a pending `ask`; queue another text and an upload during a turn.
+3. Share/forward an m4a as audio and as a document; both land in `inbox/`.
+4. Share a multi-photo album and verify it produces one queued request.
+5. Send a forwarded document and verify its source is represented in the prompt.
+6. Deliver a long markdown answer with code and round-trip a small file.
+7. Observe a turn summary with real USD cost when the provider reports it.
+8. Schedule an interval and cron job while an interactive turn is running; verify
+   jobs run concurrently and their results wait until the turn ends; cancel them.
+9. Restart with one active and two waiting requests: the active request is
+   reported once without replay, then waiting requests run in order.
+10. Restart during a harmless job: it is marked interrupted and never replayed.
 
-`IMP_MAX_HTTP_BYTES` (default 10,000,000) also caps whole-file reads for
-replacement, selected text reads, and file transfers. Use smaller line ranges
-or a deliberate shell extraction for larger files. Downloads enforce actual
-received bytes. File-tool path checks do not eliminate all filesystem races;
-trusted shell commands can bypass them. Shell output capture uses temporary
-disk files: disk quotas and descendant-process limits belong to the service
-account/deployment, not this Python file adapter.
-
-Required delivery failures are surfaced; transcripts and job results remain on
-disk. Ambiguous network retries may duplicate messages. There is no exactly-once
-external-action guarantee, persistent conversation resume, or automatic retry of
-interrupted actions. Status messages are cosmetic, throttled on events, with a
-forced flush at turn end. Commands queue while a turn is busy; questions have no
-automatic timeout. Restart reports interrupted work and resumes waiting requests
-in a fresh conversation. Uploads are saved/extracted as files; attaching an image
-or PDF does not imply native multimodal model input.
-
-Before calling a deployment ready, run these smoke checks with an explicitly
-approved test owner/chat and provider budget:
-
-1. Verify a private owner message works and a group/other sender is ignored.
-2. Ask and answer a question; queue an upload and another task while waiting.
-3. Deliver a long answer containing emoji/code and round-trip a small file.
-4. Transcribe a short voice note using the configured OpenRouter STT model.
-5. Schedule a harmless interval job and observe its first two runs; cancel it.
-6. Restart with one active and two waiting requests: report the active request
-   once without replay, then run waiting requests in order.
-7. Restart during a harmless job: it becomes interrupted/error, never replayed.
-8. Edit the manual, reset the conversation and restart; owner edits survive.
-9. Verify service account/home, logs, native dependency installation, and stop/
-   restart on the actual target host. No real credentials belong in test output.
-
-Local mocks and wheel checks do not substitute for these live checks.
+No exactly-once external-action guarantee, persistent conversation resume, or
+automatic retry of interrupted actions. Uploaded images/PDFs are saved as files;
+they are not passed as native multimodal model input.

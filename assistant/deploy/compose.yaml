@@ -1,7 +1,7 @@
 # Telegram assistant service. From the repo root:
 #   cp assistant/.env.example assistant/deploy/assistant.env  # fill in values
 #   docker compose -f assistant/deploy/compose.yaml up -d
-# State (manual, sessions, jobs, inbox/outbox) persists in the named volume
+# State (state.db, manual, inbox/outbox, workspace files) persists in the named volume
 # mounted at IMP_HOME=/data. Logs: docker compose -f assistant/deploy/compose.yaml logs -f
 name: imp-assistant
 

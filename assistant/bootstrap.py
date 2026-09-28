@@ -38,7 +38,7 @@ MINIMAL_TEMPLATE = """# AGENTS.md
 
 The assistant's operating manual. The packaged template was unreadable, so this
 minimal manual was generated instead; delete the `fingerprint` key in
-state.json and restart to retry.
+state.db and restart to retry.
 
 <!-- ENVIRONMENT:BEGIN -->
 <!-- ENVIRONMENT:END -->

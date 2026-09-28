@@ -539,10 +539,10 @@ git commit -m "feat(assistant): aiogram polling, dedup+album intake, all-kind up
 **Interfaces:**
 - Consumes: everything above.
 
-- [ ] **Step 1: Verify nothing references deleted modules**
+- [ ] **Step 1: Verify v1-only files and imports are gone**
 
-Run: `grep -rn "jobstore\|S99assistant\|state.json" --include="*.py" assistant/ tests/ imp/`
-Expected: no matches in code (README mentions only historical).
+Run: `test ! -e assistant/jobstore.py && test ! -e assistant/deploy/S99assistant && uv run python -c "import importlib.util; assert importlib.util.find_spec('assistant.jobstore') is None"`
+Expected: PASS. APScheduler's `apscheduler.jobstores` references and intentional v1-state references in migration docs/tests remain valid.
 
 - [ ] **Step 2: Update docs**
 
@@ -550,8 +550,8 @@ README: architecture (state.db schema table, APScheduler, aiogram, outbox), tool
 
 - [ ] **Step 3: Run everything**
 
-Run: `uv run python -m pytest && uv run ruff check . && uv run python -m assistant --help`
-Expected: PASS, clean, usage prints.
+Run: `uv run python -m pytest && uv run ruff check . && uv run python -c "import assistant; import assistant.main; print('assistant import ok')"`
+Expected: PASS, clean, `assistant import ok` prints. The service CLI has no `--help` option.
 
 - [ ] **Step 4: Commit**
 
