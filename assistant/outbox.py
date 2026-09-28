@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncContextManager, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Self
 
@@ -28,7 +28,7 @@ class Outbox:
         self._worker: asyncio.Task | None = None
 
     @asynccontextmanager
-    async def turn_scope(self) -> AsyncContextManager[Self]:
+    async def turn_scope(self) -> AsyncIterator[Self]:
         """Mark an interactive turn active; deferred items resume on exit."""
         self._turns_active += 1
         self._idle.clear()
