@@ -305,6 +305,8 @@ async def run_poll_loop(bot, app, cycles: int) -> PollLoop:
     task = asyncio.create_task(loop.poll_forever())
     for _ in range(cycles):
         await asyncio.sleep(0.01)
+    if loop.turn_task is not None:
+        await asyncio.wait_for(asyncio.shield(loop.turn_task), timeout=2)
     task.cancel()
     try:
         await task
