@@ -36,3 +36,8 @@ Reporting:
 Scheduling:
 - For deferred or recurring work, use the schedule_job tool call (see the
   operating manual) and tell the owner it is scheduled."""
+
+
+def memory_section(digest: str) -> str:
+    """Wrap the capped durable-memory digest for injection into the prompt."""
+    return f"\n\n## Memory\n\n{digest}" if digest else ""

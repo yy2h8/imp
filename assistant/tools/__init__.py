@@ -13,6 +13,7 @@ from imp.adapters import FileSystemAdapter, HttpClient
 from imp.config import Config
 from imp.tools import Tool, build_tools
 
+from .memory import MemoryDelete, MemoryList, MemorySet
 from .schedule import ScheduleJob, UnscheduleJob
 from .send_file import SendFile
 
@@ -37,7 +38,18 @@ def build_assistant_tools(
     tools[UnscheduleJob.name] = UnscheduleJob(
         config=config, scheduler=scheduler, db=db
     )
+    tools[MemorySet.name] = MemorySet(config=config, db=db)
+    tools[MemoryList.name] = MemoryList(config=config, db=db)
+    tools[MemoryDelete.name] = MemoryDelete(config=config, db=db)
     return tools
 
 
-__all__ = ["ScheduleJob", "SendFile", "UnscheduleJob", "build_assistant_tools"]
+__all__ = [
+    "MemoryDelete",
+    "MemoryList",
+    "MemorySet",
+    "ScheduleJob",
+    "SendFile",
+    "UnscheduleJob",
+    "build_assistant_tools",
+]

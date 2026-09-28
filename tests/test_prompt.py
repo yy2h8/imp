@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from assistant.prompt import memory_section
 from imp.agent.prompt import build_system_prompt
 from imp.tools import Tool, ToolResult
 
@@ -58,6 +59,14 @@ def test_no_skills_section_when_empty():
 def test_project_context_section():
     assert "## Project Instructions" in build(context="PROJECT NOTES")
     assert "PROJECT NOTES" in build(context="PROJECT NOTES")
+
+
+def test_memory_section_empty_is_omitted():
+    assert memory_section("") == ""
+
+
+def test_memory_section_wraps_digest():
+    assert memory_section("units: metric") == "\n\n## Memory\n\nunits: metric"
     assert "## Project Instructions" not in build()
 
 
