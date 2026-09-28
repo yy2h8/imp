@@ -97,11 +97,21 @@ async def open_db(path: Path) -> aiosqlite.Connection:
         await conn.execute("PRAGMA journal_mode=WAL")
         rows = await conn.execute_fetchall("PRAGMA user_version")
         version = rows[0][0] if rows else 0
-        for target in sorted(_MIGRATIONS):
-            if target > version:
+        for target in (1, 2):
+            if target <= version:
+                continue
+            if target == 1:
                 await conn.executescript(_MIGRATIONS[target])
-                await conn.execute(f"PRAGMA user_version={target}")
-                await conn.commit()
+            elif target == 2:
+                columns = await conn.execute_fetchall("PRAGMA table_info(queue)")
+                if "album_id" not in {row[1] for row in columns}:
+                    await conn.execute("ALTER TABLE queue ADD COLUMN album_id TEXT")
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_queue_album_state "
+                    "ON queue(album_id, state)"
+                )
+            await conn.execute(f"PRAGMA user_version={target}")
+            await conn.commit()
     except BaseException:
         await conn.close()
         raise
@@ -138,13 +148,14 @@ async def queue_push(conn: aiosqlite.Connection, kind: str, payload: str) -> int
 async def queue_claim_next(
     conn: aiosqlite.Connection,
 ) -> tuple[int, str, str] | None:
-    """Oldest waiting row → active; returns (id, kind, payload) or None."""
+    """Claim the oldest unresolved row. A collecting album blocks later FIFO
+    work until its quiet window ends."""
     async with conn.execute(
-        "SELECT id, kind, payload FROM queue WHERE state = 'waiting' "
-        "ORDER BY id LIMIT 1"
+        "SELECT id, kind, payload, state FROM queue "
+        "WHERE state IN ('waiting', 'collecting') ORDER BY id LIMIT 1"
     ) as cur:
         row = await cur.fetchone()
-    if row is None:
+    if row is None or row[3] == "collecting":
         return None
     await conn.execute("UPDATE queue SET state = 'active' WHERE id = ?", (row[0],))
     await conn.commit()
@@ -153,10 +164,29 @@ async def queue_claim_next(
 
 async def queue_count_waiting(conn: aiosqlite.Connection) -> int:
     async with conn.execute(
-        "SELECT COUNT(*) FROM queue WHERE state = 'waiting'"
+        "SELECT COUNT(*) FROM queue WHERE state IN ('waiting', 'collecting')"
     ) as cur:
         (count,) = await cur.fetchone()
     return count
+
+
+async def queue_finish_album(conn: aiosqlite.Connection, album_id: str) -> bool:
+    cur = await conn.execute(
+        "UPDATE queue SET state = 'waiting' "
+        "WHERE album_id = ? AND state = 'collecting'",
+        (album_id,),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def queue_resume_collecting(conn: aiosqlite.Connection) -> int:
+    """Make persisted partial albums runnable after a crash/restart."""
+    cur = await conn.execute(
+        "UPDATE queue SET state = 'waiting' WHERE state = 'collecting'"
+    )
+    await conn.commit()
+    return cur.rowcount
 
 
 async def queue_finish(conn: aiosqlite.Connection, row_id: int) -> None:

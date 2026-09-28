@@ -30,7 +30,9 @@ from .config import AssistantConfig
 from .db import (
     queue_claim_next,
     queue_finish,
+    queue_finish_album,
     queue_interrupted,
+    queue_resume_collecting,
     turn_insert,
 )
 from .intake import AlbumBuffer, Intake, route_message
@@ -204,18 +206,22 @@ class AssistantController:
         self.albums = AlbumBuffer()
         self.turn_task: asyncio.Task | None = None
         self.album_task: asyncio.Task | None = None
+        self._wake = asyncio.Event()
+        self._working = False
 
     async def start(self) -> None:
+        await queue_resume_collecting(self.app.db)
         self.album_task = asyncio.create_task(self._flush_albums())
-        await self._drain_queue()
+        self.turn_task = asyncio.create_task(self._work())
+        self._wake.set()
 
     async def close(self) -> None:
         if self.album_task is not None:
             self.album_task.cancel()
             await asyncio.gather(self.album_task, return_exceptions=True)
         # A graceful shutdown persists groups still inside their debounce window.
-        for group in await self.albums.flush_all():
-            await self.intake.accept_album(group)
+        for album_id in await self.albums.flush_all():
+            await queue_finish_album(self.app.db, album_id)
         if self.turn_task is not None and not self.turn_task.done():
             self.turn_task.cancel()
             await asyncio.gather(self.turn_task, return_exceptions=True)
@@ -242,7 +248,11 @@ class AssistantController:
                 await self._drain_queue()
             return
         if routed.attachment and message.get("media_group_id"):
+            ack = await self.intake.accept_album_item(message)
+            if ack:
+                await send_text(self.app.bot, self.app.chat_id, ack)
             await self.albums.add(message)
+            await self._drain_queue()
             return
         if routed.text is not None:
             message["text"] = routed.text
@@ -252,24 +262,25 @@ class AssistantController:
         await self._drain_queue()
 
     async def wait_idle(self) -> None:
-        if self.turn_task is not None:
-            await self.turn_task
+        while self._working:
+            await asyncio.sleep(0.01)
+        while True:
+            rows = await self.app.db.execute_fetchall("SELECT COUNT(*) FROM queue")
+            if rows[0][0] == 0 and not self._working:
+                return
+            await asyncio.sleep(0.01)
 
     async def _flush_albums(self) -> None:
         while True:
             await asyncio.sleep(0.1)
-            for group in await self.albums.flush_due():
-                ack = await self.intake.accept_album(group)
-                if ack:
-                    await send_text(self.app.bot, self.app.chat_id, ack)
+            for album_id in await self.albums.flush_due():
+                await queue_finish_album(self.app.db, album_id)
                 await self._drain_queue()
 
     async def _drain_queue(self) -> None:
-        if self.turn_task is not None and not self.turn_task.done():
-            return
-        if self.turn_task is not None:
-            self.turn_task.result()
-        self.turn_task = asyncio.create_task(self._work())
+        if self.turn_task is None or self.turn_task.done():
+            self.turn_task = asyncio.create_task(self._work())
+        self._wake.set()
 
     @asynccontextmanager
     async def _busy_scope(self):
@@ -286,39 +297,44 @@ class AssistantController:
 
     async def _work(self) -> None:
         while True:
-            row = await queue_claim_next(self.app.db)
-            if row is None:
-                return
-            row_id, kind, raw = row
-            completed = False
-            try:
-                payload = json.loads(raw)
-                async with self._busy_scope():
-                    if kind == "attachment":
-                        prompt = await self.app.uploads.handle(
-                            payload.get("attachments", []), payload.get("caption", "")
-                        )
-                    else:
-                        prompt = payload.get("text", "")
-                    if prompt:
-                        await TurnRunner(
-                            self.app,
-                            self.app.bot,
-                            self.app.assistant.edit_interval,
-                            self.app.assistant.status_max_chars,
-                        ).run(prompt)
-                completed = True
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _LOG.exception("queued request %s failed", row_id)
-                await send_text(
-                    self.app.bot, self.app.chat_id, "*error:* queued request failed"
-                )
-                completed = True
-            finally:
-                if completed:
-                    await queue_finish(self.app.db, row_id)
+            await self._wake.wait()
+            self._wake.clear()
+            while True:
+                row = await queue_claim_next(self.app.db)
+                if row is None:
+                    break
+                row_id, kind, raw = row
+                completed = False
+                self._working = True
+                try:
+                    payload = json.loads(raw)
+                    async with self._busy_scope():
+                        if kind == "attachment":
+                            prompt = await self.app.uploads.handle(
+                                payload.get("attachments", []), payload.get("caption", "")
+                            )
+                        else:
+                            prompt = payload.get("text", "")
+                        if prompt:
+                            await TurnRunner(
+                                self.app,
+                                self.app.bot,
+                                self.app.assistant.edit_interval,
+                                self.app.assistant.status_max_chars,
+                            ).run(prompt)
+                    completed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _LOG.exception("queued request %s failed", row_id)
+                    await send_text(
+                        self.app.bot, self.app.chat_id, "*error:* queued request failed"
+                    )
+                    completed = True
+                finally:
+                    if completed:
+                        await queue_finish(self.app.db, row_id)
+                    self._working = False
 
 
 def build_dispatcher(controller: AssistantController) -> Dispatcher:

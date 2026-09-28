@@ -13,7 +13,7 @@ from typing import Any
 
 import aiosqlite
 
-from .db import BUSY_TIMEOUT_MS
+from .db import BUSY_TIMEOUT_MS, queue_finish_album
 
 _FILE_KINDS = (
     "document", "photo", "video", "audio", "voice", "video_note",
@@ -136,9 +136,8 @@ def route_message(
 class AlbumBuffer:
     """Collect separate Telegram media-group updates until a quiet window."""
 
-    def __init__(self, wait_s: float = 1.5) -> None:
+    def __init__(self, wait_s: float = 2.5) -> None:
         self.wait_s = wait_s
-        self._items: dict[str, list[dict]] = {}
         self._deadlines: dict[str, float] = {}
         self._seen_ids: set[tuple[str, int]] = set()
 
@@ -153,21 +152,18 @@ class AlbumBuffer:
             return
         if marker is not None:
             self._seen_ids.add(marker)
-        self._items.setdefault(key, []).append(message)
         self._deadlines[key] = time.monotonic() + self.wait_s
 
-    async def flush_due(self) -> list[list[dict]]:
+    async def flush_due(self) -> list[str]:
         now = time.monotonic()
         due = [key for key, deadline in self._deadlines.items() if deadline <= now]
-        groups = [self._items.pop(key) for key in due]
         for key in due:
             self._deadlines.pop(key, None)
             self._seen_ids = {marker for marker in self._seen_ids if marker[0] != key}
-        return groups
+        return due
 
-    async def flush_all(self) -> list[list[dict]]:
-        groups = list(self._items.values())
-        self._items.clear()
+    async def flush_all(self) -> list[str]:
+        groups = list(self._deadlines)
         self._deadlines.clear()
         self._seen_ids.clear()
         return groups
@@ -249,29 +245,28 @@ class Intake:
         depth_before = depth - 1
         return queued_notice(depth) if self.is_busy() or depth_before else None
 
-    async def accept_album(self, messages: list[dict]) -> str | None:
-        """Queue one entry containing all items from a buffered album."""
-        attachments = [
-            attachment for message in messages
-            if (attachment := normalize_attachment(message)) is not None
-        ]
-        if not attachments:
+    async def accept_album_item(self, message: dict) -> str | None:
+        """Persist an album row immediately, then append each arriving item."""
+        attachment = normalize_attachment(message)
+        album_id = message.get("media_group_id")
+        message_id = message.get("message_id")
+        if attachment is None or album_id is None or type(message_id) is not int:
             return None
-        caption = next((item["caption"] for item in attachments if item["caption"]), "")
-        ids = [m.get("message_id") for m in messages if type(m.get("message_id")) is int]
         async with self._lock:
             accepted, depth = await asyncio.to_thread(
-                _enqueue_sync,
+                _album_item_sync,
                 await self._path(),
-                "attachment",
-                json.dumps({"attachments": attachments, "caption": caption}, ensure_ascii=False),
-                ids,
-                True,
+                str(album_id),
+                attachment,
+                message_id,
             )
         if not accepted:
             return None
         depth_before = depth - 1
         return queued_notice(depth) if self.is_busy() or depth_before else None
+
+    async def finish_album(self, album_id: str) -> bool:
+        return await queue_finish_album(self.db, album_id)
 
 
 def _mark_seen_sync(path: Path, message_id: int) -> bool:
@@ -328,7 +323,74 @@ def _enqueue_sync(
                 (json.dumps(newest),),
             )
         (depth,) = conn.execute(
-            "SELECT COUNT(*) FROM queue WHERE state = 'waiting'"
+            "SELECT COUNT(*) FROM queue WHERE state IN ('waiting', 'collecting')"
+        ).fetchone()
+        conn.commit()
+        return True, depth
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _album_item_sync(
+    path: Path, album_id: str, attachment: dict, message_id: int
+) -> tuple[bool, int]:
+    """Atomically create/extend one collecting queue row for a media group."""
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "SELECT value FROM kv WHERE key = 'last_message_id'"
+        ).fetchone()
+        last = int(json.loads(cursor[0])) if cursor else None
+        row = conn.execute(
+            "SELECT id, payload FROM queue WHERE album_id = ? "
+            "AND state IN ('collecting', 'waiting') ORDER BY id LIMIT 1",
+            (album_id,),
+        ).fetchone()
+        if row is None:
+            if last is not None and message_id <= last:
+                conn.rollback()
+                return False, 0
+            payload = {
+                "attachments": [attachment],
+                "caption": attachment.get("caption", ""),
+                "message_ids": [message_id],
+            }
+            conn.execute(
+                "INSERT INTO queue(kind, payload, state, created_at, album_id) "
+                "VALUES ('attachment', ?, 'collecting', ?, ?)",
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                    album_id,
+                ),
+            )
+        else:
+            row_id, raw = row
+            payload = json.loads(raw)
+            if message_id in payload["message_ids"]:
+                conn.rollback()
+                return False, 0
+            payload["attachments"].append(attachment)
+            payload["message_ids"].append(message_id)
+            if not payload["caption"] and attachment.get("caption"):
+                payload["caption"] = attachment["caption"]
+            conn.execute(
+                "UPDATE queue SET payload = ?, state = 'collecting' WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), row_id),
+            )
+        if last is None or message_id > last:
+            conn.execute(
+                "INSERT INTO kv(key, value) VALUES ('last_message_id', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(message_id),),
+            )
+        (depth,) = conn.execute(
+            "SELECT COUNT(*) FROM queue WHERE state IN ('waiting', 'collecting')"
         ).fetchone()
         conn.commit()
         return True, depth

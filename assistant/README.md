@@ -50,7 +50,9 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
 
 - `kv`: bootstrap fingerprint and tailoring state, plus Telegram redelivery
   deduplication (Telegram update offset itself is managed by aiogram).
-- `queue`: waiting and active owner requests.
+- `queue`: waiting and active owner requests, plus a durable `collecting` row
+  while an album is still arriving. That row blocks later requests to preserve
+  FIFO order and resumes with received items after restart.
 - `jobs_meta` and APScheduler's job table: job metadata, results, schedule state.
 - `turns`: per-turn usage, cost, tools, duration, and outcome.
 - `transcripts`: ordered JSON message rows, replacing `sessions/*.jsonl`.

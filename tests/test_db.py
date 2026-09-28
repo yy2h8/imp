@@ -76,7 +76,23 @@ async def test_open_db_migrations_idempotent(tmp_path):
     await conn.close()
     conn = await open_db(path)  # second open: same version, no error
     version_again = (await conn.execute_fetchall("PRAGMA user_version"))[0][0]
-    assert version == version_again == 1
+    assert version == version_again == 2
+    await conn.close()
+
+
+async def test_v2_migration_recovers_when_column_exists_but_version_did_not_advance(tmp_path):
+    path = tmp_path / STATE_DB_NAME
+    conn = await open_db(path)
+    await conn.close()
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA user_version=1")  # simulate crash after ALTER TABLE
+    raw.commit()
+    raw.close()
+    conn = await open_db(path)
+    version = (await conn.execute_fetchall("PRAGMA user_version"))[0][0]
+    columns = await conn.execute_fetchall("PRAGMA table_info(queue)")
+    assert version == 2
+    assert "album_id" in {row[1] for row in columns}
     await conn.close()
 
 

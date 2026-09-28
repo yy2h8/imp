@@ -8,7 +8,13 @@ import sqlite3
 
 import pytest
 
-from assistant.db import STATE_DB_NAME, kv_get, open_db, queue_count_waiting
+from assistant.db import (
+    STATE_DB_NAME,
+    kv_get,
+    open_db,
+    queue_claim_next,
+    queue_count_waiting,
+)
 from assistant.intake import AlbumBuffer, Intake, normalize_attachment, route_message
 
 
@@ -93,21 +99,42 @@ async def test_album_merge_interleaved_with_text(db, tmp_path):
     intake = Intake(db, FakeBot(), chat_id=7, db_path=tmp_path / STATE_DB_NAME)
     albums = AlbumBuffer(wait_s=0.03)
     first = message(photo=[{"file_id": "p1", "file_size": 1}], media_group_id="g", message_id=10)
-    second = message(photo=[{"file_id": "p2", "file_size": 2}], media_group_id="g", message_id=12)
-    third = message(photo=[{"file_id": "p3", "file_size": 3}], media_group_id="g", message_id=13)
+    second = message(photo=[{"file_id": "p2", "file_size": 2}], media_group_id="g", message_id=13)
+    await intake.accept_album_item(first)
     await albums.add(first)
-    await albums.add(second)
     await intake.accept(message(text="between photos", message_id=11))
-    await albums.add(third)
+    await intake.accept_album_item(second)
+    await albums.add(second)
+    assert await queue_claim_next(db) is None  # earlier collecting album blocks later text
     await asyncio.sleep(0.04)
     groups = await albums.flush_due()
-    assert len(groups) == 1 and len(groups[0]) == 3
-    await intake.accept_album(groups[0])
+    assert groups == ["g"]
+    await intake.finish_album("g")
     assert await queue_count_waiting(db) == 2
+    claimed = await queue_claim_next(db)
+    assert claimed is not None and claimed[1] == "attachment"  # album precedes text
     rows = await db.execute_fetchall("SELECT payload FROM queue ORDER BY id")
     payloads = [json.loads(row[0]) for row in rows]
-    assert payloads[0]["text"] == "between photos"
-    assert len(payloads[1]["attachments"]) == 3
+    assert len(payloads[0]["attachments"]) == 2
+    assert payloads[1]["text"] == "between photos"
+
+
+async def test_album_straggler_after_more_than_one_second_stays_grouped(db, tmp_path):
+    intake = Intake(db, FakeBot(), chat_id=7, db_path=tmp_path / STATE_DB_NAME)
+    albums = AlbumBuffer(wait_s=2.0)
+    first = message(photo=[{"file_id": "p1"}], media_group_id="slow", message_id=20)
+    second = message(photo=[{"file_id": "p2"}], media_group_id="slow", message_id=21)
+    await intake.accept_album_item(first)
+    await albums.add(first)
+    await asyncio.sleep(1.6)
+    await intake.accept_album_item(second)
+    await albums.add(second)
+    assert await albums.flush_due() == []
+    await asyncio.sleep(2.1)
+    assert await albums.flush_due() == ["slow"]
+    await intake.finish_album("slow")
+    rows = await db.execute_fetchall("SELECT payload FROM queue")
+    assert len(json.loads(rows[0][0])["attachments"]) == 2
 
 
 async def test_failed_queue_insert_does_not_claim_message_id(db, tmp_path):

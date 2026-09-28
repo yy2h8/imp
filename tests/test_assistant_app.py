@@ -159,6 +159,36 @@ async def test_controller_acknowledges_work_queued_during_active_turn(app):
     await controller.close()
 
 
+async def test_worker_rechecks_queue_after_empty_poll_race(app, monkeypatch):
+    from assistant.db import queue_claim_next, queue_count_waiting
+
+    original = queue_claim_next
+    empty_claimed = asyncio.Event()
+    release_empty = asyncio.Event()
+    first = True
+
+    async def pause_after_empty(conn):
+        nonlocal first
+        row = await original(conn)
+        if row is None and first:
+            first = False
+            empty_claimed.set()
+            await release_empty.wait()
+        return row
+
+    monkeypatch.setattr("assistant.main.queue_claim_next", pause_after_empty)
+    app.agent.client = StubClient([response([message_item("arrived in gap")])])
+    controller = AssistantController(app)
+    await controller.start()
+    await asyncio.wait_for(empty_claimed.wait(), timeout=1)
+    await controller.handle_message(owner_message("late request", message_id=30))
+    release_empty.set()
+    await controller.wait_idle()
+    assert await queue_count_waiting(app.db) == 0
+    assert app.bot.sent[-1] == "arrived in gap"
+    await controller.close()
+
+
 async def test_command_status_and_new_are_direct_not_model_turns(app):
     controller = AssistantController(app)
     await controller.handle_message(owner_message("/status", message_id=21))

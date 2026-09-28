@@ -67,7 +67,7 @@ Our tables (aiosqlite):
 
 - `kv(key TEXT PRIMARY KEY, value TEXT)` — fingerprint, tailoring flag, `last_message_id` (redelivery dedup; the update offset itself belongs to aiogram's polling, not persisted state).
 - `memory(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)` — agent memory. Caps: 200 keys, 2 KB per value; prompt digest ≤ 1.5 KB (oldest entries truncated out of the digest, never silently deleted).
-- `queue(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, payload TEXT, state TEXT, created_at TEXT)` — request FIFO. States: waiting / active / done. Done rows are pruned.
+- `queue(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, payload TEXT, state TEXT, created_at TEXT, album_id TEXT)` — request FIFO. States: collecting / waiting / active; finished and interrupted rows are deleted. An album gets a durable `collecting` row on its first item, blocking later FIFO work until the quiet window ends; startup resumes a leftover collecting row with the items already received.
 - `turns(id INTEGER PRIMARY KEY, ts TEXT, kind TEXT, session_id TEXT, model TEXT, in_tokens INTEGER, out_tokens INTEGER, cost_usd REAL, tools INTEGER, seconds REAL, ok INTEGER)` — one row per turn; kinds: interactive / job / bootstrap.
 - `transcripts(session_id TEXT, seq INTEGER, ts TEXT, message TEXT, PRIMARY KEY (session_id, seq))` — one row per conversation message (JSON, same shape as today's jsonl lines). `session_id` keeps today's stamp-token format so `/status` and `jobs_meta.transcript` stay readable.
 - `jobs_meta(schedule_id TEXT PRIMARY KEY, label TEXT, prompt TEXT, tz TEXT, result TEXT, delivery TEXT, transcript TEXT, updated_at TEXT)` — our job presentation/state; next-fire time comes from APScheduler.
@@ -76,7 +76,7 @@ APScheduler's `apscheduler_jobs` table (SQLAlchemyJobStore, same file, its own
 sync connection). Job args are plain strings (schedule_id, prompt) — pickled by
 the store, which makes `state.db` trusted-local-only (already the bot's model).
 
-Schema migrations: `PRAGMA user_version` + ordered DDL steps in db.py.
+Schema migrations: `PRAGMA user_version` + ordered DDL steps in db.py; version 2 adds the album ID column/index.
 
 Indexes:
 
@@ -95,9 +95,12 @@ Accept anything the owner sends. Kinds: `document`, `photo`, `video`, `audio`
 the turn prompt. Forwarded messages record `forward_origin` in the synthesized
 prompt ("Owner forwarded a photo from …"). Albums: messages sharing a
 `media_group_id` are merged into a single queue entry — all files saved, one
-turn ("Owner sent 3 photos…"). The handler buffers briefly (Telegram delivers
-album items as separate updates seconds apart) before enqueueing the merged
-entry. Anything genuinely unhandleable gets an explicit reply, never silence.
+turn ("Owner sent 3 photos…"). The first item is durably stored in a
+`collecting` queue row immediately; later items extend that row during a 2.5 s
+quiet window. That row blocks later FIFO work, preserving arrival order even
+when text arrives between album items. A restart resumes the partial album
+from the items already stored. Anything genuinely unhandleable gets an
+explicit reply, never silence.
 
 ## Agent tools
 
@@ -132,8 +135,9 @@ Rewritten:
   Telegram re-sends unconfirmed updates. A monotonic `last_message_id` guard
   in `kv` prevents duplicate queue entries.
 - Interruptions on restart: `queue` rows stuck in `active` → reported as
-  interrupted, never replayed. `jobs_meta` rows stuck `running` → reported as
-  interrupted one-shots; recurring schedules fire again at the next interval.
+  interrupted, never replayed; `collecting` album rows resume with the already
+  received items. `jobs_meta` rows stuck `running` → reported as interrupted;
+  recurring schedules fire again at the next interval.
 - APScheduler policy: `misfire_grace_time=60s`, `coalesce=True`,
   `max_instances=1` per schedule.
 - Job task fn is a module-level coroutine (APScheduler resolves it by import);
