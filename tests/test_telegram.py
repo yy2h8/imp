@@ -58,6 +58,8 @@ class FakeClient:
         return await self._record("get_file", **kwargs)
 
     async def download(self, file, destination=None, **kwargs):
+        if not isinstance(file, str) and not hasattr(file, "file_id"):
+            raise TypeError("file can only be the string or Downloadable type")
         return await self._record("download", file=file, destination=destination)
 
     async def download_file(self, file_path, destination=None, **kwargs):
@@ -155,10 +157,17 @@ async def test_send_document_truncates_caption():
 
 async def test_download_enforces_byte_limit():
     client = FakeClient()
-    client.script("get_file", {"file_id": "f1", "file_path": "docs/f1.txt"})
     client.script("download", io.BytesIO(b"x" * 100))
     with pytest.raises(TelegramError, match="limit"):
         await bot(client, max_bytes=16).download("f1")
+
+
+async def test_download_passes_file_id_to_aiogram():
+    client = FakeClient()
+    client.script("download", io.BytesIO(b"file contents"))
+    assert await bot(client).download("f1") == b"file contents"
+    assert kinds(client, "get_file") == []
+    assert kinds(client, "download")[0]["file"] == "f1"
 
 
 async def test_send_text_routes_text_and_files():

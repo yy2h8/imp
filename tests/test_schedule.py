@@ -123,6 +123,21 @@ class TestScheduleJob:
         assert not two_given.ok and "exactly one" in two_given.content
         assert scheduler.jobs == {}
 
+    async def test_ignores_empty_optional_schedule_placeholders(self, tmp_path):
+        scheduler, conn = FakeScheduler(), await make_db(tmp_path)
+        result = await make_tool(tmp_path, scheduler, conn).execute(
+            prompt="digest",
+            at="2026-09-24T08:00:00+00:00",
+            at_local="",
+            every=0,
+            cron="",
+            id="digest",
+        )
+        assert result.ok
+        assert list(scheduler.jobs) == ["digest"]
+        (_, trigger, _, _) = scheduler.jobs["digest"]
+        assert isinstance(trigger, DateTrigger)
+
     async def test_invalid_cron_is_tool_error(self, tmp_path):
         scheduler, conn = FakeScheduler(), await make_db(tmp_path)
         result = await make_tool(tmp_path, scheduler, conn).execute(

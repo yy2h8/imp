@@ -217,10 +217,9 @@ class TelegramBot:
     async def download(self, file_id: str) -> bytes:
         """Resolve and fetch raw bytes for one attachment, enforcing the
         configured byte cap (bounded by Telegram's 20 MB platform limit)."""
-        entry = await self.get_file(file_id)
         data = await self._call(
             "download",
-            self.client.download(file=entry),
+            self.client.download(file=file_id),
         )
         payload = data.getvalue() if hasattr(data, "getvalue") else data.read()
         if len(payload) > self.max_bytes:

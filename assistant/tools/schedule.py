@@ -23,6 +23,7 @@ _ID_RE = re.compile(r"[a-z0-9-]{1,64}")
 
 SCHEDULE_HINT = (
     "Exactly one of at / at_local / every / cron is required. "
+    "Omit unused fields; do not send empty strings or 0 as placeholders. "
     "at: ISO-8601 with UTC offset (2026-09-24T08:00:00+06:00). "
     "at_local: naive wall time 'YYYY-MM-DD HH:MM' in the owner's timezone. "
     "every: recurring interval in seconds. "
@@ -123,8 +124,10 @@ class ScheduleJob(Tool):
             for name, value in (
                 ("at", at), ("at_local", at_local), ("every", every), ("cron", cron)
             )
-            if value is not None
+            if value is not None and value != ""
         ]
+        if len(given) > 1 and every == 0:
+            given.remove("every")
         if len(given) != 1:
             return ToolResult(
                 ok=False,
