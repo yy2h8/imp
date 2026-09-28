@@ -311,7 +311,9 @@ class AssistantController:
                     async with self._busy_scope():
                         if kind == "attachment":
                             prompt = await self.app.uploads.handle(
-                                payload.get("attachments", []), payload.get("caption", "")
+                                payload.get("attachments", []),
+                                payload.get("caption", ""),
+                                payload.get("reply_context", ""),
                             )
                         else:
                             prompt = payload.get("text", "")

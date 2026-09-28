@@ -72,10 +72,23 @@ def normalize_attachment(message: dict) -> dict | None:
         "file_name": str(item.get("file_name") or ""),
         "mime_type": str(item.get("mime_type") or ""),
         "caption": str(message.get("caption") or ""),
+        "reply_context": _reply_context(message),
         "message_id": message.get("message_id"),
         "media_group_id": message.get("media_group_id"),
         "forward_origin": _forward_source(message.get("forward_origin")),
     }
+
+
+def _reply_context(message: dict) -> str:
+    """Small quoted context only; do not serialize the nested Telegram update."""
+    replied = message.get("reply_to_message")
+    if not isinstance(replied, dict):
+        return ""
+    original = str(replied.get("text") or replied.get("caption") or "").strip()
+    if original:
+        return original
+    kind = next((name.replace("_", " ") for name in _FILE_KINDS if replied.get(name)), None)
+    return f"[replied to a {kind} message]" if kind else "[replied to a message]"
 
 
 def _command(text: str) -> str:
@@ -119,6 +132,12 @@ def route_message(
         command = _command(text)
         if question_pending and command not in {"/new", "/status"}:
             return Routed(answer=text)
+        quoted = _reply_context(message)
+        if quoted and command not in {"/new", "/status"}:
+            text = (
+                "Owner replied to this message:\n"
+                f"{quoted}\n\nOwner's reply:\n{text}"
+            )
         return Routed(command=command if command in {"/new", "/status"} else None, text=text)
     attachment = normalize_attachment(message)
     if attachment is not None:
@@ -222,7 +241,11 @@ class Intake:
         attachment = normalize_attachment(message)
         text = str(message.get("text") or "").strip()
         if attachment is not None:
-            payload = {"attachments": [attachment], "caption": attachment["caption"]}
+            payload = {
+                "attachments": [attachment],
+                "caption": attachment["caption"],
+                "reply_context": attachment["reply_context"],
+            }
             kind = "attachment"
         else:
             text = text or _structured_text(message) or ""
@@ -358,6 +381,7 @@ def _album_item_sync(
             payload = {
                 "attachments": [attachment],
                 "caption": attachment.get("caption", ""),
+                "reply_context": attachment.get("reply_context", ""),
                 "message_ids": [message_id],
             }
             conn.execute(
@@ -379,6 +403,8 @@ def _album_item_sync(
             payload["message_ids"].append(message_id)
             if not payload["caption"] and attachment.get("caption"):
                 payload["caption"] = attachment["caption"]
+            if not payload.get("reply_context") and attachment.get("reply_context"):
+                payload["reply_context"] = attachment["reply_context"]
             conn.execute(
                 "UPDATE queue SET payload = ?, state = 'collecting' WHERE id = ?",
                 (json.dumps(payload, ensure_ascii=False), row_id),

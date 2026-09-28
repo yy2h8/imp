@@ -94,6 +94,17 @@ async def test_forward_origin_is_in_prompt(tmp_path):
     assert "forwarded" in prompt and "a channel" in prompt
 
 
+async def test_reply_context_is_in_attachment_prompt(tmp_path):
+    uploads, _ = make_uploads(tmp_path)
+    prompt = await uploads.handle(
+        [attachment("document", file_name="notes.txt")],
+        caption="please check",
+        reply_context="Does this file answer the question?",
+    )
+    assert "Does this file answer the question?" in prompt
+    assert "please check" in prompt
+
+
 async def test_album_saves_all_files_in_one_prompt(tmp_path):
     uploads, _ = make_uploads(tmp_path)
     prompt = await uploads.handle(

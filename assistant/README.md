@@ -38,6 +38,9 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
   run one at a time. Busy requests receive `Принято — в очереди …`. A request
   interrupted during execution is reported after restart and never replayed;
   waiting requests resume in order.
+- **Telegram replies.** Replying to a prior message adds that message's text or
+  caption as context to the new request. Replying while `ask` is pending answers
+  that question directly.
 - **Turn costs.** Each turn's API-reported tokens, USD cost, tool count,
   duration, and outcome are recorded in the database. `/status` continues to
   show context estimate and the transcript ID.
@@ -70,50 +73,74 @@ To back up state, stop the bot and copy `state.db`.
 
 `assistant/` lives inside the imp repository and reuses its dependencies.
 
-```bash
-export TELEGRAM_BOT_TOKEN=...
-export IMP_TG_ALLOWED_USER_IDS=123456789
-export OPENAI_API_KEY=sk-or-...       # an OpenRouter key
-export IMP_TZ=Asia/Almaty             # default; used by at_local and cron
-export BRAVE_API_KEY=...              # optional: enables web_search
-uv sync
-uv run python -m assistant
-python -m assistant whoami            # run while the bot is stopped
-```
+The assistant pins the OpenRouter base URL to `https://openrouter.ai/api/v1`;
+the default model is `openai/gpt-5-mini`, overridden by `OPENAI_MODEL`. See
+`.env.example` for every variable. Important settings are:
 
-See `.env.example` for every variable. The assistant pins the OpenRouter base
-URL to `https://openrouter.ai/api/v1`; the default model is
-`openai/gpt-5-mini`, overridden by `OPENAI_MODEL`. `IMP_HOME` is the file-tool
-confinement root; shell commands run with the service account's permissions.
-Set `IMP_MAX_CONCURRENT_JOBS` to change the job concurrency cap (default `2`).
+- `TELEGRAM_BOT_TOKEN` and `IMP_TG_ALLOWED_USER_IDS` (one owner ID).
+- `OPENAI_API_KEY` (an OpenRouter key).
+- `IMP_TZ` (timezone for `at_local` and cron; default `Asia/Almaty`).
+- `IMP_MAX_CONCURRENT_JOBS` (background job cap; default `2`).
+- `IMP_HOME` (state and file-tool root; shell commands retain service-account
+  access).
 
-## Deployment
+## Configure and run with Docker
 
-Supported target: glibc Linux, including ARM64 SBCs. The first deployment
-target is Armbian on ARM64. BusyBox/musl deployment is not supported.
-
-**Docker:**
+From the repository root:
 
 ```bash
-cp assistant/.env.example assistant/deploy/assistant.env  # fill in values
+cp assistant/.env.example assistant/deploy/assistant.env
+# Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY in assistant/deploy/assistant.env.
 docker build --target assistant -t imp-assistant .
+docker compose -f assistant/deploy/compose.yaml run --rm assistant whoami
+# Copy the printed owner ID into IMP_TG_ALLOWED_USER_IDS in assistant.env.
 docker compose -f assistant/deploy/compose.yaml up -d
+docker compose -f assistant/deploy/compose.yaml logs -f assistant
 ```
 
-Docker keeps assistant files and `state.db` in the `/data` volume. The shell
-and file tools operate inside the container and mounted volumes.
+Docker sets `IMP_HOME=/data`; `state.db`, the manual, transcripts, and inbox/
+workspace data persist in the named `assistant-data` volume. `whoami` uses
+Telegram's `getUpdates` endpoint, so never run it alongside the bot. To run it
+again after deployment, stop the service first:
 
-**Bare-metal systemd:** use `assistant/deploy/assistant.service`, create a
-dedicated service account and writable home, place variables in
-`/etc/assistant.env`, then enable the service. For example:
+```bash
+docker compose -f assistant/deploy/compose.yaml stop assistant
+docker compose -f assistant/deploy/compose.yaml run --rm assistant whoami
+```
+
+## Configure and run on a dedicated Linux machine
+
+Supported hosts are glibc Linux on Python 3.12 or newer, including ARM64 SBCs
+(the first target is Armbian). From a checkout at `/opt/imp`:
+
+```bash
+python3.12 -m venv /opt/imp-venv
+/opt/imp-venv/bin/pip install /opt/imp
+```
+
+Create a dedicated service user and writable assistant home, then configure
+the systemd environment file. First set the Telegram token and OpenRouter key,
+then run `whoami` to discover the owner ID before enabling the service:
 
 ```bash
 useradd --system --create-home --home-dir /var/lib/assistant assistant
 install -d -o assistant -g assistant /var/lib/assistant/assistant
-# Set IMP_HOME=/var/lib/assistant/assistant in /etc/assistant.env.
-cp assistant/deploy/assistant.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now assistant
+cp /opt/imp/assistant/.env.example /etc/assistant.env
+# Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY; set IMP_HOME below.
+TELEGRAM_BOT_TOKEN=... /opt/imp-venv/bin/python -m assistant whoami
+# Put the printed ID in IMP_TG_ALLOWED_USER_IDS and set IMP_HOME.
+chown root:assistant /etc/assistant.env
+chmod 640 /etc/assistant.env
+cp /opt/imp/assistant/deploy/assistant.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now assistant
 ```
+The service starts at boot and restarts on failure. Follow logs with
+`journalctl -u assistant -f`. Set `IMP_HOME` to a directory writable by the
+service user; it holds `state.db` and is the file-tool root. To run `whoami`
+again, stop the service first.
+
+## Security
 
 **Execution boundary:** shell commands are approved automatically and inherit
 the service account's filesystem, network, and environment access, including

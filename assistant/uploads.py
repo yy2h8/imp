@@ -49,7 +49,12 @@ class Uploads:
         self.chat_id = chat_id
         self.inbox.mkdir(parents=True, exist_ok=True)
 
-    async def handle(self, attachments: list[dict], caption: str = "") -> str | None:
+    async def handle(
+        self,
+        attachments: list[dict],
+        caption: str = "",
+        reply_context: str = "",
+    ) -> str | None:
         """Save every attachment; captions and available audio transcripts
         become one prompt. Uncaptioned non-audio files are saved and acked."""
         saved: list[tuple[dict, Path]] = []
@@ -97,6 +102,8 @@ class Uploads:
         )
         source = f" forwarded from {', '.join(forwards)}" if forwards else ""
         parts = [f"Owner sent{source} file(s) saved to {details}."]
+        if reply_context:
+            parts.append(f"The owner is replying to: {reply_context}")
         if caption:
             parts.append(f"Note: {caption}")
         if transcripts:

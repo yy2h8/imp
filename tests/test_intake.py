@@ -65,6 +65,33 @@ def test_route_owner_private_text_question_command_and_other_sender():
     assert route_message(group, owner_id=7, question_pending=False, busy=False).ignore
 
 
+def test_reply_to_bot_message_carries_original_text_into_prompt():
+    routed = route_message(
+        message(
+            text="use the second option",
+            reply_to_message={"from": {"id": 999}, "text": "Which database should I use?"},
+        ),
+        owner_id=7,
+        question_pending=False,
+        busy=False,
+    )
+    assert "Which database should I use?" in routed.text
+    assert "use the second option" in routed.text
+
+
+def test_pending_ask_reply_stays_plain_answer():
+    routed = route_message(
+        message(
+            text="yes",
+            reply_to_message={"from": {"id": 999}, "text": "Should I continue?"},
+        ),
+        owner_id=7,
+        question_pending=True,
+        busy=True,
+    )
+    assert routed.answer == "yes"
+
+
 def test_route_structured_owner_message_instead_of_silently_ignoring():
     routed = route_message(
         message(location={"latitude": 51.5, "longitude": -0.1}),
@@ -93,6 +120,20 @@ async def test_redelivered_update_not_duplicated(db, tmp_path):
     await intake.accept(incoming)
     await intake.accept(incoming)
     assert await queue_count_waiting(db) == 1
+
+
+async def test_queued_attachment_keeps_reply_context(db, tmp_path):
+    intake = Intake(db, FakeBot(), chat_id=7, db_path=tmp_path / STATE_DB_NAME)
+    await intake.accept(
+        message(
+            document={"file_id": "doc", "file_name": "report.pdf"},
+            caption="check this",
+            reply_to_message={"text": "What did the report say?"},
+        )
+    )
+    rows = await db.execute_fetchall("SELECT payload FROM queue")
+    payload = json.loads(rows[0][0])
+    assert payload["reply_context"] == "What did the report say?"
 
 
 async def test_album_merge_interleaved_with_text(db, tmp_path):
