@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import sys
-
-from imp.agent.context import Context
-from imp.entities import AssistantMessage, TextMessage, ToolMessage
 
 from assistant.db import STATE_DB_NAME, open_db, transcript_search
 from assistant.transcripts import DbSessionWriter
+from imp.agent.context import Context
+from imp.entities import TextMessage, ToolMessage
 
 
 async def test_writer_records_context_messages_in_order(config, tmp_path):
@@ -21,7 +19,9 @@ async def test_writer_records_context_messages_in_order(config, tmp_path):
     try:
         context = Context(config=config, system_prompt="sys", writer=writer)
         context.append(TextMessage(role="user", content="find the armbian box"))
-        context.append(AssistantMessage(content="on it"))
+        context.append(
+            TextMessage(role="assistant", content="on it")
+        )  # any ConversationMessage takes a row; AssistantMessage needs an SDK item
         context.append(ToolMessage(call_id="1", content="result"))
     finally:
         writer.__exit__(None, None, None)
