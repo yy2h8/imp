@@ -52,7 +52,7 @@ def host_summary(home: Path) -> str:
     disk_pct = disk.used / disk.total * 100
     return (
         f"load {load1:.2f} · RAM {total - available:.1f}/{total:.1f} ГБ "
-        f"({ram_pct:.0f}%) · диск: свободно {disk_free:.0f} ГБ ({disk_pct:.0f}%)"
+        f"({ram_pct:.0f}%) · диск: свободно {disk_free:.0f} ГБ (занято {disk_pct:.0f}%)"
     )
 
 
@@ -77,7 +77,7 @@ async def _jobs_lines(
             _LOG.warning("job labels unavailable", exc_info=True)
     lines = []
     for entry in pending[:JOBS_SHOWN]:
-        label = labels.get(entry.id, entry.id)
+        label = " ".join(labels.get(entry.id, entry.id).split())
         if len(label) > LABEL_LIMIT:
             label = label[:LABEL_LIMIT] + "…"
         local = entry.next_run_time.astimezone(tz)

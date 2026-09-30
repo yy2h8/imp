@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -148,6 +149,29 @@ async def test_jobs_lines_skips_paused_truncates_and_falls_back_to_id(tmp_path):
         assert "д" * 40 + "…" in lines[1]
     finally:
         await db.close()
+
+
+async def test_jobs_lines_collapses_multiline_labels(tmp_path):
+    db = await open_db(tmp_path / "state.db")
+    try:
+        await jobs_meta_upsert(
+            db,
+            schedule_id="multi",
+            label="строка один\nстрока   два",
+            prompt="p",
+            tz="UTC",
+            state="scheduled",
+        )
+        lines = await _jobs_lines(FakeScheduler([job("multi", BASE)]), db, TZ)
+        local = BASE.astimezone(TZ)
+        assert lines == [f"• строка один строка два — {local:%d.%m %H:%M}"]
+    finally:
+        await db.close()
+
+
+def test_host_summary_labels_disk_percentage_as_used(tmp_path):
+    line = host_summary(tmp_path)
+    assert re.search(r"диск: свободно \d+ ГБ \(занято \d+%\)", line)
 
 
 async def test_jobs_lines_without_scheduler_is_unavailable():
