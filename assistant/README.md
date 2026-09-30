@@ -42,10 +42,15 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
   caption as context to the new request. Replying while `ask` is pending answers
   that question directly.
 - **Turn costs.** Each turn's API-reported tokens, USD cost, tool count,
-  duration, and outcome are recorded in the database. `/status` continues to
-  show context estimate and the transcript ID.
+  duration, and outcome are recorded in the database.
 - **Commands.** `/new` starts a fresh conversation (the transcript remains in
-  the database); `/status` reports context use and transcript ID.
+  the database); `/status` shows a short summary: local time in `IMP_TZ`, the
+  three nearest scheduled jobs, the context-usage estimate (marked `~ …
+  (оценка)`), host load/RAM/disk, and the OpenRouter balance in USD (wallet
+  via a management key, else the key's remaining limit). A failed source is
+  shown as «недоступен» without hiding the rest. Startup sends the same
+  summary in place of `pong`; a failed startup notification never blocks
+  polling.
 
 ## State and files
 
