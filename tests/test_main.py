@@ -92,22 +92,46 @@ def install_bot(monkeypatch, tmp_path, send_error=None):
     return events
 
 
-async def test_run_bot_sends_pong_after_startup_and_before_polling(
+async def test_run_bot_sends_status_summary_after_startup_and_before_polling(
     monkeypatch, tmp_path
 ):
     events = install_bot(monkeypatch, tmp_path)
 
+    async def summary(_app):
+        return "*Статус* сводка"
+
+    monkeypatch.setattr("assistant.main.collect_status", summary)
     await run_bot()
 
-    assert events.index("controller-start") < events.index(("send", 42, "pong"))
-    assert events.index(("send", 42, "pong")) < events.index("polling-start")
+    sent = ("send", 42, "*Статус* сводка")
+    assert events.index("controller-start") < events.index(sent)
+    assert events.index(sent) < events.index("polling-start")
 
 
-async def test_run_bot_continues_polling_if_startup_pong_fails(
+async def test_run_bot_continues_polling_if_startup_status_fails(
     monkeypatch, tmp_path, caplog
 ):
     events = install_bot(monkeypatch, tmp_path, TelegramError("unavailable"))
 
+    async def summary(_app):
+        return "*Статус* сводка"
+
+    monkeypatch.setattr("assistant.main.collect_status", summary)
+    await run_bot()
+
+    assert "polling-start" in events
+    assert "startup notification failed" in caplog.text
+
+
+async def test_run_bot_continues_polling_if_collect_status_raises(
+    monkeypatch, tmp_path, caplog
+):
+    events = install_bot(monkeypatch, tmp_path)
+
+    async def broken(_app):
+        raise RuntimeError("collector broken")
+
+    monkeypatch.setattr("assistant.main.collect_status", broken)
     await run_bot()
 
     assert "polling-start" in events

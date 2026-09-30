@@ -37,6 +37,7 @@ from .db import (
 )
 from .intake import AlbumBuffer, Intake, route_message
 from .scheduler import set_context, startup_recovery
+from .status import collect_status
 
 _LOG = logging.getLogger(__name__)
 TYPING_INTERVAL_S = 4.0
@@ -75,7 +76,7 @@ class TurnRunner:
 
     async def run(self, prompt: str) -> None:
         async with self._turn_scope():
-            command = await asyncio.to_thread(self._command_reply, prompt)
+            command = await self._command(prompt)
             if command is not None:
                 await send_text(self.bot, self.app.chat_id, command)
                 return
@@ -86,6 +87,11 @@ class TurnRunner:
                 await send_text(self.bot, self.app.chat_id, notice)
             await self._agent_turn(prompt)
 
+    async def _command(self, prompt: str) -> str | None:
+        if command_token(prompt) == "/status":
+            return await collect_status(self.app)
+        return await asyncio.to_thread(self._command_reply, prompt)
+
     def _command_reply(self, prompt: str) -> str | None:
         lowered = command_token(prompt)
         if lowered == "/new":
@@ -94,14 +100,6 @@ class TurnRunner:
             return (
                 "Started a fresh session. Previous transcript is saved. "
                 f"New transcript: `{name}`"
-            )
-        if lowered == "/status":
-            used, maximum = self.app.usage
-            name = self.app.session.writer.name
-            _LOG.info("command /status: %d/%d estimated tokens", used, maximum)
-            return (
-                f"*status:* {used}/{maximum} estimated tokens ({used / maximum:.0%}) · "
-                f"transcript `{name}`"
             )
         return None
 
@@ -386,8 +384,8 @@ async def run_bot() -> None:
         await controller.start()
         try:
             try:
-                await send_text(app.bot, chat_id, "pong")
-            except TelegramError as exc:
+                await send_text(app.bot, chat_id, await collect_status(app))
+            except Exception as exc:
                 _LOG.warning("startup notification failed: %s", exc)
             await dispatcher.start_polling(
                 app.bot.client,

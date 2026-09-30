@@ -193,7 +193,8 @@ async def test_command_status_and_new_are_direct_not_model_turns(app):
     controller = AssistantController(app)
     await controller.handle_message(owner_message("/status", message_id=21))
     await controller.wait_idle()
-    assert "*status:*" in app.bot.sent[-1]
+    assert "Контекст" in app.bot.sent[-1]
+    assert "(оценка)" in app.bot.sent[-1]
     previous = app.session.writer.name
     await controller.handle_message(owner_message("/new", message_id=22))
     await controller.wait_idle()
