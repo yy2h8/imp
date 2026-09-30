@@ -77,6 +77,7 @@ async def test_build_assistant_pins_openrouter_and_wires_stt(tmp_path, monkeypat
         assert app.uploads.stt.model == "openai/whisper-large-v3-turbo"
         assert (tmp_path / "inbox").is_dir()
         assert app.db is not None and app.outbox is not None and app.scheduler is not None
+        assert app.http is not None
         assert not hasattr(app, "execution_lock")
         assert "schedule_job" in app.agent.tools
         assert "unschedule_job" in app.agent.tools

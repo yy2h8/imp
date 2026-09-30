@@ -7,6 +7,7 @@ Each section is gathered independently; a failing source degrades to
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -16,12 +17,14 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
+from .config import OPENROUTER_BASE_URL
 from .db import jobs_meta_list
 
 _LOG = logging.getLogger(__name__)
 
 UNAVAILABLE = "недоступен"
 NO_JOBS = "нет активных заданий"
+BALANCE_TIMEOUT_S = 10.0
 LABEL_LIMIT = 40
 JOBS_SHOWN = 3
 _KIB = 1024 * 1024  # /proc/meminfo kB → GiB
@@ -136,5 +139,29 @@ async def _collect(app, now: datetime | None) -> str:
     return "\n".join(lines)
 
 
+async def openrouter_balance(http, api_key: str, timeout: float = BALANCE_TIMEOUT_S) -> float | None:
+    """Wallet balance in USD: /credits (management key), falling back to the
+    inference key's remaining limit. None when undeterminable."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        raw = await asyncio.wait_for(
+            http.get(f"{OPENROUTER_BASE_URL}/credits", headers=headers), timeout
+        )
+        data = json.loads(raw)["data"]
+        return float(data["total_credits"]) - float(data["total_usage"])
+    except Exception as exc:
+        _LOG.warning("openrouter credits unavailable: %s", type(exc).__name__)
+    try:
+        raw = await asyncio.wait_for(
+            http.get(f"{OPENROUTER_BASE_URL}/key", headers=headers), timeout
+        )
+        remaining = json.loads(raw)["data"]["limit_remaining"]
+        return None if remaining is None else float(remaining)
+    except Exception as exc:
+        _LOG.warning("openrouter key fallback unavailable: %s", type(exc).__name__)
+        return None
+
+
 async def _balance_line(http, app) -> str:
-    raise NotImplementedError  # Task 2: OpenRouter balance
+    balance = await openrouter_balance(http, app.config.api_key)
+    return UNAVAILABLE if balance is None else f"${balance:.2f}"

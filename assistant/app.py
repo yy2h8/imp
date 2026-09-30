@@ -118,6 +118,7 @@ class AssistantApp:
     db: aiosqlite.Connection | None = None
     outbox: Outbox | None = None
     scheduler: AsyncIOScheduler | None = None
+    http: HttpClient | None = None
     jobs_semaphore: asyncio.Semaphore = field(
         default_factory=lambda: asyncio.Semaphore(2)
     )
@@ -272,6 +273,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                     db=db,
                     outbox=outbox,
                     scheduler=scheduler,
+                    http=http,
                     jobs_semaphore=jobs_semaphore,
                     turn_state=turn_state,
                 )

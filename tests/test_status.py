@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from assistant.config import OPENROUTER_BASE_URL
 from assistant.db import jobs_meta_upsert, open_db
 from assistant.status import (
     NO_JOBS,
@@ -14,10 +16,31 @@ from assistant.status import (
     collect_status,
     format_tokens,
     host_summary,
+    openrouter_balance,
 )
 
 TZ = ZoneInfo("Asia/Almaty")
 BASE = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+CREDITS_URL = f"{OPENROUTER_BASE_URL}/credits"
+KEY_URL = f"{OPENROUTER_BASE_URL}/key"
+
+
+class FakeHttp:
+    """Maps URLs to response bodies; Exception values raise on get."""
+
+    def __init__(self, responses=None, delay=0.0):
+        self.responses = responses or {}
+        self.delay = delay
+        self.requests: list[tuple[str, dict | None]] = []
+
+    async def get(self, url, *, params=None, headers=None, follow_redirects=False):
+        self.requests.append((url, headers))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        out = self.responses[url]
+        if isinstance(out, Exception):
+            raise out
+        return out
 
 
 def fake_app(tmp_path, **overrides):
@@ -139,3 +162,67 @@ async def test_jobs_lines_without_db_shows_ids():
     lines = await _jobs_lines(FakeScheduler([job("job-0", BASE)]), None, TZ)
     local = BASE.astimezone(TZ)
     assert lines == [f"• job-0 — {local:%d.%m %H:%M}"]
+
+
+async def test_balance_from_credits_wallet():
+    http = FakeHttp(
+        {CREDITS_URL: '{"data": {"total_credits": 100.5, "total_usage": 25.75}}'}
+    )
+    assert await openrouter_balance(http, "sk-x") == 74.75
+    assert [url for url, _ in http.requests] == [CREDITS_URL]
+    assert http.requests[0][1]["Authorization"] == "Bearer sk-x"
+
+
+async def test_balance_falls_back_to_key_when_credits_forbidden():
+    http = FakeHttp(
+        {
+            CREDITS_URL: RuntimeError("403"),
+            KEY_URL: '{"data": {"limit_remaining": 74.5}}',
+        }
+    )
+    assert await openrouter_balance(http, "sk-x") == 74.5
+
+
+async def test_balance_none_when_both_sources_fail():
+    http = FakeHttp({CREDITS_URL: RuntimeError("x"), KEY_URL: RuntimeError("y")})
+    assert await openrouter_balance(http, "sk-x") is None
+
+
+async def test_balance_none_when_key_has_no_limit():
+    http = FakeHttp(
+        {
+            CREDITS_URL: RuntimeError("x"),
+            KEY_URL: '{"data": {"limit_remaining": null}}',
+        }
+    )
+    assert await openrouter_balance(http, "sk-x") is None
+
+
+async def test_balance_times_out():
+    http = FakeHttp({}, delay=0.2)
+    assert await openrouter_balance(http, "sk-x", timeout=0.05) is None
+
+
+async def test_collect_status_includes_balance_in_dollars(tmp_path):
+    http = FakeHttp(
+        {CREDITS_URL: '{"data": {"total_credits": 100.5, "total_usage": 25.75}}'}
+    )
+    summary = await collect_status(fake_app(tmp_path, http=http))
+    assert "💳 OpenRouter: $74.75" in summary
+
+
+async def test_collect_status_balance_unavailable_when_undetermined(tmp_path):
+    http = FakeHttp(
+        {
+            CREDITS_URL: RuntimeError("x"),
+            KEY_URL: '{"data": {"limit_remaining": null}}',
+        }
+    )
+    summary = await collect_status(fake_app(tmp_path, http=http))
+    assert f"💳 OpenRouter: {UNAVAILABLE}" in summary
+
+
+async def test_collect_status_never_leaks_the_api_key(tmp_path):
+    http = FakeHttp({CREDITS_URL: RuntimeError("boom sk-test-secret")})
+    summary = await collect_status(fake_app(tmp_path, http=http))
+    assert "sk-test-secret" not in summary
