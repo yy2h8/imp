@@ -1,21 +1,20 @@
-"""TelegramBot over aiogram: entity-based sends with plain-text fallbacks.
-
-The client is injectable (`client=None` builds a real aiogram Bot) so tests
-drive a fake exposing the aiogram method surface.
-"""
+"""Telegram transport: entity rendering, SDK conversion and bounded transfers."""
 
 from __future__ import annotations
 
 import io
+from types import SimpleNamespace
 
+import httpx2
 import pytest
-from aiogram.exceptions import TelegramBadRequest
+from telegram import Update
+from telegram.error import BadRequest
 
 from assistant.adapters.telegram import TelegramBot, TelegramError
 
 
 class FakeClient:
-    """Records aiogram-style calls; scriptable per-method results/errors."""
+    """Records Bot API calls; scriptable per-method results/errors."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -57,24 +56,14 @@ class FakeClient:
     async def get_file(self, **kwargs):
         return await self._record("get_file", **kwargs)
 
-    async def download(self, file, destination=None, **kwargs):
-        if not isinstance(file, str) and not hasattr(file, "file_id"):
-            raise TypeError("file can only be the string or Downloadable type")
-        return await self._record("download", file=file, destination=destination)
-
-    async def download_file(self, file_path, destination=None, **kwargs):
-        return await self._record(
-            "download_file", file_path=file_path, destination=destination
-        )
-
 
 class Msg:
     def __init__(self, message_id: int) -> None:
         self.message_id = message_id
 
 
-def bad_request(message: str = "can't parse entities") -> TelegramBadRequest:
-    return TelegramBadRequest(method="sendMessage", message=message)
+def bad_request(message: str = "can't parse entities") -> BadRequest:
+    return BadRequest(message)
 
 
 def bot(client: FakeClient, max_bytes: int = 10_000_000) -> TelegramBot:
@@ -133,15 +122,9 @@ async def test_send_chat_action_swallows_errors():
 
 
 async def test_get_me_and_get_updates_return_dicts():
-    from types import SimpleNamespace
-
-    class UpdateObj(SimpleNamespace):
-        def model_dump(self, **_):
-            return self.__dict__.copy()
-
     client = FakeClient()
     client.script("get_me", {"id": 42, "username": "my_bot"})
-    client.script("get_updates", [UpdateObj(update_id=41)])
+    client.script("get_updates", (Update(update_id=41),))
     assert await bot(client).get_me() == {"id": 42, "username": "my_bot"}
     assert await bot(client).get_updates(40) == [{"update_id": 41}]
 
@@ -155,19 +138,44 @@ async def test_send_document_truncates_caption():
     assert kwargs["document"].filename == "f.txt"
 
 
-async def test_download_enforces_byte_limit():
+async def test_download_streams_and_stops_at_limit():
     client = FakeClient()
-    client.script("download", io.BytesIO(b"x" * 100))
-    with pytest.raises(TelegramError, match="limit"):
-        await bot(client, max_bytes=16).download("f1")
+    client.script("get_file", {"file_path": "https://api.telegram.org/file/botTESTTOKEN/f"})
+    chunks_read = []
+
+    class Stream(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            for chunk in (b"first", b"overflow", b"never"):
+                chunks_read.append(chunk)
+                yield chunk
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(
+        lambda request: httpx2.Response(200, stream=Stream())
+    )) as http:
+        transport = bot(client, max_bytes=8)
+        transport.http = SimpleNamespace(client=http)
+        received = []
+        with pytest.raises(TelegramError, match="limit"):
+            async for chunk in transport.download("f1"):
+                received.append(chunk)
+    assert received == [b"first"]
+    assert chunks_read == [b"first", b"overflow"]
+    assert kinds(client, "get_file")[0]["file_id"] == "f1"
 
 
-async def test_download_passes_file_id_to_aiogram():
+async def test_send_document_does_not_read_file_into_memory():
+    class Stream(io.BytesIO):
+        def read(self, size=-1):
+            assert size >= 0, "file must not be eagerly read"
+            return super().read(size)
+
     client = FakeClient()
-    client.script("download", io.BytesIO(b"file contents"))
-    assert await bot(client).download("f1") == b"file contents"
-    assert kinds(client, "get_file") == []
-    assert kinds(client, "download")[0]["file"] == "f1"
+    client.script("send_document", Msg(3))
+    with Stream(b"contents") as stream:
+        assert await bot(client).send_document(1, stream, "f.txt") == 3
+        document = kinds(client, "send_document")[0]["document"]
+        assert document.input_file_content is stream
+        assert not stream.closed
 
 
 async def test_send_text_routes_text_and_files():
@@ -192,3 +200,88 @@ async def test_whoami_style_polling_works():
     (kwargs,) = kinds(client, "get_updates")
     assert kwargs["offset"] == 7
     assert kwargs["timeout"] >= 25
+
+
+async def test_real_sdk_serialization_streaming_and_lifecycle():
+    import json
+    from urllib.parse import parse_qs
+
+    import httpx
+    from telegram import Bot
+    from telegram.request import HTTPXRequest
+
+    reads, requests = [], []
+
+    class Stream(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 65536
+            reads.append(size)
+            return super().read(size)
+
+    message = {
+        "message_id": 7, "date": 1,
+        "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+        "chat": {"id": 42, "type": "private"},
+        "photo": [{"file_id": "f", "file_unique_id": "u", "width": 1, "height": 1}],
+        "reply_to_message": {"message_id": 6, "date": 1,
+                             "chat": {"id": 42, "type": "private"}, "text": "earlier"},
+        "forward_origin": {"type": "hidden_user", "date": 1, "sender_user_name": "Source"},
+    }
+
+    def respond(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        requests.append((method, request.content))
+        results = {
+            "getMe": {"id": 1, "is_bot": True, "first_name": "Test"},
+            "getUpdates": [{"update_id": 10, "message": message}],
+            "getFile": {"file_id": "f", "file_unique_id": "u", "file_path": "photos/f.jpg"},
+            "sendMessage": message,
+            "sendDocument": message,
+        }
+        return httpx.Response(200, json={"ok": True, "result": results[method]})
+
+    request = HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(respond)})
+    client = Bot("123456:TEST-TOKEN", request=request, get_updates_request=request)
+    transport = TelegramBot("123456:TEST-TOKEN", client=client)
+    try:
+        await transport.initialize()
+        updates = await transport.get_updates(10)
+        data = updates[0]["message"]
+        assert data["from"]["id"] == 42
+        assert data["photo"][0]["file_id"] == "f"
+        assert data["reply_to_message"]["text"] == "earlier"
+        assert data["forward_origin"]["sender_user_name"] == "Source"
+        file = await transport.get_file("f")
+        assert file["file_path"].endswith("/file/bot123456:TEST-TOKEN/photos/f.jpg")
+        assert await transport.send_message(42, "**bold**") == 7
+        body = next(body for method, body in requests if method == "sendMessage")
+        payload = parse_qs(body.decode())
+        assert payload["text"] == ["bold"]
+        assert json.loads(payload["entities"][0]) == [{"type": "bold", "offset": 0, "length": 4}]
+        with Stream(b"x" * 150_000) as stream:
+            assert await transport.send_document(42, stream, "large.txt") == 7
+            assert len(reads) >= 3
+    finally:
+        await transport.close()
+    assert request._client.is_closed
+
+
+async def test_retry_after_and_download_errors_do_not_expose_token(monkeypatch):
+    from telegram.error import RetryAfter
+
+    monkeypatch.setenv("PTB_TIMEDELTA", "1")
+    client = FakeClient()
+    client.script("get_updates", RetryAfter(9))
+    with pytest.raises(TelegramError) as error:
+        await bot(client).get_updates(0)
+    assert error.value.retry_after == 9
+    client.script("get_file", {"file_path": "https://api.telegram.org/file/botTESTTOKEN/f"})
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(
+        lambda request: httpx2.Response(404)
+    )) as http:
+        transport = bot(client)
+        transport.http = SimpleNamespace(client=http)
+        with pytest.raises(TelegramError) as error:
+            async for _ in transport.download("f"):
+                pass
+    assert "TESTTOKEN" not in str(error.value)

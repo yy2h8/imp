@@ -1,4 +1,4 @@
-"""Telegram transport over aiogram: one method per endpoint the assistant
+"""Telegram transport over python-telegram-bot: one method per endpoint the assistant
 uses. No parse_mode anywhere — markdown is rendered to (text, entities) by
 adapters.markdown, with literal-text fallbacks when Telegram rejects an
 entity rendering, so formatting can never lose a message. Status composition
@@ -7,12 +7,17 @@ lives in ui.py; long-answer splitting in markdown.render_long.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable
+from datetime import timedelta
+from typing import BinaryIO
 
-from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile, MessageEntity
+import httpx2
+from telegram import Bot, InputFile, MessageEntity
+from telegram.error import RetryAfter
+from telegram.error import TelegramError as BotAPIError
+from telegram.request import HTTPXRequest
 
+from imp.adapters.http import HttpClient
 from imp.config import DEFAULT_MAX_HTTP_BYTES
 
 from .markdown import render, render_long
@@ -25,6 +30,10 @@ CAPTION_CHARS = 1024
 
 class TelegramError(RuntimeError):
     """A Bot API call failed; message describes the cause."""
+
+    def __init__(self, message: str, retry_after: float = 5.0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def units(text: str) -> int:
@@ -53,17 +62,16 @@ def _entities(entities: list[dict]) -> list[MessageEntity]:
 
 
 def _as_dict(result):
-    """aiogram typed results → plain dicts (fakes may already return dicts)."""
+    """SDK objects → portable dictionaries used by the durable intake."""
     if isinstance(result, dict):
         return result
-    if isinstance(result, list):
+    if isinstance(result, (list, tuple)):
         return [_as_dict(item) for item in result]
-    dumper = getattr(result, "model_dump", None)
-    return dumper(exclude_none=True) if dumper else result
+    return result.to_dict()
 
 
 class TelegramBot:
-    """aiogram Bot wrapper. Required sends raise TelegramError on rejection;
+    """Bot wrapper. Required sends raise TelegramError on rejection;
     cosmetic edits and typing indicators may fail without aborting a turn."""
 
     def __init__(
@@ -72,18 +80,29 @@ class TelegramBot:
         timeout: float = 60.0,
         max_bytes: int = DEFAULT_MAX_HTTP_BYTES,
         client=None,
+        http: HttpClient | None = None,
     ) -> None:
         self.max_bytes = max_bytes
         self.token = token
+        self.http = http
         self.client = client if client is not None else Bot(
-            token=token, request_timeout=timeout
+            token=token,
+            request=HTTPXRequest(read_timeout=timeout, media_write_timeout=timeout),
+            get_updates_request=HTTPXRequest(read_timeout=timeout),
         )
+
+    async def initialize(self) -> None:
+        await self._call("initialize", self.client.initialize())
 
     async def _call(self, method: str, coro: Awaitable):
         try:
             return await coro
-        except TelegramAPIError as exc:
-            raise TelegramError(f"{method} failed: {exc}") from None
+        except BotAPIError as exc:
+            delay = exc.retry_after if isinstance(exc, RetryAfter) else 5.0
+            if isinstance(delay, timedelta):
+                delay = delay.total_seconds()
+            message = str(exc).replace(self.token, "<redacted>")
+            raise TelegramError(f"{method} failed: {message}", delay) from None
 
     async def send_message(self, chat_id: int, text: str) -> int:
         """Markdown in: rendered as text + entities, falling back to the
@@ -182,13 +201,13 @@ class TelegramBot:
             pass  # cosmetic; never worth failing a turn over
 
     async def send_document(
-        self, chat_id: int, data: bytes, filename: str, caption: str = ""
+        self, chat_id: int, data: bytes | BinaryIO, filename: str, caption: str = ""
     ) -> int:
         result = await self._call(
             "sendDocument",
             self.client.send_document(
                 chat_id=chat_id,
-                document=BufferedInputFile(data, filename=filename),
+                document=InputFile(data, filename=filename, read_file_handle=False),
                 caption=split(caption, CAPTION_CHARS)[0] if caption else "",
             ),
         )
@@ -203,7 +222,7 @@ class TelegramBot:
         updates = await self._call(
             "getUpdates",
             self.client.get_updates(
-                offset=offset, timeout=POLL_TIMEOUT_S, allowed_updates=[]
+                offset=offset, timeout=POLL_TIMEOUT_S, allowed_updates=["message"]
             ),
         )
         return _as_dict(list(updates))
@@ -214,33 +233,33 @@ class TelegramBot:
             await self._call("getFile", self.client.get_file(file_id=file_id))
         )
 
-    async def download(self, file_id: str) -> bytes:
-        """Resolve and fetch raw bytes for one attachment, enforcing the
-        configured byte cap (bounded by Telegram's 20 MB platform limit)."""
-        data = await self._call(
-            "download",
-            self.client.download(file=file_id),
-        )
-        payload = data.getvalue() if hasattr(data, "getvalue") else data.read()
-        if len(payload) > self.max_bytes:
+    async def download(self, file_id: str) -> AsyncIterator[bytes]:
+        """Stream to the sandbox writer; reject oversized files before buffering."""
+        if self.http is None:
+            raise TelegramError("Download requires the shared HTTP client")
+        file = await self.get_file(file_id)
+        if (file.get("file_size") or 0) > self.max_bytes:
             raise TelegramError(f"Download exceeds byte limit ({self.max_bytes})")
-        return payload
-
-    async def download_file(self, file_path: str) -> bytes:
-        """Fetch raw bytes for a resolved file_path (v1 seam; uploads)."""
-        data = await self._call(
-            "downloadFile",
-            self.client.download_file(file_path),
-        )
-        payload = data.getvalue() if hasattr(data, "getvalue") else data.read()
-        if len(payload) > self.max_bytes:
-            raise TelegramError(f"Download exceeds byte limit ({self.max_bytes})")
-        return payload
+        url = file.get("file_path")
+        if not url:
+            raise TelegramError("Telegram did not return a download URL")
+        try:
+            # PTB's download_to_drive also buffers the response; use our existing
+            # streaming client, including its SSRF validation, for the file body.
+            async with self.http.client.stream("GET", url) as response:
+                response.raise_for_status()
+                received = 0
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > self.max_bytes:
+                        raise TelegramError(f"Download exceeds byte limit ({self.max_bytes})")
+                    yield chunk
+        except (httpx2.HTTPError, ValueError) as exc:
+            message = str(exc).replace(self.token, "<redacted>")
+            raise TelegramError(f"Download failed: {message}") from None
 
     async def close(self) -> None:
-        session = getattr(self.client, "session", None)
-        if session is not None:
-            await session.close()
+        await self.client.shutdown()
 
 
 async def send_text(bot: TelegramBot, chat_id: int, text: str) -> list[int]:

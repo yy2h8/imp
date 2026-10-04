@@ -20,7 +20,7 @@ from imp.config import Config
 
 from .adapters import SttClient, TelegramBot
 from .adapters.telegram import send_text
-from .config import OPENROUTER_BASE_URL, AssistantConfig
+from .config import DEFAULT_MAX_CONCURRENT_JOBS, OPENROUTER_BASE_URL, AssistantConfig
 from .db import STATE_DB_NAME, memory_digest, memory_digest_sync, open_db
 from .outbox import Outbox
 from .prompt import BASE_PROMPT, memory_section
@@ -120,7 +120,7 @@ class AssistantApp:
     scheduler: AsyncIOScheduler | None = None
     http: HttpClient | None = None
     jobs_semaphore: asyncio.Semaphore = field(
-        default_factory=lambda: asyncio.Semaphore(2)
+        default_factory=lambda: asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_JOBS)
     )
     turn_state: dict[str, bool] = field(default_factory=lambda: {"active": False})
     job_context: JobContext | None = None
@@ -207,7 +207,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
             finally:
                 ask_router.clear()
 
-    bot = TelegramBot(assistant_config.bot_token, max_bytes=imp_config.max_http_bytes)
+    bot = None
     try:
         async with (
             HttpClient(imp_config) as http,
@@ -217,12 +217,18 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 timeout=imp_config.network_timeout,
             ) as openai_client,
         ):
+            bot = TelegramBot(
+                assistant_config.bot_token,
+                max_bytes=imp_config.max_http_bytes,
+                http=http,
+            )
+            await bot.initialize()
 
             async def sender(path: Path, caption: str) -> str | None:
-                data = await asyncio.to_thread(fs.read_bytes, path)
-                return await bot.send_document(
-                    chat_id, data, filename=path.name, caption=caption
-                )
+                async with fs.read_stream(path) as data:
+                    return await bot.send_document(
+                        chat_id, data, filename=path.name, caption=caption
+                    )
 
             tools = build_assistant_tools(
                 config=imp_config,
@@ -258,7 +264,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                     bot=bot,
                     inbox=assistant_config.home / "inbox",
                     fs=fs,
-                    stt=SttClient(openai_client, assistant_config.stt_model),
+                    stt=SttClient(openai_client, assistant_config.stt_model, fs),
                     chat_id=chat_id,
                 )
                 app = AssistantApp(
@@ -291,5 +297,6 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 (app.session if app else session).writer.__exit__(None, None, None)
     finally:
         set_context(None)
-        await bot.close()
+        if bot is not None:
+            await bot.close()
         await db.close()

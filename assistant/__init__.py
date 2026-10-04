@@ -5,7 +5,7 @@ capability set, this package provides the transport (adapters/telegram.py),
 rendering (adapters/ui.py), STT (adapters/stt.py), the composition root
 (app.py), bootstrap (bootstrap.py), SQLite state (`db.py`), transcripts,
 intake and APScheduler wiring. Run with `python -m assistant` (`whoami` to find
-your id). The Telegram framework is aiogram.
+your id). The Telegram client is python-telegram-bot.
 See README.md.
 """
 

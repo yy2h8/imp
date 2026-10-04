@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -266,3 +268,126 @@ def test_paged_read_keeps_only_requested_range(tmp_path):
     fs = FileSystemAdapter(tmp_path, max_bytes=16)
     (tmp_path / "many").write_text("line\n" * 10000)
     assert fs.read_text_file("many", start_line=9000, end_line=9001) == "line\nline\n"
+
+
+async def test_create_stream_writes_each_chunk_before_requesting_next(tmp_path):
+    fs = FileSystemAdapter(tmp_path, max_bytes=6)
+
+    async def chunks():
+        yield b"abc"
+        assert (tmp_path / "stream").stat().st_size == 3
+        yield b"def"
+
+    saved = await fs.create_stream("stream", chunks())
+    assert saved.read_bytes() == b"abcdef"
+
+
+@pytest.mark.parametrize("failure", [ValueError, RuntimeError, asyncio.CancelledError])
+async def test_create_stream_removes_partial_file_on_failure(tmp_path, failure):
+    fs = FileSystemAdapter(tmp_path, max_bytes=3)
+
+    async def chunks():
+        yield b"abc"
+        if failure is ValueError:
+            yield b"d"
+        else:
+            raise failure("download interrupted")
+
+    with pytest.raises(failure):
+        await fs.create_stream("stream", chunks())
+    assert not (tmp_path / "stream").exists()
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+async def test_create_stream_preserves_existing_files_and_symlinks(tmp_path, symlink):
+    fs = FileSystemAdapter(tmp_path)
+    original = tmp_path / "original"
+    original.write_bytes(b"keep")
+    target = tmp_path / "link" if symlink else original
+    if symlink:
+        target.symlink_to(original)
+
+    async def chunks():
+        pytest.fail("Existing destinations must fail before downloading")
+        yield b"replacement"
+
+    with pytest.raises(FileExistsError):
+        await fs.create_stream(target, chunks())
+    assert original.read_bytes() == b"keep"
+    assert target.is_symlink() is symlink
+
+
+async def test_create_stream_cancelled_while_opening_closes_and_removes_file(
+    tmp_path, monkeypatch
+):
+    fs = FileSystemAdapter(tmp_path)
+    entered, release = asyncio.Event(), threading.Event()
+    loop, original_open = asyncio.get_running_loop(), Path.open
+    handles = []
+
+    def delayed_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        handles.append(stream)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        return stream
+
+    async def chunks():
+        yield b"abc"
+
+    monkeypatch.setattr(Path, "open", delayed_open)
+    task = asyncio.create_task(fs.create_stream("stream", chunks()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert handles[0].closed
+    assert not (tmp_path / "stream").exists()
+
+
+async def test_create_stream_rejects_short_write_and_removes_partial_file(
+    tmp_path, monkeypatch
+):
+    fs = FileSystemAdapter(tmp_path)
+    original_open = Path.open
+
+    def short_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        write = stream.write
+        stream.write = lambda data: write(data[:1])
+        return stream
+
+    async def chunks():
+        yield b"abc"
+
+    monkeypatch.setattr(Path, "open", short_open)
+    with pytest.raises(OSError, match="Incomplete"):
+        await fs.create_stream("stream", chunks())
+    assert not (tmp_path / "stream").exists()
+
+
+def test_open_read_enforces_limit_after_file_growth(tmp_path):
+    fs = FileSystemAdapter(tmp_path, max_bytes=6)
+    path = tmp_path / "audio"
+    path.write_bytes(b"abc")
+    with fs.open_read("audio") as stream:
+        assert stream.read(3) == b"abc"
+        with path.open("ab") as writer:
+            writer.write(b"defg")
+        assert stream.read(3) == b"def"
+        with pytest.raises(ValueError, match="byte limit"):
+            stream.read(3)
+    assert stream.closed
+    with pytest.raises(ValueError, match="byte limit"):
+        fs.open_read("audio")
+
+
+def test_open_read_checks_sandbox_and_regular_file(tmp_path):
+    fs = FileSystemAdapter(tmp_path)
+    with pytest.raises(ValueError, match="regular file"):
+        fs.open_read(tmp_path)
+    with pytest.raises(ValueError, match="escapes workspace"):
+        fs.open_read("../outside")

@@ -1,7 +1,7 @@
 # assistant
 
 A personal assistant reached over Telegram, built on `imp/` as a library. It
-uses aiogram for Telegram transport and OpenRouter for model calls.
+uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 
 ## What it does
 
@@ -12,8 +12,9 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
   short monospace log. The final status includes tool count, seconds, and the
   provider-reported USD cost when available. Reasoning text is never shown.
 - **Markdown and files.** `telegramify-markdown` renders answers as Telegram
-  entities and splits long replies safely. aiogram handles Bot API requests,
-  uploads, and downloads. Documents, photos, videos, audio (including m4a),
+  entities and splits long replies safely. python-telegram-bot handles Bot API
+  requests and uploads; the shared HTTP client streams downloads into sandboxed
+  files with a byte cap. Documents, photos, videos, audio (including m4a),
   voice notes, video notes, animations, and stickers are accepted. Forwarded
   source details are retained, and media albums are merged into one request.
   Voice notes and playable audio are transcribed when STT is available.
@@ -32,8 +33,9 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
 - **Scheduled jobs.** `schedule_job` supports one-shot `at`/`at_local`, interval
   `every`, and five-field `cron` in `IMP_TZ`. APScheduler persists schedules in
   `state.db`. Each job gets a fresh context and cannot use `ask`. Jobs can run
-  concurrently with an interactive turn and with other jobs (default maximum
-  two); results queue until the active interactive turn ends.
+  concurrently with an interactive turn; one background job runs at a time by
+  default. `IMP_MAX_CONCURRENT_JOBS` allows more parallel jobs. Results queue
+  until the active interactive turn ends.
 - **Interactive FIFO.** Owner requests are accepted into a durable queue and
   run one at a time. Busy requests receive `Принято — в очереди …`. A request
   interrupted during execution is reported after restart and never replayed;
@@ -57,7 +59,8 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
 `<IMP_HOME>/state.db` is the assistant's single state artifact (SQLite WAL):
 
 - `kv`: bootstrap fingerprint and tailoring state, plus Telegram redelivery
-  deduplication (Telegram update offset itself is managed by aiogram).
+  deduplication. Polling advances the Telegram offset after intake completes,
+  so accepted requests reach SQLite before Telegram acknowledges them.
 - `queue`: waiting and active owner requests, plus a durable `collecting` row
   while an album is still arriving. That row blocks later requests to preserve
   FIFO order and resumes with received items after restart.
@@ -88,7 +91,7 @@ the default model is `openai/gpt-5-mini`, overridden by `OPENAI_MODEL`. See
 - `TELEGRAM_BOT_TOKEN` and `IMP_TG_ALLOWED_USER_IDS` (one owner ID).
 - `OPENAI_API_KEY` (an OpenRouter key).
 - `IMP_TZ` (timezone for `at_local` and cron; default `Asia/Almaty`).
-- `IMP_MAX_CONCURRENT_JOBS` (background job cap; default `2`).
+- `IMP_MAX_CONCURRENT_JOBS` (background job cap; default `1`).
 - `IMP_HOME` (state and file-tool root; shell commands run with the service's
   privileges).
 

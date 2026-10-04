@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from assistant.uploads import Uploads
+from imp.adapters import FileSystemAdapter
 
 
 class StubBot:
@@ -16,8 +17,10 @@ class StubBot:
         self.sent: list[str] = []
         self.actions: list[str] = []
 
-    async def download(self, file_id: str) -> bytes:
-        return self.files[file_id]
+    async def download(self, file_id: str):
+        data = self.files[file_id]
+        for offset in range(0, len(data), 3):
+            yield data[offset:offset + 3]
 
     async def send_text(self, chat_id: int, text: str) -> list[int]:
         self.sent.append(text)
@@ -155,3 +158,41 @@ async def test_download_failure_is_reported_not_silently_dropped(tmp_path):
     )
     assert result is None
     assert bot.sent and "could not save" in bot.sent[0]
+
+
+async def test_stream_limit_cleans_up_and_reports_error(tmp_path):
+    bot = StubBot()
+    uploads = Uploads(
+        bot, tmp_path / "inbox", fs=FileSystemAdapter(tmp_path, max_bytes=4)
+    )
+    assert await uploads.handle([attachment("document", file_name="big")]) is None
+    assert not list((tmp_path / "inbox").iterdir())
+    assert "byte limit" in bot.sent[0]
+
+
+async def test_duplicate_upload_names_preserve_existing_file(tmp_path):
+    uploads, _ = make_uploads(tmp_path)
+    existing = tmp_path / "inbox" / "report.txt"
+    existing.write_bytes(b"keep")
+    await uploads.handle([attachment("document", file_name=existing.name)])
+    assert existing.read_bytes() == b"keep"
+    assert (tmp_path / "inbox" / "report-2.txt").read_bytes() == b"bytes-document"
+
+
+async def test_oversized_download_closes_stream_immediately(tmp_path):
+    closed = []
+
+    async def download(file_id):
+        try:
+            yield b"abc"
+            yield b"def"
+        finally:
+            closed.append(file_id)
+
+    bot = StubBot()
+    bot.download = download
+    uploads = Uploads(
+        bot, tmp_path / "inbox", fs=FileSystemAdapter(tmp_path, max_bytes=4)
+    )
+    await uploads.handle([attachment("document", file_name="big")])
+    assert closed == ["id-document"]

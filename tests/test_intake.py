@@ -40,6 +40,22 @@ def test_normalize_common_file_kinds_and_m4a():
     assert audio["kind"] == "audio" and doc["kind"] == "document"
 
 
+@pytest.mark.parametrize("content", [{}, {"future_content": {"value": "keep me"}}])
+def test_sdk_default_service_flags_do_not_hide_future_content(content):
+    from telegram import Message
+
+    raw = message(date=1, **content)
+    raw["from"].update(is_bot=False, first_name="Owner")
+    typed = Message.de_json(raw, bot=None)
+    routed = route_message(
+        typed.to_dict(), owner_id=7, question_pending=False, busy=False
+    )
+    if content:
+        assert routed.text == 'Owner shared future content: {"value": "keep me"}'
+    else:
+        assert routed.ignore
+
+
 def test_photo_uses_largest_size_and_keeps_forward_origin():
     photo = [
         {"file_id": "small", "file_unique_id": "s", "file_size": 10},

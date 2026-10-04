@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import tracemalloc
+import weakref
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+import pytest
+
 from imp.agent import Agent, EventType
 from imp.agent.context import Context
-from imp.agent.executor import _truncate_tool_output
-from imp.entities import ReasoningMessage, ToolMessage
+from imp.agent.executor import _truncate_tool_output, execute_tool_batch
+from imp.entities import ReasoningMessage, ToolCall, ToolMessage
 from imp.events import Usage
 from imp.tools import Tool, ToolResult
 from imp.tools.fs import WriteFile
@@ -334,6 +338,115 @@ async def test_results_append_in_tool_call_order(config):
     assert [m.content for m in tool_messages] == ["slow", "fast"]
 
 
+@pytest.mark.parametrize("mutating", [False, True])
+async def test_tool_batch_releases_consumed_oversized_results(config, mutating):
+    config.max_tool_output = 10
+    raw_refs = []
+    retained_tasks = []  # Python 3.12's as_completed retains a completed task.
+    waiting = asyncio.Event()
+    consumed = asyncio.Event()
+    release = asyncio.Event()
+
+    class TrackedText(str):
+        pass
+
+    class ProducingTool(FakeTool):
+        async def execute(self, **kwargs):
+            retained_tasks.append(asyncio.current_task())
+            content = TrackedText("x" * 10_000)
+            diff = TrackedText("y" * 10_000)
+            raw_refs.extend((weakref.ref(content), weakref.ref(diff)))
+            return ToolResult(ok=True, content=content, diff=diff)
+
+    class WaitingTool(FakeTool):
+        async def execute(self, **kwargs):
+            waiting.set()
+            await release.wait()
+            return ToolResult(ok=True, content="done")
+
+    producing = ProducingTool(ToolResult(ok=True, content="unused"))
+    waiting_tool = WaitingTool(ToolResult(ok=True, content="unused"))
+    producing.mutating = waiting_tool.mutating = mutating
+    context = Context(config=config, system_prompt="sys")
+    calls = [ToolCall(str(i), "produce", {}, {}) for i in range(8)]
+    calls.append(ToolCall("wait", "wait", {}, {}))
+    batch = execute_tool_batch(
+        {"produce": producing, "wait": waiting_tool}, calls, context
+    )
+
+    async def consume():
+        count = 0
+        async for event in batch:
+            if event.tool_result is not None and event.tool_name == "produce":
+                assert event.tool_result.content == "x" * 10_000
+                assert event.tool_result.diff == "y" * 10_000
+                count += 1
+                if count == len(calls) - 1:
+                    consumed.set()
+            del event
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        await asyncio.wait_for(consumed.wait(), 1)
+        assert len(raw_refs) == 2 * (len(calls) - 1)
+        assert all(ref() is None for ref in raw_refs)
+    finally:
+        release.set()
+        await consumer
+
+    outputs = [m for m in context.messages if isinstance(m, ToolMessage)]
+    assert [m.call_id for m in outputs] == [call.call_id for call in calls]
+    assert [m.content for m in outputs] == [
+        "xxxxxxxxxx... [truncated, 9990 characters omitted]"
+    ] * (len(calls) - 1) + ["done"]
+
+
+async def test_tool_batch_overlaps_reads_before_sequential_writes(config):
+    second_read_started = asyncio.Event()
+    completed = []
+
+    class ReadTool(FakeTool):
+        async def execute(self, **kwargs):
+            if self.name == "read_one":
+                await second_read_started.wait()
+            else:
+                second_read_started.set()
+            completed.append(self.name)
+            return ToolResult(ok=True, content=self.name)
+
+    class WriteTool(FakeTool):
+        mutating = True
+
+        async def execute(self, **kwargs):
+            # Yield so a concurrent write would finish before this one.
+            if self.name == "write_one":
+                await asyncio.sleep(0)
+            completed.append(self.name)
+            return ToolResult(ok=True, content=self.name)
+
+    tools = {
+        name: cls(ToolResult(ok=True, content="unused"), name=name)
+        for cls, name in [
+            (WriteTool, "write_one"),
+            (ReadTool, "read_one"),
+            (WriteTool, "write_two"),
+            (ReadTool, "read_two"),
+        ]
+    }
+    calls = [ToolCall(name, name, {}, {}) for name in tools]
+    context = Context(config=config, system_prompt="sys")
+
+    async def consume():
+        async for _ in execute_tool_batch(tools, calls, context):
+            pass
+
+    await asyncio.wait_for(consume(), 1)
+    assert completed == ["read_two", "read_one", "write_one", "write_two"]
+    outputs = [m for m in context.messages if isinstance(m, ToolMessage)]
+    assert [m.call_id for m in outputs] == list(tools)
+
+
 async def test_duplicate_call_ids_do_not_collide(config):
     tools = {
         "one": FakeTool(ToolResult(ok=True, content="first"), name="one"),
@@ -430,6 +543,34 @@ def test_truncate_tool_output_cuts_on_line_boundary():
 def test_truncate_tool_output_single_long_line_falls_back_to_char_cut():
     out = _truncate_tool_output("x" * 300, 100)
     assert out == "x" * 100 + "... [truncated, 200 characters omitted]"
+
+
+def test_truncate_tool_output_allocates_only_for_retained_prefix():
+    text = "line\n" * 100_000
+    tracemalloc.start()
+    try:
+        output = _truncate_tool_output(text, 100)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert output.startswith("line\n" * 20)
+    assert peak < len(text)
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\n", "\r\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+)
+def test_truncate_tool_output_preserves_splitlines_boundaries(separator):
+    first = "a" + separator
+    text = first + "bcdef"
+    assert _truncate_tool_output(text, len(first)) == (
+        first + "... [truncated after 1 lines, 5 characters omitted; "
+        "continue from the last line shown]"
+    )
+    assert _truncate_tool_output(text, len(first) - 1) == (
+        text[: len(first) - 1] + "... [truncated, 6 characters omitted]"
+    )
 
 
 async def test_duplicate_calls_rejected_before_execution(config):

@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
+import io
+import os
 import re
+from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import ClassVar
 
 from ..config import DEFAULT_MAX_HTTP_BYTES
+
+
+class _BoundedReader(io.BufferedReader):
+    """A multipart-compatible file handle whose reads cannot pass the byte cap."""
+
+    def __init__(self, raw: io.FileIO, max_bytes: int) -> None:
+        super().__init__(raw)
+        self.max_bytes = max_bytes
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = max(0, self.max_bytes - self.tell())
+        data = super().read(
+            remaining + 1 if size < 0 else min(size, remaining + 1)
+        )
+        if len(data) > remaining:
+            raise ValueError(f"File exceeds byte limit ({self.max_bytes})")
+        return data
 
 
 def _is_text(path: Path) -> bool:
@@ -231,15 +253,29 @@ class FileSystemAdapter:
             )
         return "\n\n".join(sections) if sections else ""
 
-    def read_bytes(self, path: str | Path) -> bytes:
+    def open_read(self, path: str | Path) -> _BoundedReader:
         resolved = self.resolve_path(path, must_exist=True)
         if not resolved.is_file():
             raise ValueError("Expected a regular file")
-        with resolved.open("rb") as fh:
-            data = fh.read(self.max_bytes + 1)
-        if len(data) > self.max_bytes:
+        fh = _BoundedReader(resolved.open("rb", buffering=0), self.max_bytes)
+        if os.fstat(fh.fileno()).st_size > self.max_bytes:
+            fh.close()
             raise ValueError(f"File exceeds byte limit ({self.max_bytes})")
-        return data
+        return fh
+
+    def read_bytes(self, path: str | Path) -> bytes:
+        with self.open_read(path) as fh:
+            return fh.read()
+
+    @asynccontextmanager
+    async def read_stream(self, path: str | Path) -> AsyncIterator[_BoundedReader]:
+        opening = asyncio.create_task(asyncio.to_thread(self.open_read, path))
+        try:
+            yield await asyncio.shield(opening)
+        finally:
+            await asyncio.wait({opening})
+            if opening.exception() is None:
+                await asyncio.to_thread(opening.result().close)
 
     def create_bytes(self, path: str | Path, data: bytes) -> Path:
         if len(data) > self.max_bytes:
@@ -250,6 +286,45 @@ class FileSystemAdapter:
         resolved = self.resolve_path(path)
         with resolved.open("xb") as fh:
             fh.write(data)
+        return resolved
+
+    async def create_stream(
+        self, path: str | Path, chunks: AsyncIterable[bytes]
+    ) -> Path:
+        fh = None
+
+        def open_file() -> Path:
+            nonlocal fh
+            lexical = self.workspace / path
+            if lexical.is_symlink():
+                raise FileExistsError(str(lexical))
+            resolved = self.resolve_path(path)
+            fh = resolved.open("xb", buffering=0)
+            return resolved
+
+        async def file_io(function, *args):
+            operation = asyncio.create_task(asyncio.to_thread(function, *args))
+            try:
+                return await asyncio.shield(operation)
+            finally:
+                # A cancelled await must not race cleanup against an active write.
+                await operation
+
+        try:
+            resolved = await file_io(open_file)
+            total = 0
+            async for chunk in chunks:
+                total += len(chunk)
+                if total > self.max_bytes:
+                    raise ValueError(f"File exceeds byte limit ({self.max_bytes})")
+                if await file_io(fh.write, chunk) != len(chunk):
+                    raise OSError("Incomplete file write")
+            await file_io(fh.close)
+        except BaseException:
+            if fh is not None:
+                await asyncio.to_thread(fh.close)
+                await asyncio.to_thread(Path(fh.name).unlink, missing_ok=True)
+            raise
         return resolved
 
     def write_text_file(self, path: str, content: str) -> str:

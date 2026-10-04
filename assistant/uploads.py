@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import re
+from contextlib import aclosing
 from pathlib import Path
 
 from imp.adapters import FileSystemAdapter
@@ -130,21 +131,18 @@ class Uploads:
             await send_text(self.bot, self.chat_id, "Could not save attachment: missing file id.")
             return None
         try:
-            data = await self.bot.download(file_id)
-            return await asyncio.to_thread(self._create, name, data)
+            while True:
+                target = await asyncio.to_thread(self._target, name)
+                try:
+                    async with aclosing(self.bot.download(file_id)) as chunks:
+                        return await self.fs.create_stream(target, chunks)
+                except FileExistsError:
+                    continue
         except Exception as exc:
             await send_text(
                 self.bot, self.chat_id, f"*error:* could not save the file: {exc}"
             )
             return None
-
-    def _create(self, name: str, data: bytes) -> Path:
-        while True:
-            target = self._target(name)
-            try:
-                return self.fs.create_bytes(target, data)
-            except FileExistsError:
-                continue
 
     def _target(self, name: str) -> Path:
         candidate, n = self.inbox / name, 1

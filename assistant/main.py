@@ -1,18 +1,18 @@
-"""aiogram entry points, private-owner message handler and turn worker."""
+"""Telegram polling, private-owner message handler and turn worker."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aiogram import Dispatcher
-from aiogram.types import Message
+from telegram import Message
 
 from imp.events import EventType
 
@@ -226,7 +226,7 @@ class AssistantController:
 
     async def handle_message(self, message: Message | dict) -> None:
         if not isinstance(message, dict):
-            message = message.model_dump(exclude_none=True, by_alias=True)
+            message = message.to_dict()
         routed = route_message(
             message,
             owner_id=self.app.chat_id,
@@ -337,14 +337,30 @@ class AssistantController:
                     self._working = False
 
 
-def build_dispatcher(controller: AssistantController) -> Dispatcher:
-    dispatcher = Dispatcher()
-
-    @dispatcher.message()
-    async def owner_message(message: Message) -> None:
-        await controller.handle_message(message)
-
-    return dispatcher
+async def poll_updates(bot: TelegramBot, controller: AssistantController) -> None:
+    """Acknowledge Telegram updates only after intake has persisted them."""
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    offset = 0
+    try:
+        while True:
+            try:
+                updates = await bot.get_updates(offset)
+            except TelegramError as exc:
+                _LOG.warning("getUpdates failed: %s", exc)
+                await asyncio.sleep(exc.retry_after)
+                continue
+            for update in updates:
+                try:
+                    if message := update.get("message"):
+                        await controller.handle_message(message)
+                except Exception as exc:
+                    _LOG.exception("Telegram intake failed; leaving update unacknowledged")
+                    await asyncio.sleep(exc.retry_after if isinstance(exc, TelegramError) else 5)
+                    break
+                offset = update["update_id"] + 1
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 async def _recover_interactive_requests(app: AssistantApp) -> None:
@@ -378,7 +394,6 @@ async def run_bot() -> None:
         if app.job_context is not None:
             await startup_recovery(app.job_context)
         controller = AssistantController(app)
-        dispatcher = build_dispatcher(controller)
         app.scheduler.start()
         await app.outbox.start()
         await controller.start()
@@ -387,12 +402,7 @@ async def run_bot() -> None:
                 await send_text(app.bot, chat_id, await collect_status(app))
             except Exception as exc:
                 _LOG.warning("startup notification failed: %s", exc)
-            await dispatcher.start_polling(
-                app.bot.client,
-                allowed_updates=dispatcher.resolve_used_update_types(),
-                handle_as_tasks=False,
-                close_bot_session=False,
-            )
+            await poll_updates(app.bot, controller)
         finally:
             await controller.close()
             app.scheduler.shutdown(wait=False)
@@ -436,7 +446,7 @@ def _package_dir() -> Path:
 
 
 async def whoami() -> None:
-    """Identify the owner using aiogram's Bot API client; run while stopped."""
+    """Identify the owner using the Bot API client; run while stopped."""
     token = AssistantConfig.raw_token()
     if not token:
         raise ValueError(
@@ -444,6 +454,7 @@ async def whoami() -> None:
         )
     bot = TelegramBot(token)
     try:
+        await bot.initialize()
         me = await bot.get_me()
         who = " ".join(
             part for part in (me.get("first_name"), me.get("last_name")) if part
@@ -456,7 +467,7 @@ async def whoami() -> None:
                 updates = await bot.get_updates(offset)
             except TelegramError as exc:
                 print(f"getUpdates failed: {exc}", file=sys.stderr)
-                await asyncio.sleep(5)
+                await asyncio.sleep(exc.retry_after)
                 continue
             for update in updates:
                 uid = update.get("update_id")
@@ -481,6 +492,10 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Bot API URLs contain the token; HTTP request logs must not expose it.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
     args = sys.argv[1:] if argv is None else argv
     command = args[0] if args else ""
     if command == "whoami":
@@ -495,7 +510,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"unknown command: {command!r} (use 'whoami' or none)")
     try:
         asyncio.run(run_bot())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     except ValueError as e:
         raise SystemExit(f"Configuration error: {e}")

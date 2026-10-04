@@ -17,7 +17,7 @@ def _truncate_tool_output(tool_output: str, max_tool_output: int) -> str:
     # cut on a line boundary so line-numbered reads keep a clean resume point
     kept: list[str] = []
     length = 0
-    for line in tool_output.splitlines(keepends=True):
+    for line in tool_output[: max_tool_output + 1].splitlines(keepends=True):
         if length + len(line) > max_tool_output:
             break
         kept.append(line)
@@ -40,9 +40,9 @@ async def execute_tool_batch(
     in original order. Results append to the context in tool-call order
     regardless of completion order (deterministic sessions)."""
 
-    async def run(call: ToolCall) -> tuple[ToolCall, ToolResult]:
+    async def run(call: ToolCall) -> tuple[ToolCall, list[ToolResult]]:
         result = await execute_call(tools, call.function_name, call.arguments)
-        return call, result
+        return call, [result]
 
     def is_mutating(name: str) -> bool:
         tool = tools.get(name)
@@ -51,7 +51,7 @@ async def execute_tool_batch(
     reads = [c for c in calls if not is_mutating(c.function_name)]
     writes = [c for c in calls if is_mutating(c.function_name)]
 
-    results: dict[int, ToolResult] = {}
+    results: dict[int, str] = {}
     try:
         for call in reads:
             yield AgentEvent(
@@ -63,14 +63,19 @@ async def execute_tool_batch(
         tasks = [asyncio.create_task(run(c)) for c in reads]
         try:
             for finished in asyncio.as_completed(tasks):
-                call, result = await finished
-                results[id(call)] = result
+                call, holder = await finished
+                # as_completed on Python 3.12 retains a task; empty its result holder.
+                result = holder.pop()
+                results[id(call)] = _truncate_tool_output(
+                    result.content, context.config.max_tool_output
+                )
                 yield AgentEvent(
                     type=EventType.TOOL_RESULT,
                     tool_result=result,
                     token_usage=context.get_usage(),
                     tool_name=call.function_name,
                 )
+                del result
         finally:
             for task in tasks:
                 task.cancel()
@@ -84,13 +89,16 @@ async def execute_tool_batch(
                 tool_args=call.arguments,
             )
             result = await execute_call(tools, call.function_name, call.arguments)
-            results[id(call)] = result
+            results[id(call)] = _truncate_tool_output(
+                result.content, context.config.max_tool_output
+            )
             yield AgentEvent(
                 type=EventType.TOOL_RESULT,
                 tool_result=result,
                 token_usage=context.get_usage(),
                 tool_name=call.function_name,
             )
+            del result
 
     finally:
         for call in calls:
@@ -98,11 +106,13 @@ async def execute_tool_batch(
             context.append(
                 ToolMessage(
                     call_id=call.call_id,
-                    content=_truncate_tool_output(
-                        result.content
+                    content=(
+                        result
                         if result is not None
-                        else "Interrupted; execution outcome unknown. Inspect state before retrying actions.",
-                        context.config.max_tool_output,
+                        else _truncate_tool_output(
+                            "Interrupted; execution outcome unknown. Inspect state before retrying actions.",
+                            context.config.max_tool_output,
+                        )
                     ),
                 )
             )

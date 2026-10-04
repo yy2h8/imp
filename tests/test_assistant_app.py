@@ -1,4 +1,4 @@
-"""Integration tests for v2 turn execution and aiogram message intake."""
+"""Integration tests for turn execution and Telegram message intake."""
 
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ class FakeBot:
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         self.actions.append(action)
 
-    async def download(self, file_id: str) -> bytes:
-        return b"file contents"
+    async def download(self, file_id: str):
+        yield b"file contents"
 
 
 @pytest.fixture

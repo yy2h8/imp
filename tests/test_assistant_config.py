@@ -49,6 +49,11 @@ IMP_ENV_VARS = [
 def make_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str
 ) -> AssistantConfig:
+    async def get_me(_bot):
+        from telegram import User
+        return User(id=1, is_bot=True, first_name="Test")
+
+    monkeypatch.setattr("telegram.Bot.get_me", get_me)
     for var in ASSISTANT_ENV_VARS + IMP_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST-TOKEN")
@@ -93,11 +98,11 @@ async def test_build_assistant_pins_openrouter_and_wires_stt(tmp_path, monkeypat
         assert app.agent.tools["schedule_job"].config.workspace == tmp_path
 
 
-def test_max_concurrent_jobs_defaults_to_two(tmp_path, monkeypatch):
+def test_max_concurrent_jobs_default(tmp_path, monkeypatch):
     from assistant.config import DEFAULT_MAX_CONCURRENT_JOBS
 
     config = make_config(tmp_path, monkeypatch)
-    assert config.max_concurrent_jobs == DEFAULT_MAX_CONCURRENT_JOBS == 2
+    assert config.max_concurrent_jobs == DEFAULT_MAX_CONCURRENT_JOBS
 
 
 def test_max_concurrent_jobs_override(tmp_path, monkeypatch):

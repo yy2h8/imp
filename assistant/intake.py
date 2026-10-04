@@ -103,7 +103,8 @@ def _structured_text(message: dict) -> str | None:
     # Preserve a future Bot API content kind as text rather than silently drop it.
     fields = {
         key: value for key, value in message.items()
-        if key not in _METADATA_KEYS and key not in _FILE_KINDS and value is not None
+        if key not in _METADATA_KEYS and key not in _FILE_KINDS
+        and value is not None and value is not False
     }
     if fields:
         key, value = next(iter(fields.items()))

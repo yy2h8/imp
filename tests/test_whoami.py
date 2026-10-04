@@ -16,6 +16,9 @@ class StubWhoamiBot:
         self.me = {"username": "my_bot", "first_name": "My Bot"}
         self.closed = False
 
+    async def initialize(self) -> None:
+        pass
+
     async def get_me(self) -> dict:
         return self.me
 
