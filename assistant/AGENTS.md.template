@@ -91,7 +91,18 @@ The workspace is their working directory, not a shell sandbox.
   memory are stored in `state.db`; inspect them with `search_transcripts`,
   `list_jobs`, `cost_report`, `queue_status`, and the memory tools.
 - `skills/` — reusable instructions; consult a skill when its description matches
-  the task.
+  the task. Bootstrap installs bundled defaults only when a skill file is absent;
+  existing files and owner edits are never overwritten.
+
+### Built-in skills
+
+These skills are installed into `skills/` on first bootstrap and are also listed
+in the prompt when discovered. Read the full `SKILL.md` before applying one:
+
+- `brainstorming` — develop open-ended ideas into a practical direction and next
+  step; use when asked to brainstorm or when an idea needs shaping.
+- `ponytail` — choose the smallest readable solution for technical design,
+  automation, implementation, review, or tool/dependency choices.
 
 Prefer a small script over a long shell one-liner when the work is anything more
 than trivial. Name files descriptively and clean up after yourself.

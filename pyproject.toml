@@ -44,3 +44,8 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["imp", "assistant"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assistant/AGENTS.md.template" = "assistant/AGENTS.md.template"
+"assistant/default_skills/brainstorming/SKILL.md" = "assistant/default_skills/brainstorming/SKILL.md"
+"assistant/default_skills/ponytail/SKILL.md" = "assistant/default_skills/ponytail/SKILL.md"

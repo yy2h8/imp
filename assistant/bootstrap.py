@@ -268,6 +268,49 @@ class BootstrapResult:
     changed: bool  # manual written (first run, forced, or fingerprint mismatch)
 
 
+def install_default_skills(home: Path, package_dir: Path) -> int:
+    """Install bundled skills that are missing from the owner's workspace.
+
+    Defaults are additive: an existing skill file, including an owner-edited
+    copy, is never replaced. Returns the number of files installed.
+    """
+    source_root = package_dir / "default_skills"
+    skills_root = home / "skills"
+    installed = 0
+    try:
+        sources = sorted(source_root.glob("*/SKILL.md"))
+    except OSError as exc:
+        _LOG.warning("bootstrap: cannot list bundled skills: %s", exc)
+        return 0
+
+    home_resolved = home.resolve()
+    for source in sources:
+        skill_dir = skills_root / source.parent.name
+        target = skill_dir / "SKILL.md"
+        try:
+            if target.exists():
+                continue
+            # Reject symlinked workspace/skill paths before creating anything
+            # through them, then check again after mkdir to cover races.
+            if not skills_root.resolve().is_relative_to(home_resolved):
+                _LOG.warning("bootstrap: refusing skill path outside workspace: %s", skills_root)
+                continue
+            if not skill_dir.resolve().is_relative_to(home_resolved):
+                _LOG.warning("bootstrap: refusing skill path outside workspace: %s", skill_dir)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.resolve().is_relative_to(home_resolved):
+                _LOG.warning("bootstrap: refusing skill path outside workspace: %s", target)
+                continue
+            if target.exists():  # another startup may have installed it
+                continue
+            shutil.copyfile(source, target)
+            installed += 1
+        except (OSError, RuntimeError) as exc:
+            _LOG.warning("bootstrap: cannot install bundled skill %s: %s", source.name, exc)
+    return installed
+
+
 def run_bootstrap(
     home: Path,
     package_dir: Path,
@@ -282,6 +325,7 @@ def run_bootstrap(
     failure degrades to a minimal manual rather than blocking startup.
     """
     probe = probe or Probe.take(home)
+    install_default_skills(home, package_dir)
     path = home / "AGENTS.md"
     changed = (
         force

@@ -67,8 +67,11 @@ uses aiogram for Telegram transport and OpenRouter for model calls.
 - `memory`: durable agent memory.
 
 The agent still works with ordinary workspace files: `AGENTS.md`, skills,
-`inbox/`, `outbox/`, `scratch/`, `scripts/`, and `projects/`. SQLite contains
-assistant state and transcripts, not user documents or workspace content.
+`inbox/`, `outbox/`, `scratch/`, `scripts/`, and `projects/`. Bootstrap installs
+bundled `brainstorming` and `ponytail` skills when their files are missing, and
+never overwrites existing skill files; other skills can be added under `skills/`
+as usual. SQLite contains assistant state and transcripts, not user documents
+or workspace content.
 
 The v2 assistant starts fresh. Existing v1 `state.json` and `jobs/*.json` are
 left untouched and not imported; recreate any schedules with `schedule_job`.

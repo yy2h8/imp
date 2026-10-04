@@ -15,6 +15,7 @@ from assistant.bootstrap import (
     ENV_BEGIN,
     ENV_END,
     Probe,
+    install_default_skills,
     load_template,
     needs_tailoring,
     prune_scratch,
@@ -249,6 +250,67 @@ class TestRunBootstrap:
         assert run_bootstrap(tmp_path, package_dir, probe=probe).changed
         assert "512 MB" in (tmp_path / "AGENTS.md").read_text()
         assert needs_tailoring(read_state(tmp_path))
+
+    def test_installs_bundled_skills_additively(self, tmp_path):
+        home = tmp_path / "home"
+        package = tmp_path / "package"
+        local = home / "skills" / "brainstorming" / "SKILL.md"
+        bundled_existing = package / "default_skills" / "brainstorming" / "SKILL.md"
+        bundled_missing = package / "default_skills" / "ponytail" / "SKILL.md"
+        local.parent.mkdir(parents=True)
+        bundled_existing.parent.mkdir(parents=True)
+        bundled_missing.parent.mkdir(parents=True)
+        local.write_text("owner's customized skill")
+        bundled_existing.write_text("bundled version")
+        bundled_missing.write_text("new default")
+
+        assert install_default_skills(home, package) == 1
+        assert local.read_text() == "owner's customized skill"
+        assert (home / "skills" / "ponytail" / "SKILL.md").read_text() == "new default"
+
+        # Future runs never overwrite either a customized or an installed file.
+        bundled_missing.write_text("updated bundle")
+        assert install_default_skills(home, package) == 0
+        assert (home / "skills" / "ponytail" / "SKILL.md").read_text() == "new default"
+
+    def test_refuses_to_install_through_workspace_symlink(self, tmp_path):
+        home = tmp_path / "home"
+        package = tmp_path / "package"
+        external = tmp_path / "external"
+        home.mkdir()
+        external.mkdir()
+        (home / "skills").symlink_to(external, target_is_directory=True)
+        bundled = package / "default_skills" / "brainstorming" / "SKILL.md"
+        bundled.parent.mkdir(parents=True)
+        bundled.write_text("bundled skill")
+
+        assert install_default_skills(home, package) == 0
+        assert not (external / "brainstorming").exists()
+
+    def test_default_skills_are_installed_by_bootstrap_even_without_manual_refresh(
+        self, tmp_path, package_dir
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        defaults = package_dir / "default_skills" / "brainstorming"
+        defaults.mkdir(parents=True)
+        (defaults / "SKILL.md").write_text("bundled skill")
+        probe = make_probe()
+        run_bootstrap(home, package_dir, probe=probe)
+        installed = home / "skills" / "brainstorming" / "SKILL.md"
+        assert installed.read_text() == "bundled skill"
+
+        # Even when the fingerprint matches, a missing default is restored.
+        installed.unlink()
+        result = run_bootstrap(home, package_dir, probe=probe)
+        assert result.changed is False
+        assert installed.read_text() == "bundled skill"
+
+    def test_packaged_template_lists_built_in_skills(self):
+        template = load_template(Path(__file__).parents[1] / "assistant")
+        assert "### Built-in skills" in template
+        assert "`brainstorming`" in template
+        assert "`ponytail`" in template
 
     def test_load_template_missing_raises_runtime_error(self, tmp_path):
         with pytest.raises(RuntimeError, match="Cannot read template"):
