@@ -26,10 +26,14 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 - **Durable memory.** The assistant can save concise preferences and facts that
   survive `/new`, restarts, and scheduled runs. A capped digest is included in
   each system prompt. Values are limited to 2,048 characters; at most 200 keys.
+- **Prompt context.** Before each interactive turn and scheduled run, the prompt
+  includes the current manual, skills, memory, and a timestamp in `IMP_TZ` with
+  its UTC offset and timezone name. The timestamp is a snapshot for that turn.
 - **Self-configuring.** On first start it probes the machine and writes
   `<IMP_HOME>/AGENTS.md`, which shapes how it organises work (`scratch/`,
   `scripts/`, `projects/`, `outbox/`, `inbox/`). A model turn tailors the manual
-  without asking questions. Edits outside the generated block survive refresh.
+  without asking questions. Owner edits survive refresh; startup corrects exact
+  matches of obsolete default scheduling and plain-text reply guidance.
 - **Scheduled jobs.** `schedule_job` supports one-shot `at`/`at_local`, interval
   `every`, and five-field `cron` in `IMP_TZ`. APScheduler persists schedules in
   `state.db`. Each job gets a fresh context and cannot use `ask`. Jobs can run
@@ -79,6 +83,25 @@ or workspace content.
 The v2 assistant starts fresh. Existing v1 `state.json` and `jobs/*.json` are
 left untouched and not imported; recreate any schedules with `schedule_job`.
 To back up state, stop the bot and copy `state.db`.
+
+## Manual updates and recovery
+
+General behavior lives in `prompt.py`; tool usage lives in the tool definitions.
+`AGENTS.md` holds workspace conventions and owner instructions. New installations
+use the compact template. Existing manuals retain their custom content and are
+not replaced wholesale; merge the compact `AGENTS.md.template` manually if desired,
+preserving owner instructions and the generated environment block.
+
+Bootstrap corrects known old scheduling and reply-format wording on the next
+startup, including when the machine fingerprint has not changed. Customized
+wording is left alone. Installed skills are also preserved; the bundled skill
+edits apply to new installations or missing skill files.
+
+If bootstrap tailoring failed, it retries at the next startup. To force a fresh
+environment probe and tailoring pass, stop the bot, back up `state.db` and
+`AGENTS.md`, delete only the `fingerprint` row from the `kv` table in `state.db`,
+and restart. This preserves manual content outside the generated block; it does
+not replace the manual with a new template.
 
 ## Running it
 

@@ -60,6 +60,6 @@ to risk and run the project's required checks. A short implementation can still
 need several tests.
 
 Lead the Telegram reply with the result, followed by what was verified and any
-material limitation. Use concise plain text and provide more explanation when
+material limitation. Use concise Markdown and provide more explanation when
 requested. Deliver files the owner should have with `send_file`; include code
 in chat when the owner asks for it or a short snippet is the useful result.

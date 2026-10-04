@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import platform
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from ..tools import Tool
 
@@ -11,7 +12,8 @@ You are a pragmatic coding assistant operating in a ReAct loop:
 reason about the task, call tools to act, observe results, repeat.
 
 How you work:
-- Work only on the user's requested task.
+- Complete the user's requested task. You may briefly flag obvious adjacent issues in the final reply,
+  but investigate or fix them only when needed for the task or requested by the user.
 - Think in small, verifiable steps.
 - Use tools for facts. Do not guess file contents, command output, or web facts when you can inspect or search.
 - Inspect before changing: read relevant files and run read-only commands first.
@@ -19,7 +21,9 @@ How you work:
 - Verify meaningful changes: compile, run tests, linters, or the program itself.
 - Use web_search/web_fetch when you need current or external information.
 - Use skills when appropriate or requested by the user.
-- If a tool call fails, read the error, adapt, and try a different approach.
+- If a tool call fails, read the error and adapt. After 3 failed attempts at the same action
+  in a turn, including attempts with different tools, stop and report what you tried,
+  the blocker, and any unfinished work.
 - When the task is done, reply with markdown text and no tool calls.
 
 Reporting:
@@ -41,14 +45,15 @@ The list above shows only name and description — that's all you have until you
 """
 
 
-def _environment_block(workspace: str, fs_listing: list[str]) -> str:
+def _environment_block(workspace: str, fs_listing: list[str], timezone: str) -> str:
     listing = "".join(f"  - {entry}\n" for entry in fs_listing).rstrip()
+    now = datetime.now(UTC if timezone == "UTC" else ZoneInfo(timezone))
     return (
         "You are running with the following environment:\n"
-        f"- OS: {platform.system()} {platform.release()} ({platform.version()})\n"
+        f"- OS: {platform.system()} {platform.release()}\n"
         f"- Python: {platform.python_version()}\n"
         f"- Workspace: {workspace}\n"
-        f"- Current UTC datetime: {datetime.now(UTC).isoformat()}\n"
+        f"- Prompt generated at: {now.isoformat(timespec='seconds')} ({timezone})\n"
         "- Top-level workspace listing:\n"
         f"{listing}"
     )
@@ -65,13 +70,9 @@ def _format_skills(skills: list[tuple]) -> str:
     return "\n".join(lines)
 
 
-def _format_tool_descriptions(tools: dict[str, Tool]) -> str:
-    return "\n".join(f"- **{t.name}** - {t.description}" for t in tools.values())
-
-
 def _format_tool_instructions(tools: dict[str, Tool]) -> str:
     instructions = "\n".join(
-        f"- {t.instructions}" for t in tools.values() if t.instructions
+        f"- **{t.name}**: {t.instructions}" for t in tools.values() if t.instructions
     )
     return instructions if instructions.strip() else ""
 
@@ -83,12 +84,13 @@ def build_system_prompt(
     skills: list[tuple],
     context: str,
     base_prompt: str = BASE_PROMPT,
+    *,
+    timezone: str = "UTC",
 ) -> str:
     sections: list[str] = [base_prompt]
-    sections.append(f"## Environment\n{_environment_block(workspace, fs_listing)}")
+    sections.append(f"## Environment\n{_environment_block(workspace, fs_listing, timezone)}")
 
     if tools:
-        sections.append(f"## Available Tools\n{_format_tool_descriptions(tools)}")
         tool_instructions = _format_tool_instructions(tools)
         if tool_instructions:
             sections.append(f"## Tool Instructions\n{tool_instructions}")

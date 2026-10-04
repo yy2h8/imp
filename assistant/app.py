@@ -146,6 +146,7 @@ class AssistantApp:
             fs.list_skills(),
             fs.gather_project_context(),
             base_prompt=BASE_PROMPT,
+            timezone=self.assistant.tz,
         )
         digest = memory_digest_sync(self.assistant.home / STATE_DB_NAME)
         return prompt + memory_section(digest)
@@ -248,6 +249,7 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
                 fs.list_skills(),
                 fs.gather_project_context(),
                 base_prompt=BASE_PROMPT,
+                timezone=assistant_config.tz,
             ) + memory_section(await memory_digest(db))
             session = Session.open(
                 imp_config, system_prompt, assistant_config.home / STATE_DB_NAME

@@ -71,13 +71,14 @@ async def test_build_assistant_pins_openrouter_and_wires_stt(tmp_path, monkeypat
     from assistant.adapters.stt import SttClient
     from assistant.app import build_assistant
 
-    make_config(tmp_path, monkeypatch, OPENAI_MODEL="openai/gpt-5-mini")
+    make_config(tmp_path, monkeypatch, OPENAI_MODEL="openai/gpt-5-mini", IMP_TZ="Asia/Tokyo")
     assistant_config = AssistantConfig.from_env()
 
     async with build_assistant(assistant_config, 7) as app:
         assert app.config.base_url == "https://openrouter.ai/api/v1"
         assert app.config.model == "openai/gpt-5-mini"  # env var respected now
         assert app.config.workspace == tmp_path
+        assert "Asia/Tokyo" in app.session.context.messages[0].content
         assert isinstance(app.uploads.stt, SttClient)
         assert app.uploads.stt.model == "openai/whisper-large-v3-turbo"
         assert (tmp_path / "inbox").is_dir()

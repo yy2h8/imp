@@ -32,8 +32,8 @@ software. Match the depth to the decision, not to a fixed process.
 
 ## Fit the Telegram conversation
 
-- Use short paragraphs and compact numbered choices. Messages are plain text;
-  avoid tables, rendered diagrams, or formatting that needs a rich interface.
+- Use short Markdown paragraphs and compact numbered choices. Prefer lists to
+  wide tables or diagrams that are hard to read on a phone.
 - When a follow-up question would help, put it at the end of the final reply
   and end the turn. The owner can continue in another message.
 - Reserve `ask` for essential information needed before an authorized action

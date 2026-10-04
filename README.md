@@ -111,8 +111,9 @@ user prompt ─▶ model ─▶ tool calls ─▶ tool results ─▶ model ─�
   the turn aborts when usage crosses 95% of the budget, and oversized tool
   output is truncated before entering the context.
 - **System prompt**: assembled at startup from the base prompt, environment,
-  tool list and per-tool instructions, discovered skills, and
-  `AGENTS.md`/`CLAUDE.md` if present.
+  per-tool instructions, discovered skills, and `AGENTS.md`/`CLAUDE.md` if present.
+  Tool names, descriptions, and argument schemas are sent separately with each
+  model request.
 - **Persistence**: every message is appended to
   `.imp/sessions/<timestamp>-<id>.jsonl` (persistence only — the agent
   always runs from the in-memory context).

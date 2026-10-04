@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfoNotFoundError
 
 from assistant.prompt import memory_section
 from imp.agent.prompt import build_system_prompt
@@ -32,11 +33,13 @@ def test_environment_section():
     assert "a.py" in prompt
 
 
-def test_tool_sections():
-    prompt = build(tools={"fake": FakeTool()})
-    assert "## Available Tools" in prompt
-    assert "**fake** - a fake tool" in prompt
-    assert "## Tool Instructions" not in prompt
+def test_default_timezone_needs_no_timezone_database(monkeypatch):
+    def unavailable(key):
+        raise ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr("imp.agent.prompt.ZoneInfo", unavailable)
+    prompt = build()
+    assert "+00:00 (UTC)" in prompt
 
 
 def test_tool_instructions_section():

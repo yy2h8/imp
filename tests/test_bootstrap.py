@@ -223,6 +223,40 @@ class TestRunBootstrap:
         assert (home / "AGENTS.md").read_text() == "hand-edited manual"
 
     @pytest.mark.parametrize("force", [False, True])
+    def test_upgrade_corrects_old_guidance_without_losing_owner_edits(
+        self, tmp_path, package_dir, force
+    ):
+        probe = make_probe()
+        run_bootstrap(tmp_path, package_dir, probe=probe)
+        manual = tmp_path / "AGENTS.md"
+        owner_text = "\n## Owner preferences\n\nKeep replies in Russian.\n"
+        manual.write_text(manual.read_text() + (
+            "\nSchedules are persisted by APScheduler in `state.db`; never edit scheduler data\n"
+            "directly. Exactly one of `at` (ISO timestamp with offset), `at_local` (the\n"
+            "owner's wall time, resolved via `IMP_TZ`), `every` (interval seconds), or\n"
+            "`cron` (five-field cron expression in `IMP_TZ`) is required.\n"
+            "- When the task is done, reply with your final answer as plain text and no tool\n"
+            "  calls.\n"
+            "- Final messages are plain text. Preserve code and whitespace; do not rely on rich formatting.\n"
+            "  Prefer short paragraphs and compact lists over long prose.\n"
+        ) + owner_text)
+        write_state(tmp_path, {"tailored": True})
+
+        result = run_bootstrap(tmp_path, package_dir, probe=probe, force=force)
+
+        updated = manual.read_text()
+        assert "schedule_job tool schema" in updated
+        assert "Exactly one of `at`" not in updated
+        assert "plain text" not in updated
+        assert "Markdown" in updated
+        assert updated.endswith(owner_text)
+        assert "keep this" in updated
+        assert result.changed is force
+        assert read_state(tmp_path)["tailored"] is not force
+        run_bootstrap(tmp_path, package_dir, probe=probe)
+        assert manual.read_text() == updated
+
+    @pytest.mark.parametrize("force", [False, True])
     def test_refresh_preserves_owner_edits_and_requires_tailoring(
         self, tmp_path, package_dir, force
     ):
@@ -306,11 +340,10 @@ class TestRunBootstrap:
         assert result.changed is False
         assert installed.read_text() == "bundled skill"
 
-    def test_packaged_template_lists_built_in_skills(self):
-        template = load_template(Path(__file__).parents[1] / "assistant")
-        assert "### Built-in skills" in template
-        assert "`brainstorming`" in template
-        assert "`ponytail`" in template
+    def test_packaged_skills_are_discovered_after_bootstrap(self, tmp_path):
+        run_bootstrap(tmp_path, Path(__file__).parents[1] / "assistant", probe=make_probe())
+        skills = FileSystemAdapter(tmp_path, skills_dir="skills").list_skills()
+        assert {name for name, _description, _path in skills} == {"brainstorming", "ponytail"}
 
     def test_load_template_missing_raises_runtime_error(self, tmp_path):
         with pytest.raises(RuntimeError, match="Cannot read template"):

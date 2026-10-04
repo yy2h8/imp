@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from test_agent import StubClient, message_item, response, usage_ns
@@ -100,6 +101,34 @@ async def test_turn_summary_and_cost_are_recorded(app):
     assert "$0.0042" in app.bot.edits[-1]
     assert app.bot.sent[-1] == "answer"
     assert turn_summary(3, 47, True, 0.0134) == "✓ done · 3 tools · 47 s · $0.0134"
+
+
+async def test_turn_prompt_refreshes_local_time_without_losing_history(app, monkeypatch):
+    now = datetime(2026, 10, 4, 14, 59, tzinfo=UTC)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr("imp.agent.prompt.datetime", Clock)
+    app.assistant.tz = "Asia/Tokyo"
+    app.agent.client = StubClient([
+        response([message_item("first answer")]),
+        response([message_item("second answer")]),
+    ])
+    runner = TurnRunner(app, app.bot, 0, 3500)
+    await runner.run("first request")
+    now = datetime(2026, 10, 4, 15, 1, tzinfo=UTC)
+    await runner.run("second request")
+
+    first, second = app.agent.client.calls
+    assert "2026-10-04T23:59:00+09:00" in first["input"][0]["content"]
+    assert "2026-10-05T00:01:00+09:00" in second["input"][0]["content"]
+    assert "Asia/Tokyo" in second["input"][0]["content"]
+    assert [item["content"] for item in second["input"][1:]] == [
+        "first request", [{"type": "output_text", "text": "first answer"}], "second request"
+    ]
 
 
 async def test_turn_records_tokens_even_when_provider_omits_cost(app):

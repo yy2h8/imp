@@ -37,7 +37,11 @@ def _clean_html(raw_html: str) -> str:
 class WebFetch(Tool):
     name = "web_fetch"
     description = "Fetch a specific web page content by URL."
-    instructions = "When using web_fetch, the content is cleaned of scripts, styles, and comments to provide a clear view of the page's main content."
+    instructions = (
+        "Plain HTTP GET; no JavaScript or login, and internal addresses are refused. "
+        "Scripts, styles, and comments are removed. If a page requires interaction, "
+        "report the limitation instead of repeating the same fetch."
+    )
     parameters: ClassVar[dict[str, Any]] = {
         "url": {
             "type": "string",
