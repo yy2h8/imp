@@ -108,6 +108,31 @@ def test_pending_ask_reply_stays_plain_answer():
     assert routed.answer == "yes"
 
 
+def test_cancel_is_a_command_even_while_ask_pending():
+    routed = route_message(
+        message(text="/cancel"),
+        owner_id=7,
+        question_pending=True,
+        busy=True,
+    )
+    assert routed.command == "/cancel"
+    assert routed.answer is None
+
+
+def test_cancel_is_never_wrapped_in_reply_quote():
+    routed = route_message(
+        message(
+            text="/cancel",
+            reply_to_message={"from": {"id": 999}, "text": "long running task"},
+        ),
+        owner_id=7,
+        question_pending=False,
+        busy=True,
+    )
+    assert routed.command == "/cancel"
+    assert routed.text == "/cancel"
+
+
 def test_route_structured_owner_message_instead_of_silently_ignoring():
     routed = route_message(
         message(location={"latitude": 51.5, "longitude": -0.1}),

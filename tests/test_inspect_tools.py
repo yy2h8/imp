@@ -53,6 +53,53 @@ async def test_list_jobs_joins_next_fire_with_metadata(db, tmp_path):
     assert "orphan" in result.content
 
 
+
+async def test_list_jobs_appends_last_run_summary_from_transcript(db, tmp_path):
+    await turn_insert(
+        db,
+        ts=datetime.now(UTC).isoformat(),
+        kind="job",
+        session_id="sess-9",
+        model="m",
+        in_tokens=10,
+        out_tokens=5,
+        cost_usd=0.02,
+        tools=2,
+        seconds=12,
+        ok=True,
+    )
+    await jobs_meta_upsert(
+        db,
+        schedule_id="daily",
+        label="Daily report",
+        prompt="p",
+        tz="UTC",
+        state="scheduled",
+        transcript="sess-9",
+    )
+    result = await ListJobs(
+        config=Config(api_key="k", workspace=tmp_path), db=db, scheduler=None
+    ).execute()
+    assert result.ok
+    assert "last run: ✓ done · 2 tools · 12 s · $0.0200" in result.content
+
+
+async def test_list_jobs_without_transcript_has_no_last_run(db, tmp_path):
+    await jobs_meta_upsert(
+        db,
+        schedule_id="one-shot",
+        label="once",
+        prompt="p",
+        tz="UTC",
+        state="done",
+    )
+    result = await ListJobs(
+        config=Config(api_key="k", workspace=tmp_path), db=db, scheduler=None
+    ).execute()
+    assert result.ok
+    assert "last run:" not in result.content
+
+
 async def test_search_transcripts_finds_and_misses(db, tmp_path):
     await db.execute(
         "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",

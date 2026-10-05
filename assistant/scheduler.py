@@ -28,6 +28,7 @@ from imp.agent import Agent, Context, EventType
 from imp.tools.ask import Ask
 
 from .adapters.telegram import send_text
+from .adapters.ui import turn_summary
 from .db import STATE_DB_NAME, jobs_meta_running, jobs_meta_update, turn_insert
 from .outbox import Outbox
 from .transcripts import DbSessionWriter
@@ -99,13 +100,14 @@ async def run_scheduled_job(schedule_id: str, prompt: str) -> None:
         await jobs_meta_update(ctx.db, schedule_id, state="running")
         _LOG.info("job %s started", schedule_id)
         try:
-            result, session_id = await _execute(ctx, schedule_id, prompt)
+            result, session_id, summary = await _execute(ctx, schedule_id, prompt)
         except Exception as exc:
             _LOG.warning("job %s failed: %s", schedule_id, exc)
             result = f"Job {schedule_id} failed: {exc}"
             await jobs_meta_update(
                 ctx.db, schedule_id, state="error", result=result
             )
+            await ctx.outbox.submit(f"⏰ {schedule_id}\n\n{result}")
         else:
             state = (
                 "scheduled" if _recurring(ctx.scheduler, schedule_id) else "done"
@@ -117,14 +119,14 @@ async def run_scheduled_job(schedule_id: str, prompt: str) -> None:
                 result=result,
                 transcript=session_id,
             )
-        await ctx.outbox.submit(f"⏰ {schedule_id}\n\n{result}")
+            await ctx.outbox.submit(f"⏰ {schedule_id}\n\n{result}\n\n{summary}")
         await jobs_meta_update(ctx.db, schedule_id, delivery="queued")
         _LOG.info("job %s finished; result queued for delivery", schedule_id)
 
 
-async def _execute(ctx: JobContext, schedule_id: str, prompt: str) -> tuple[str, str]:
+async def _execute(ctx: JobContext, schedule_id: str, prompt: str) -> tuple[str, str, str]:
     """Fresh context, no interactive questions; records the turns row.
-    Returns (answer, session_id)."""
+    Returns (answer, session_id, run summary)."""
     started = time.monotonic()
     system_prompt = ctx.app.build_prompt() + NON_INTERACTIVE_SUFFIX
     writer = DbSessionWriter(ctx.db_path)
@@ -165,7 +167,9 @@ async def _execute(ctx: JobContext, schedule_id: str, prompt: str) -> tuple[str,
         except Exception:
             ok = False
             raise
-        return answer, writer.session_id
+        return answer, writer.session_id, turn_summary(
+            tools, int(time.monotonic() - started), True, cost
+        )
     finally:
         await turn_insert(
             ctx.db,

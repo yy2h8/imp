@@ -8,6 +8,7 @@ by ``PRAGMA user_version``: each version's DDL is idempotent, applied once.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -341,6 +342,20 @@ async def turns_report(conn: aiosqlite.Connection, period: str) -> dict:
     }
 
 
+async def turn_last_by_session(
+    conn: aiosqlite.Connection, session_id: str
+) -> dict | None:
+    """Newest turns row for a session (jobs_meta.transcript holds the id)."""
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        "SELECT ts, cost_usd, tools, seconds, ok FROM turns "
+        "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 async def jobs_meta_upsert(
     conn: aiosqlite.Connection,
     *,
@@ -431,3 +446,32 @@ async def transcript_search(
         (query, limit),
     ) as cur:
         return [(row[0], row[1]) for row in await cur.fetchall()]
+
+
+def _assistant_text(data: dict) -> str:
+    content = data.get("content")
+    if isinstance(content, str):
+        return content
+    return "".join(
+        part.get("text", "")
+        for part in content or []
+        if part.get("type") == "output_text"
+    )
+
+
+async def transcript_last_reply(
+    conn: aiosqlite.Connection, session_id: str
+) -> tuple[str, str] | None:
+    """(ts, text) of the newest assistant text message in a session, or None."""
+    async with conn.execute(
+        "SELECT ts, message FROM transcripts WHERE session_id = ? ORDER BY seq DESC",
+        (session_id,),
+    ) as cur:
+        async for ts, raw in cur:
+            data = json.loads(raw)
+            if data.get("role") != "assistant":
+                continue
+            text = _assistant_text(data)
+            if text.strip():
+                return ts, text
+    return None

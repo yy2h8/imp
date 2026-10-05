@@ -98,7 +98,9 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
 
-        assert outbox.items == ["⏰ j1\n\nvaluable result"]
+        assert outbox.items[0].startswith("⏰ j1\n\nvaluable result\n\n")
+        assert "✓ done · 0 tools ·" in outbox.items[0]
+        assert "$0.0100" in outbox.items[0]
         meta = await jobs_meta_get(conn, "j1")
         assert meta["state"] == "done"  # one-shot: not rescheduled
         assert meta["result"] == "valuable result"

@@ -11,10 +11,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from imp.tools.base import Tool, ToolResult
 
+from ..adapters.ui import turn_summary
 from ..db import (
     jobs_meta_list,
     queue_count_waiting,
     transcript_search,
+    turn_last_by_session,
     turns_report,
 )
 
@@ -27,7 +29,9 @@ def _need_db(db: aiosqlite.Connection | None) -> ToolResult | None:
 
 class ListJobs(Tool):
     name = "list_jobs"
-    description = "List scheduled jobs, their next fire time and last result."
+    description = (
+        "List scheduled jobs, their next fire time, last result and last run cost."
+    )
     parameters: ClassVar[dict[str, Any]] = {}
     required: ClassVar[list[str]] = []
 
@@ -50,6 +54,21 @@ class ListJobs(Tool):
         if not scheduled and not metadata:
             return ToolResult(ok=True, content="No scheduled jobs.")
         lines = []
+
+        async def _last_run(row: dict) -> str:
+            transcript = row.get("transcript") or ""
+            if not transcript:
+                return ""
+            turn = await turn_last_by_session(self.db, transcript)
+            if turn is None:
+                return ""
+            return " · last run: " + turn_summary(
+                int(turn["tools"]),
+                int(turn["seconds"]),
+                bool(turn["ok"]),
+                turn["cost_usd"],
+            )
+
         for job in scheduled:
             row = metadata.get(job.id, {})
             next_run = getattr(job, "next_run_time", None)
@@ -61,6 +80,7 @@ class ListJobs(Tool):
                 f"{job.id} · {state} · {next_text}"
                 + (f" · {label}" if label else "")
                 + (f" · last: {result}" if result else "")
+                + await _last_run(row)
             )
         for schedule_id, row in metadata.items():
             if schedule_id not in {job.id for job in scheduled}:
@@ -69,6 +89,7 @@ class ListJobs(Tool):
                     f"{schedule_id} · {row['state']}"
                     + (f" · {row['label']}" if row.get("label") else "")
                     + (f" · last: {result}" if result else "")
+                    + await _last_run(row)
                 )
         return ToolResult(ok=True, content="\n".join(lines))
 

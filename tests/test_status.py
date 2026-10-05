@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from assistant.app import CurrentTurn
 from assistant.config import OPENROUTER_BASE_URL
-from assistant.db import jobs_meta_upsert, open_db
+from assistant.db import jobs_meta_upsert, open_db, queue_push
 from assistant.status import (
     NO_JOBS,
     UNAVAILABLE,
     _jobs_lines,
+    _turn_lines,
     collect_status,
     format_tokens,
     host_summary,
@@ -250,3 +253,102 @@ async def test_collect_status_never_leaks_the_api_key(tmp_path):
     http = FakeHttp({CREDITS_URL: RuntimeError("boom sk-test-secret")})
     summary = await collect_status(fake_app(tmp_path, http=http))
     assert "sk-test-secret" not in summary
+
+
+
+
+async def test_turn_lines_running_turn_with_activity(tmp_path):
+    current = CurrentTurn(
+        prompt="очень длинный запрос " * 20,
+        started_monotonic=time.monotonic() - 90,
+        started_at=datetime.now(UTC),
+        tools=3,
+        activity="shell tar -czf x.tgz",
+        last_reply="partial progress",
+        last_reply_at=datetime(2026, 9, 30, 12, 0, tzinfo=UTC),
+    )
+    lines = await _turn_lines(fake_app(tmp_path, current_turn=current), TZ)
+    assert lines[0].startswith("▶ Текущий ход — 1 мин ")
+    assert lines[1].startswith("«очень длинный запрос") and lines[1].endswith("…»")
+    assert "инструментов: 3 · сейчас: shell tar -czf x.tgz" in lines[2]
+    assert "ответ модели 17:00 «partial progress»" in lines[3]
+
+
+async def test_turn_lines_waiting_for_model_answer(tmp_path):
+    current = CurrentTurn(
+        prompt="short",
+        started_monotonic=time.monotonic(),
+        started_at=datetime.now(UTC),
+    )
+    lines = await _turn_lines(
+        fake_app(
+            tmp_path,
+            current_turn=current,
+            ask_router=SimpleNamespace(pending=True),
+        ),
+        TZ,
+    )
+    assert lines[0].startswith("▶ Текущий ход — 0 с")
+    assert "сейчас: ожидание ответа модели" in lines[1 + 1]
+    assert any("ждёт вашего ответа" in line for line in lines)
+
+
+async def test_turn_lines_idle_shows_last_reply_in_owner_tz(tmp_path):
+    import json
+
+
+    db = await open_db(tmp_path / "state.db")
+    await db.execute(
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+        (
+            "s1",
+            1,
+            "2026-01-01T05:00:00+00:00",
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ),
+        ),
+    )
+    await db.commit()
+    app = fake_app(
+        tmp_path,
+        db=db,
+        session=SimpleNamespace(writer=SimpleNamespace(session_id="s1", name="s1")),
+    )
+    lines = await _turn_lines(app, TZ)
+    await db.close()
+    assert lines == ["💬 Последний ответ 01.01 10:00: «done»"]
+
+
+
+
+async def test_turn_lines_running_job_and_queue_depth(tmp_path):
+    db = await open_db(tmp_path / "state.db")
+    await jobs_meta_upsert(
+        db,
+        schedule_id="job-1",
+        label="ежедневный отчёт с очень длинным названием",
+        prompt="p",
+        tz="UTC",
+        state="running",
+    )
+    await queue_push(db, "text", "one")
+    await queue_push(db, "text", "two")
+    lines = await _turn_lines(fake_app(tmp_path, db=db), TZ)
+    assert any(
+        line.startswith("⏳ Фоновое задание: ") and " — идёт " in line
+        for line in lines
+    )
+    await db.close()
+
+
+async def test_turn_lines_idle_without_db_or_history_is_empty(tmp_path):
+    app = fake_app(
+        tmp_path,
+        session=SimpleNamespace(writer=SimpleNamespace(session_id="fresh", name="f")),
+    )
+    assert await _turn_lines(app, TZ) == []

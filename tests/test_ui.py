@@ -8,6 +8,7 @@ from assistant.adapters.ui import (
     STATUS_LINES,
     StatusBuffer,
     TelegramUIAdapter,
+    tool_label,
     tool_subject,
     turn_summary,
 )
@@ -114,6 +115,19 @@ class TestToolSubject:
         assert tool_subject("memory_set", {"key": "server"}) == "server"
         assert tool_subject("cost_report", {"period": "week"}) == "week"
         assert tool_subject("unknown_tool", None) == ""
+
+
+
+class TestToolLabel:
+    def test_short_name_plus_subject(self):
+        label = tool_label("run_shell", {"command": "tar -czf x.tgz dir"})
+        assert label == "shell tar -czf x.tgz dir"
+
+    def test_unknown_tool_uses_truncated_name(self):
+        assert tool_label("very_long_tool_name", None) == "very_lon"
+
+    def test_none_name_is_empty(self):
+        assert tool_label(None, None) == ""
 
 
 class FakeBot:

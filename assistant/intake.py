@@ -91,6 +91,9 @@ def _reply_context(message: dict) -> str:
     return f"[replied to a {kind} message]" if kind else "[replied to a message]"
 
 
+COMMANDS = frozenset({"/new", "/status", "/cancel"})
+
+
 def _command(text: str) -> str:
     return text.split()[0].lower() if text.split() else ""
 
@@ -131,15 +134,15 @@ def route_message(
     text = str(message.get("text") or "").strip()
     if text:
         command = _command(text)
-        if question_pending and command not in {"/new", "/status"}:
+        if question_pending and command not in COMMANDS:
             return Routed(answer=text)
         quoted = _reply_context(message)
-        if quoted and command not in {"/new", "/status"}:
+        if quoted and command not in COMMANDS:
             text = (
                 "Owner replied to this message:\n"
                 f"{quoted}\n\nOwner's reply:\n{text}"
             )
-        return Routed(command=command if command in {"/new", "/status"} else None, text=text)
+        return Routed(command=command if command in COMMANDS else None, text=text)
     attachment = normalize_attachment(message)
     if attachment is not None:
         return Routed(attachment=attachment)

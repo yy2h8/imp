@@ -26,8 +26,10 @@ from assistant.db import (
     queue_finish,
     queue_interrupted,
     queue_push,
+    transcript_last_reply,
     transcript_search,
     turn_insert,
+    turn_last_by_session,
     turns_report,
 )
 
@@ -250,3 +252,97 @@ async def test_transcript_search(db):
         )
     await db.commit()
     assert len(await transcript_search(db, "armbian")) == 10  # default limit
+
+
+
+
+async def test_transcript_last_reply_returns_latest_assistant_text(db):
+    import json
+
+
+    async def insert(session: str, seq: int, message: dict, ts: str) -> None:
+        await db.execute(
+            "INSERT INTO transcripts(session_id, seq, ts, message) VALUES "
+            "(?, ?, ?, ?)",
+            (session, seq, ts, json.dumps(message)),
+        )
+
+
+    await insert(
+        "s1", 0, {"role": "user", "content": "deploy it"}, "2026-01-01T00:00:00+00:00"
+    )
+    await insert(
+        "s1",
+        1,
+        {"role": "assistant", "content": "working on it"},
+        "2026-01-01T00:00:05+00:00",
+    )
+    await insert(
+        "s1",
+        2,
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}],
+        },
+        "2026-01-01T00:00:09+00:00",
+    )
+    await insert(
+        "s1",
+        3,
+        {"type": "function_call_output", "call_id": "c1", "output": "x"},
+        "2026-01-01T00:00:12+00:00",
+    )
+    await db.commit()
+    assert await transcript_last_reply(db, "s1") == (
+        "2026-01-01T00:00:09+00:00",
+        "done",
+    )
+
+
+async def test_transcript_last_reply_skips_empty_and_missing(db):
+    import json
+
+
+    await db.execute(
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+        (
+            "s1",
+            0,
+            "2026-01-01T00:00:00+00:00",
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "  "}],
+                }
+            ),
+        ),
+    )
+    await db.commit()
+    assert await transcript_last_reply(db, "s1") is None
+    assert await transcript_last_reply(db, "unknown") is None
+
+
+async def test_turn_last_by_session_returns_newest_row(db):
+    from datetime import UTC, datetime
+
+
+    for i, seconds in enumerate((11, 42)):
+        await turn_insert(
+            db,
+            ts=datetime.now(UTC).isoformat(),
+            kind="job",
+            session_id="sess",
+            model="m",
+            in_tokens=1,
+            out_tokens=1,
+            cost_usd=0.02 * i,
+            tools=i,
+            seconds=seconds,
+            ok=i == 1,
+        )
+    newest = await turn_last_by_session(db, "sess")
+    assert newest is not None
+    assert newest["seconds"] == 42 and newest["tools"] == 1 and newest["ok"] == 1
+    assert await turn_last_by_session(db, "unknown") is None

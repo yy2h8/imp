@@ -11,23 +11,25 @@ import json
 import logging
 import os
 import shutil
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiosqlite
 
 from .config import OPENROUTER_BASE_URL
-from .db import jobs_meta_list
+from .db import jobs_meta_list, queue_count_waiting, transcript_last_reply
 
 _LOG = logging.getLogger(__name__)
 
 UNAVAILABLE = "недоступен"
 NO_JOBS = "нет активных заданий"
+_KIB = 1024 * 1024  # /proc/meminfo kB → GiB
 BALANCE_TIMEOUT_S = 10.0
 LABEL_LIMIT = 40
 JOBS_SHOWN = 3
-_KIB = 1024 * 1024  # /proc/meminfo kB → GiB
+PREVIEW = 80
 
 
 def format_tokens(used: int, maximum: int) -> str:
@@ -85,6 +87,75 @@ async def _jobs_lines(
     return lines
 
 
+def _elapsed(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s} с"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} мин {s} с"
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин"
+
+
+def _clip(text: str, limit: int = PREVIEW) -> str:
+    line = " ".join(text.split())
+    return line[:limit] + ("…" if len(line) > limit else "")
+
+
+async def _turn_lines(app, tz: ZoneInfo) -> list[str]:
+    lines: list[str] = []
+    current = getattr(app, "current_turn", None)
+    if current is not None:
+        lines.append(
+            f"▶ Текущий ход — {_elapsed(time.monotonic() - current.started_monotonic)}"
+        )
+        lines.append(f"«{_clip(current.prompt)}»")
+        lines.append(
+            f"инструментов: {current.tools} · "
+            f"сейчас: {current.activity or 'ожидание ответа модели'}"
+        )
+        if current.last_reply:
+            stamp = current.last_reply_at.astimezone(tz) if current.last_reply_at else None
+            when = f"{stamp:%H:%M} " if stamp else ""
+            lines.append(f"ответ модели {when}«{_clip(current.last_reply)}»")
+    ask_router = getattr(app, "ask_router", None)
+    if getattr(ask_router, "pending", False):
+        lines.append("⏸ Ход ждёт вашего ответа на вопрос (ответьте обычным сообщением)")
+    if app.db is not None:
+        try:
+            for row in await jobs_meta_list(app.db):
+                if row.get("state") != "running":
+                    continue
+                label = " ".join((row.get("label") or row["schedule_id"]).split())
+                if len(label) > LABEL_LIMIT:
+                    label = label[:LABEL_LIMIT] + "…"
+                updated = datetime.fromisoformat(row["updated_at"])
+                lines.append(
+                    f"⏳ Фоновое задание: {label} — идёт "
+                    f"{_elapsed((datetime.now(UTC) - updated).total_seconds())}"
+                )
+        except Exception:
+            _LOG.warning("running-jobs section failed", exc_info=True)
+    if current is None and getattr(app, "session", None) is not None:
+        try:
+            last = await transcript_last_reply(app.db, app.session.writer.session_id)
+        except Exception:
+            last = None
+        if last is not None:
+            ts, text = last
+            local = datetime.fromisoformat(ts).astimezone(tz)
+            lines.append(f"💬 Последний ответ {local:%d.%m %H:%M}: «{_clip(text)}»")
+    if app.db is not None:
+        try:
+            waiting = await queue_count_waiting(app.db)
+        except Exception:
+            waiting = 0
+        if waiting:
+            lines.append(f"📥 В очереди: {waiting}")
+    return lines
+
+
 async def collect_status(app, now: datetime | None = None) -> str:
     try:
         return await _collect(app, now)
@@ -112,6 +183,12 @@ async def _collect(app, now: datetime | None) -> str:
         lines.extend(await _jobs_lines(app.scheduler, app.db, tz))
     except Exception:
         _LOG.warning("jobs section failed", exc_info=True)
+        lines.append(UNAVAILABLE)
+    lines.append("")
+    try:
+        lines.extend(await _turn_lines(app, tz))
+    except Exception:
+        _LOG.warning("turn section failed", exc_info=True)
         lines.append(UNAVAILABLE)
     lines.append("")
     try:

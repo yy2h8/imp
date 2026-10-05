@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from test_agent import StubClient, message_item, response, usage_ns
@@ -85,6 +86,104 @@ def owner_message(text: str, message_id: int = 1, user_id: int = 7) -> dict:
         "chat": {"id": user_id, "type": "private"},
         "text": text,
     }
+
+
+class GatedClient:
+    """StubClient whose model call blocks on a gate the test controls."""
+
+    def __init__(self, script: list, gate: asyncio.Event) -> None:
+        self.script = list(script)
+        self.gate = gate
+        self.calls = 0
+        self.responses = SimpleNamespace(create=self._create)
+
+    async def _create(self, **kwargs):
+        self.calls += 1
+        await self.gate.wait()
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+async def wait_for_turn(app) -> None:
+    for _ in range(500):
+        if app.current_turn is not None:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("turn never started")
+
+
+async def queue_rows(app) -> int:
+    rows = await app.db.execute_fetchall("SELECT COUNT(*) FROM queue")
+    return rows[0][0]
+
+
+async def test_status_answers_immediately_while_turn_in_flight(app):
+    gate = asyncio.Event()
+    app.agent.client = GatedClient([response([message_item("answer")])], gate)
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("long task", message_id=31))
+    await wait_for_turn(app)
+    await controller.handle_message(owner_message("/status", message_id=32))
+    assert any("Статус" in text for text in app.bot.sent)
+    assert any("Текущий ход" in text for text in app.bot.sent)
+    assert any("ожидание ответа модели" in text for text in app.bot.sent)
+    assert not any("Принято — в очереди" in text for text in app.bot.sent)
+    assert await queue_rows(app) == 1  # the active work row only
+    gate.set()
+    await controller.wait_idle()
+    await controller.close()
+
+
+async def test_cancel_mid_turn_records_and_resumes_queue(app):
+    gate = asyncio.Event()
+    app.agent.client = GatedClient(
+        [response([message_item("second answer")], usage=usage_ns(5, 2, 7, 0.001))],
+        gate,
+    )
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("first request", message_id=41))
+    await wait_for_turn(app)
+    await controller.handle_message(owner_message("second request", message_id=42))
+    await controller.handle_message(owner_message("/cancel", message_id=43))
+    assert app.bot.sent[-1] == "⇥ Отменяю текущий ход…"
+    gate.set()
+    await controller.wait_idle()
+    assert await queue_rows(app) == 0
+    outcomes = [
+        row[0]
+        for row in await app.db.execute_fetchall("SELECT ok FROM turns ORDER BY id")
+    ]
+    assert outcomes[0] == 0  # cancelled turn recorded as not-ok
+    assert any("отменён" in text for text in app.bot.edits)
+    assert app.current_turn is None
+    assert any("second answer" in text for text in app.bot.sent)
+    assert not app.turn_state["active"]
+    await controller.close()
+
+
+async def test_cancel_with_no_active_turn_is_rejected(app):
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("/cancel", message_id=51))
+    assert app.bot.sent[-1] == "Отменять нечего: сейчас нет активного хода."
+    await controller.close()
+
+
+async def test_new_is_refused_while_turn_active(app):
+    gate = asyncio.Event()
+    app.agent.client = GatedClient([response([message_item("answer")])], gate)
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("work", message_id=61))
+    await wait_for_turn(app)
+    previous = app.session.writer.name
+    await controller.handle_message(owner_message("/new", message_id=62))
+    assert "/new недоступен" in app.bot.sent[-1]
+    assert await queue_rows(app) == 1  # the active work row only
+    assert app.session.writer.name == previous
+    gate.set()
+    await controller.wait_idle()
+    await controller.close()
 
 
 async def test_turn_summary_and_cost_are_recorded(app):
@@ -229,5 +328,6 @@ async def test_command_status_and_new_are_direct_not_model_turns(app):
     await controller.wait_idle()
     assert "Started a fresh session" in app.bot.sent[-1]
     assert app.session.writer.name != previous
-    assert await app.db.execute_fetchall("SELECT COUNT(*) FROM turns") == [(0,)]
+    rows = await app.db.execute_fetchall("SELECT COUNT(*) FROM turns")
+    assert rows[0][0] == 0  # commands never reach the model
     await controller.close()

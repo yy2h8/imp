@@ -17,8 +17,8 @@ from telegram import Message
 from imp.events import EventType
 
 from .adapters.telegram import TelegramBot, TelegramError, send_text
-from .adapters.ui import TelegramUIAdapter, turn_summary
-from .app import RESET_NOTICE, AssistantApp, build_assistant, ensure_home
+from .adapters.ui import TelegramUIAdapter, tool_label, turn_summary
+from .app import RESET_NOTICE, AssistantApp, CurrentTurn, build_assistant, ensure_home
 from .bootstrap import (
     needs_tailoring,
     prune_scratch,
@@ -50,6 +50,9 @@ def _preview(text: str, limit: int = 60) -> str:
 
 def command_token(text: str) -> str:
     return text.split()[0].lower() if text.split() else ""
+
+
+_DIRECT_COMMANDS = frozenset({"/status", "/cancel", "/new"})
 
 
 class TurnRunner:
@@ -89,6 +92,7 @@ class TurnRunner:
 
     async def _command(self, prompt: str) -> str | None:
         if command_token(prompt) == "/status":
+            # legacy: /status queued by an older version before the fast-path
             return await collect_status(self.app)
         return await asyncio.to_thread(self._command_reply, prompt)
 
@@ -112,6 +116,11 @@ class TurnRunner:
     async def _agent_turn(self, prompt: str) -> None:
         started = time.monotonic()
         started_at = datetime.now(UTC).isoformat()
+        self.app.current_turn = CurrentTurn(
+            prompt=_preview(prompt, 100),
+            started_monotonic=started,
+            started_at=datetime.now(UTC),
+        )
         ui = TelegramUIAdapter(
             self.bot,
             self.app.chat_id,
@@ -122,6 +131,7 @@ class TurnRunner:
         typing = asyncio.create_task(self._keep_typing())
         tools = 0
         error: str | None = None
+        cancelled = False
         reply = ""
         in_tokens = out_tokens = 0
         reported_cost = 0.0
@@ -132,11 +142,18 @@ class TurnRunner:
                 async for event in events:
                     if event.type is EventType.TOOL_START:
                         tools += 1
+                        self.app.current_turn.tools = tools
+                        self.app.current_turn.activity = tool_label(
+                            event.tool_name, event.tool_args
+                        )
                         _LOG.info("tool: %s", event.tool_name)
                     elif event.type is EventType.ERROR:
                         error = event.error_message or "Turn failed"
                     elif event.type is EventType.MODEL_RESPONSE:
                         reply = event.quote or ""
+                        if reply:
+                            self.app.current_turn.last_reply = _preview(reply, 100)
+                            self.app.current_turn.last_reply_at = datetime.now(UTC)
                         saw_model_response = True
                         if event.usage is None:
                             cost_complete = False
@@ -149,14 +166,17 @@ class TurnRunner:
                                 reported_cost += event.usage.cost_usd
                     await ui.handle(event)
                     await ui.flush()
+        except asyncio.CancelledError:
+            cancelled = True
         except Exception as exc:
             error = str(exc)
         finally:
             typing.cancel()
             await asyncio.gather(typing, return_exceptions=True)
+            self.app.current_turn = None
 
         seconds = int(time.monotonic() - started)
-        ok = error is None
+        ok = error is None and not cancelled
         cost = reported_cost if saw_model_response and cost_complete else None
         if self.app.db is not None:
             await turn_insert(
@@ -173,6 +193,10 @@ class TurnRunner:
                 ok=ok,
             )
         _LOG.info("turn finished: ok=%s tools=%d elapsed=%ds", ok, tools, seconds)
+        if cancelled:
+            _LOG.info("turn cancelled by owner: tools=%d elapsed=%ds", tools, seconds)
+            await ui.end_turn(f"✋ отменён · {tools} tools · {seconds} s")
+            raise asyncio.CancelledError
         if error is not None:
             _LOG.warning("turn failed: %s", error)
             await send_text(self.bot, self.app.chat_id, f"*error:* {error}")
@@ -206,6 +230,8 @@ class AssistantController:
         self.album_task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._working = False
+        self._current_row: asyncio.Task | None = None
+        self._cancel_requested = False
 
     async def start(self) -> None:
         await queue_resume_collecting(self.app.db)
@@ -245,6 +271,13 @@ class AssistantController:
                     await send_text(self.app.bot, self.app.chat_id, ack)
                 await self._drain_queue()
             return
+        if routed.command in _DIRECT_COMMANDS:
+            reply = await self._run_direct_command(routed.command)
+            if reply is not None:
+                await send_text(self.app.bot, self.app.chat_id, reply)
+                return
+        # /new while idle returns None here and falls through to the
+        # attachment/text intake below, i.e. it is queued exactly as today.
         if routed.attachment and message.get("media_group_id"):
             ack = await self.intake.accept_album_item(message)
             if ack:
@@ -258,6 +291,26 @@ class AssistantController:
         if ack:
             await send_text(self.app.bot, self.app.chat_id, ack)
         await self._drain_queue()
+
+    async def _run_direct_command(self, command: str) -> str | None:
+        if command == "/status":
+            return await collect_status(self.app)
+        if command == "/cancel":
+            return self._cancel_current_turn()
+        if self.app.turn_state["active"]:
+            return (
+                "⏸ Сейчас выполняется ход — /new недоступен. Дождитесь "
+                "окончания или отмените ход через /cancel."
+            )
+        return None  # idle /new: enqueue and reset at dequeue time as before
+
+    def _cancel_current_turn(self) -> str:
+        row = self._current_row
+        if row is None or row.done():
+            return "Отменять нечего: сейчас нет активного хода."
+        self._cancel_requested = True
+        row.cancel()
+        return "⇥ Отменяю текущий ход…"
 
     async def wait_idle(self) -> None:
         while self._working:
@@ -306,22 +359,24 @@ class AssistantController:
                 self._working = True
                 try:
                     payload = json.loads(raw)
-                    async with self._busy_scope():
-                        if kind == "attachment":
-                            prompt = await self.app.uploads.handle(
-                                payload.get("attachments", []),
-                                payload.get("caption", ""),
-                                payload.get("reply_context", ""),
-                            )
-                        else:
-                            prompt = payload.get("text", "")
-                        if prompt:
-                            await TurnRunner(
-                                self.app,
-                                self.app.bot,
-                                self.app.assistant.edit_interval,
-                                self.app.assistant.status_max_chars,
-                            ).run(prompt)
+                    row = asyncio.create_task(self._run_row(kind, payload))
+                    self._current_row = row
+                    try:
+                        await row
+                    except asyncio.CancelledError:
+                        if not (
+                            self._cancel_requested
+                            and asyncio.current_task().cancelling() == 0
+                        ):
+                            # genuine shutdown: stop the row, leave the queue
+                            # row 'active' for startup recovery, re-raise
+                            row.cancel()
+                            await asyncio.gather(row, return_exceptions=True)
+                            raise
+                        _LOG.info("interactive turn cancelled by owner")
+                    finally:
+                        self._current_row = None
+                        self._cancel_requested = False
                     completed = True
                 except asyncio.CancelledError:
                     raise
@@ -335,6 +390,24 @@ class AssistantController:
                     if completed:
                         await queue_finish(self.app.db, row_id)
                     self._working = False
+
+    async def _run_row(self, kind: str, payload: dict) -> None:
+        async with self._busy_scope():
+            if kind == "attachment":
+                prompt = await self.app.uploads.handle(
+                    payload.get("attachments", []),
+                    payload.get("caption", ""),
+                    payload.get("reply_context", ""),
+                )
+            else:
+                prompt = payload.get("text", "")
+            if prompt:
+                await TurnRunner(
+                    self.app,
+                    self.app.bot,
+                    self.app.assistant.edit_interval,
+                    self.app.assistant.status_max_chars,
+                ).run(prompt)
 
 
 async def poll_updates(bot: TelegramBot, controller: AssistantController) -> None:

@@ -88,6 +88,12 @@ def tool_subject(name: str, args: dict | None) -> str:
     return ""
 
 
+def tool_label(name: str | None, args: dict | None) -> str:
+    """One-line 'name subject' description for status displays."""
+    short = _SHORT_NAMES.get(name or "", (name or "")[:8])
+    return f"{short} {tool_subject(name or '', args)}".strip()
+
+
 class StatusBuffer:
     """Line buffer for the tool log: capped at max_chars (oldest dropped) and
     max_lines (dropped lines counted in a leading ``… +N earlier``)."""

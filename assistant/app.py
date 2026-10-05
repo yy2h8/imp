@@ -8,6 +8,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -103,6 +104,18 @@ class Session:
 
 
 @dataclass(slots=True)
+class CurrentTurn:
+    """Live view of the interactive turn in flight, for /status."""
+
+    prompt: str
+    started_monotonic: float
+    started_at: datetime  # UTC
+    tools: int = 0
+    activity: str = ""  # last tool, e.g. "shell tar -czf …"
+    last_reply: str = ""  # latest model text (preview)
+    last_reply_at: datetime | None = None  # UTC
+
+@dataclass(slots=True)
 class AssistantApp:
     """imp's Agent plus the assistant home concerns: session lifecycle,
     usage thresholds, the shared ask router, and the upload handler."""
@@ -123,6 +136,7 @@ class AssistantApp:
         default_factory=lambda: asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_JOBS)
     )
     turn_state: dict[str, bool] = field(default_factory=lambda: {"active": False})
+    current_turn: CurrentTurn | None = None
     job_context: JobContext | None = None
 
     @property

@@ -39,7 +39,8 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
   `state.db`. Each job gets a fresh context and cannot use `ask`. Jobs can run
   concurrently with an interactive turn; one background job runs at a time by
   default. `IMP_MAX_CONCURRENT_JOBS` allows more parallel jobs. Results queue
-  until the active interactive turn ends.
+  until the active interactive turn ends. Job deliveries and `list_jobs`
+  include the run's tool/time/cost summary (`✓ done · N tools · M s · $X`).
 - **Interactive FIFO.** Owner requests are accepted into a durable queue and
   run one at a time. Busy requests receive `Принято — в очереди …`. A request
   interrupted during execution is reported after restart and never replayed;
@@ -50,13 +51,19 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 - **Turn costs.** Each turn's API-reported tokens, USD cost, tool count,
   duration, and outcome are recorded in the database.
 - **Commands.** `/new` starts a fresh conversation (the transcript remains in
-  the database); `/status` shows a short summary: local time in `IMP_TZ`, the
-  three nearest scheduled jobs, the context-usage estimate (marked `~ …
-  (оценка)`), host load/RAM/disk, and the OpenRouter balance in USD (wallet
-  via a management key, else the key's remaining limit). A failed source is
-  shown as «недоступен» without hiding the rest. Startup sends the same
-  summary in place of `pong`; a failed startup notification never blocks
-  polling.
+  the database) and is refused while a turn is active. `/status` answers
+  immediately, even mid-turn: local time in `IMP_TZ`, the running turn
+  (prompt, elapsed time, tool count, current activity, latest model reply),
+  a pending `ask`, running background jobs, queue depth, the latest chat
+  response when idle, the three nearest scheduled jobs, the context-usage
+  estimate (marked `~ … (оценка)`), host load/RAM/disk, and the OpenRouter
+  balance in USD (wallet via a management key, else the key's remaining
+  limit). `/cancel` aborts the active interactive turn, kills its process
+  group, records the turn as cancelled, and lets the queue continue;
+  scheduled jobs are never cancelled — `/status` surfaces them instead.
+  A failed source is shown as «недоступен» without hiding the rest. Startup
+  sends the same summary in place of `pong`; a failed startup notification
+  never blocks polling.
 
 ## State and files
 
