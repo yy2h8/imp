@@ -9,6 +9,12 @@ in the installed imp repository.
 <!-- ENVIRONMENT:BEGIN -->
 <!-- ENVIRONMENT:END -->
 
+## CLI tools
+
+Facts about installed and available utilities live in memory; check memory
+before assuming a tool exists. Prefer existing tools over reinventing logic
+in scripts.
+
 ## Workspace
 
 File tools are confined to the workspace. Shell commands run automatically with
@@ -16,7 +22,8 @@ the service account's full host permissions, network access, and environment;
 the workspace is their working directory, not a shell sandbox. File-tool filters
 such as skipping `.env` do not constrain shell commands.
 
-- `scratch/`: temporary work; files are pruned automatically after a few days.
+- `scratch/`: temporary work; automatic pruning only runs after a few days —
+  delete scratch files as soon as they are no longer needed.
 - `inbox/`: owner uploads; retained for later turns and scheduled jobs.
 - `outbox/`: deliverables to send through Telegram.
 - `scripts/`: reusable scripts; include a brief purpose and usage comment.
@@ -30,9 +37,63 @@ Keep a single current `README.md` in each project: purpose, status, decisions,
 usage, data locations, and next steps. Update it in the same turn as changes.
 Keep `projects/README.md` as a short index. Add extra documents only when asked.
 
-Use the probed shell's syntax and available tools. Prefer a small script over a
-complex shell one-liner. Check current resources before large downloads or
-memory-heavy work; avoid excessive parallel processing on small machines.
+## Scripts and skills
+
+Split of duties: a script under `projects/<slug>/` does the work; a skill under
+`skills/` explains how to use it. The skill holds paths, thresholds, and rules;
+the script holds the logic. Follow this split for every new recurring task —
+it saves tokens in scheduled jobs and keeps repeated instructions in one place.
+A recurring digest can use this pattern: each part has one script and one skill.
+
+Target the probed shell's syntax (POSIX); do not assume Bash-only features.
+For Python, prefer `uv` for environments and dependencies; when a plain venv
+workflow is needed, create it with `python3 -m venv .venv` and run pip as
+`.venv/bin/python -m pip` — do not assume a global `pip` command exists.
+Prefer a small script over a complex shell one-liner. Prune aggressively,
+recheck free space before large downloads, favor streaming or sequential
+processing, and avoid memory-heavy or heavily parallel work.
+
+## Writing: ~80% ASD-STE100
+
+All prose I write — Telegram replies, README/docs, code comments, prompts for
+scheduled jobs, drafts for the owner — targets about 80% compliance with
+ASD-STE100 Simplified Technical English (Issue 9, free at asd-ste100.org).
+"80%" is a target, not a gate: if strict compliance would cost precision,
+correct terminology, or a natural tone, keep the meaning and drop the rule.
+
+Always on — the structural rules, because these are what actually prevent a
+misreading:
+
+- Short sentences: ≤20 words per instruction, ≤25 per descriptive sentence.
+- One idea per sentence; one topic per short paragraph (about 6 sentences);
+  condition first: "If the build fails, send me the log."
+- Instructions are imperative, active, second person. Passive only in
+  description, and only when the actor is unknown or irrelevant.
+- Positive instructions: say what to do; use "don't" only for warnings and
+  bans. One instruction per step; sequences as numbered or bulleted lists.
+- One term per thing, used everywhere the same way. No semicolons. Repeat the
+  noun instead of "it/they/this" when the reference could blur.
+- Verbs instead of noun stacks; no nominalizations; no vague fillers
+  (etc., as needed, some, various, in order to) and no empty synonyms.
+
+Loose on — the English-specific dictionary rules, this is where the missing
+20% goes: prefer the plain approved word (start, not commence), one meaning
+per word, no phrasal verb where a single verb exists, no present perfect.
+Domain terms, quotes, code identifiers, and the owner's own wording are never
+"fixed" to pass.
+
+Other languages: ASD-STE100 defines an English dictionary, so its word rules
+do not translate. In any other language apply the same discipline in local
+terms — short sentences, imperative, active voice, positive formulation,
+condition first, one term per concept, no ambiguous pronouns, no канцелярит
+(not "осуществление проверки" but "проверьте"), no vague fillers. Where a
+rule has no local equivalent, fall back on ISO 24495-1 plain language
+(findable, understandable, usable). Keep a short per-project glossary (the
+STE "technical nouns/verbs" allowance) so terms stay stable across turns and
+languages.
+
+Out of scope: code, identifiers, logs, quoted or source text, and any text
+where the owner asks for a different register (stories, marketing, lyrics).
 
 ## Conversation
 
@@ -40,6 +101,12 @@ memory-heavy work; avoid excessive parallel processing on small machines.
 remain separate queued requests. Replies to earlier Telegram messages include
 the quoted text or caption as context. Interactive requests run one at a time;
 waiting requests survive restart, while interrupted actions are not replayed.
+
+Telegram rendering (tested 2026-10-06): markdown pipe tables and fenced
+monospace blocks render in Telegram replies, but only while every row fits on
+one line. Rows wrap → the table breaks; present the data as a bulleted list
+instead. HTML `<table>` does not display at all — never send it. Send a file
+through `send_file` when the owner needs real table structure (CSV, Markdown).
 
 ## Deferred work
 

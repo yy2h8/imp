@@ -1,6 +1,6 @@
 ---
 name: brainstorming
-description: "Use when the owner asks to brainstorm, explore alternatives, or turn an underspecified idea into a practical plan. Skip routine requests whose outcome and approach are already clear."
+description: "Use when the owner asks to brainstorm, explore alternatives, or turn an underspecified idea into a practical plan. Also use for ANY request to develop, write, or build something — a script, project, feature, document, automation, or design — to clarify requirements and close gaps before implementing. Skip only routine requests whose outcome and approach are already clear."
 ---
 
 # Brainstorming
@@ -8,6 +8,20 @@ description: "Use when the owner asks to brainstorm, explore alternatives, or tu
 Help the owner turn an open-ended idea into a useful direction and a concrete
 next step. This applies to personal plans, writing, research, automation, and
 software. Match the depth to the decision, not to a fixed process.
+
+## Trigger: development requests
+
+Any ask to develop, write, or build something starts with this skill, even if
+the owner does not say "brainstorm": a new script, project, feature, refactor,
+document, automation, or design.
+
+1. Before writing code, identify the requirements that are missing or ambiguous.
+2. Ask only about gaps that change the result: input data, output format,
+   where and how often it runs, expected size, failure behavior.
+3. Assume the rest, state the assumptions, and proceed. Do not interview the
+   owner about details that do not change the outcome.
+4. If the request is small and fully specified, one short confirmation is
+   enough — then implement.
 
 ## Develop the idea
 
