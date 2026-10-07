@@ -20,7 +20,7 @@ from imp.entities import (
 )
 from imp.events import Usage
 from imp.tools import Tool, ToolResult
-from imp.tools.fs import WriteFile
+from imp.tools.fs import ReadFile, WriteFile
 
 
 def sdk_item(data: dict):
@@ -832,6 +832,37 @@ def test_compact_stubs_prior_turn_only(config):
     snapshot = [m.serialize() for m in context.messages]
     assert context.compact() == 0
     assert [m.serialize() for m in context.messages] == snapshot  # idempotent
+
+
+@pytest.mark.parametrize("skills_dir", [".imp/skills", "skills"])
+async def test_agent_replays_skill_on_next_turn(config, fs, skills_dir):
+    path = f"{skills_dir}/example/SKILL.md"
+    file = config.workspace / path
+    file.parent.mkdir(parents=True)
+    content = "Keep following these instructions.\n" * COMPACT_TOOL_OUTPUT_CHARS
+    file.write_text(content)
+    config.compact_threshold = 1  # also exercise cleanup within each iteration
+    script = [
+        response([function_call_item("skill", "read_file", {"path": path})]),
+        response([message_item("loaded")]),
+        response([function_call_item("notes", "read_file", {"path": "notes.txt"})]),
+        response([message_item("done")]),
+    ]
+    (config.workspace / "notes.txt").write_text("notes")
+    agent, client = make_agent(config, {"read_file": ReadFile(config, fs)}, script)
+    await collect(agent, "Load the skill")
+    events = await collect(agent, "Continue using the skill")
+
+    assert not any(event.type is EventType.ERROR for event in events)
+    expected = fs.read_text_file(path, line_numbers=True)
+    for request in client.calls[1:]:
+        outputs = [
+            item["output"]
+            for item in request["input"]
+            if item.get("type") == "function_call_output"
+            and item["call_id"] == "skill"
+        ]
+        assert outputs == [expected]
 
 
 def test_trim_drops_oldest_whole_turns(config):

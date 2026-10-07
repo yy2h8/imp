@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import PurePath
 
 import tiktoken
 
@@ -11,6 +12,7 @@ from ..entities import (
     ConversationMessage,
     ReasoningMessage,
     TextMessage,
+    ToolCall,
     ToolMessage,
 )
 
@@ -85,10 +87,18 @@ class Context:
 
     def compact(self) -> int:
         """Shrink replay cost of completed prior turns: drop their encrypted
-        reasoning and stub oversized old tool outputs. Call/output pairing and
-        the current turn are never touched; idempotent. Full outputs remain in
-        the persisted session transcript. Returns tokens saved."""
+        reasoning and stub oversized old tool outputs except SKILL.md reads.
+        Call/output pairing and the current turn are never touched; idempotent.
+        Full outputs remain in the persisted session transcript. Returns tokens saved."""
         start = self._current_turn_start()
+        skill_reads = {
+            m.call_id
+            for m in self.messages[1:start]
+            if isinstance(m, ToolCall)
+            and m.function_name == "read_file"
+            and isinstance(path := m.arguments.get("path"), str)
+            and PurePath(path).name == "SKILL.md"
+        }
         for i in range(1, start):
             m = self.messages[i]
             if isinstance(m, ReasoningMessage) and "encrypted_content" in m.item:
@@ -96,6 +106,7 @@ class Context:
                 self.messages[i] = replace(m, item=item)
             elif (
                 isinstance(m, ToolMessage)
+                and m.call_id not in skill_reads
                 and len(m.content) > COMPACT_TOOL_OUTPUT_CHARS
                 and COMPACT_MARKER not in m.content
             ):
