@@ -55,8 +55,8 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
   immediately, even mid-turn: local time in `IMP_TZ`, the running turn
   (prompt, elapsed time, tool count, current activity, latest model reply),
   a pending `ask`, running background jobs, queue depth, the latest chat
-  response when idle, the three nearest scheduled jobs, the context-usage
-  estimate (marked `~ … (оценка)`), and the OpenRouter
+  response when idle, the three nearest scheduled jobs, the model slug, the
+  context-usage estimate (marked `~ … (оценка)`), and the OpenRouter
   balance in USD (wallet via a management key, else the key's remaining
   limit). `/cancel` aborts the active interactive turn, kills its process
   group, records the turn as cancelled, and lets the queue continue;

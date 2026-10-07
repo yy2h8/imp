@@ -48,7 +48,7 @@ class FakeHttp:
 def fake_app(tmp_path, **overrides):
     app = SimpleNamespace(
         assistant=SimpleNamespace(tz="Asia/Almaty", home=tmp_path),
-        config=SimpleNamespace(api_key="sk-test-secret"),
+        config=SimpleNamespace(api_key="sk-test-secret", model="openai/gpt-5-mini"),
         usage=(12_345, 128_000),
         scheduler=None,
         db=None,
@@ -75,7 +75,7 @@ async def test_collect_status_shows_all_sections(tmp_path):
     assert "Статус" in summary
     assert "Asia/Almaty" in summary
     assert "Задания" in summary
-    assert "Контекст" in summary
+    assert "Модель: openai/gpt-5-mini" in summary
     assert "OpenRouter" in summary
     assert UNAVAILABLE in summary  # scheduler/http absent on the fake app
     assert "Хост" not in summary  # board/infrastructure is out of scope

@@ -174,6 +174,7 @@ async def _collect(app, now: datetime | None) -> str:
         _LOG.warning("context section failed", exc_info=True)
         context = UNAVAILABLE
     lines.append(f"🧠 Контекст: {context}")
+    lines.append(f"🤖 Модель: {app.config.model}")
     lines.append("")
     http = getattr(app, "http", None)
     try:
