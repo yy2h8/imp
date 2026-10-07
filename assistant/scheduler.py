@@ -103,7 +103,7 @@ async def run_scheduled_job(schedule_id: str, prompt: str) -> None:
             result, session_id, summary = await _execute(ctx, schedule_id, prompt)
         except Exception as exc:
             _LOG.warning("job %s failed: %s", schedule_id, exc)
-            result = f"Job {schedule_id} failed: {exc}"
+            result = f"Задание {schedule_id} завершилось с ошибкой: {exc}"
             await jobs_meta_update(
                 ctx.db, schedule_id, state="error", result=result
             )
@@ -192,8 +192,8 @@ async def startup_recovery(ctx: JobContext) -> None:
     (not through the outbox — no turn may ever run them again)."""
     for row in await jobs_meta_running(ctx.db):
         notice = (
-            f"⏰ {row['schedule_id']}\n\nJob interrupted by shutdown; actions "
-            "may already have occurred. Reschedule manually."
+            f"⏰ {row['schedule_id']}\n\nЗадание прервано перезапуском бота; "
+            "часть действий могла уже выполниться. Запланируйте заново вручную."
         )
         try:
             await send_text(ctx.app.bot, ctx.app.chat_id, notice)

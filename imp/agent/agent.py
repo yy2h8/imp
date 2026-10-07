@@ -48,7 +48,10 @@ class Agent:
                     )
 
     async def _run_turn(self, prompt: str) -> AsyncIterator[AgentEvent]:
+        self._context_warned = False
         self.context.append(TextMessage(role="user", content=prompt))
+        async for event in self._compact_and_trim():
+            yield event
         if not self.context.is_within_token_limit():
             yield AgentEvent(
                 type=EventType.ERROR,
@@ -61,6 +64,17 @@ class Agent:
             yield AgentEvent(
                 type=EventType.THINKING, token_usage=self.context.get_usage()
             )
+
+            if not self._context_warned and self.context.is_approaching_limit():
+                self._context_warned = True  # one heads-up per turn
+                yield AgentEvent(
+                    type=EventType.CONTEXT_WARNING,
+                    quote="context is approaching the token limit",
+                    token_usage=self.context.get_usage(),
+                )
+            if self.context.tokens > self.config.compact_threshold:
+                async for event in self._compact_and_trim():
+                    yield event
 
             try:
                 reply = await call_model(
@@ -99,15 +113,36 @@ class Agent:
                     yield event
 
             if not self.context.is_within_token_limit():
-                yield AgentEvent(
-                    type=EventType.ERROR,
-                    error_message="Context exceeds token limit after tool calls.",
-                    token_usage=self.context.get_usage(),
-                )
-                return
+                async for event in self._compact_and_trim():
+                    yield event
+                if not self.context.is_within_token_limit():
+                    yield AgentEvent(
+                        type=EventType.ERROR,
+                        error_message="Context exceeds token limit after tool calls.",
+                        token_usage=self.context.get_usage(),
+                    )
+                    return
 
         yield AgentEvent(
             type=EventType.ERROR,
             error_message="Maximum iteration limit reached.",
             token_usage=self.context.get_usage(),
         )
+
+    async def _compact_and_trim(self) -> AsyncIterator[AgentEvent]:
+        saved = self.context.compact()
+        if saved > 0:
+            yield AgentEvent(
+                type=EventType.CONTEXT_COMPACTED,
+                quote=f"compacted prior turns (−{saved} tokens)",
+                token_usage=self.context.get_usage(),
+                context_detail={"saved": saved},
+            )
+        dropped = self.context.trim()
+        if dropped > 0:
+            yield AgentEvent(
+                type=EventType.CONTEXT_TRIMMED,
+                quote=f"trimmed {dropped} old messages",
+                token_usage=self.context.get_usage(),
+                context_detail={"dropped": dropped},
+            )

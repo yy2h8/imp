@@ -1,9 +1,8 @@
-"""Status summary: local time, nearest jobs, context estimate, host, resilience."""
+"""Status summary: local time, nearest jobs, context estimate, resilience."""
 
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -19,7 +18,6 @@ from assistant.status import (
     _turn_lines,
     collect_status,
     format_tokens,
-    host_summary,
     openrouter_balance,
 )
 
@@ -78,9 +76,9 @@ async def test_collect_status_shows_all_sections(tmp_path):
     assert "Asia/Almaty" in summary
     assert "Задания" in summary
     assert "Контекст" in summary
-    assert "Хост" in summary
     assert "OpenRouter" in summary
     assert UNAVAILABLE in summary  # scheduler/http absent on the fake app
+    assert "Хост" not in summary  # board/infrastructure is out of scope
 
 
 async def test_collect_status_formats_fixed_now_in_local_tz(tmp_path):
@@ -99,12 +97,6 @@ async def test_collect_status_marks_context_as_estimate(tmp_path):
 def test_format_tokens_marks_estimate():
     assert format_tokens(12_345, 128_000) == "~12 345 / 128 000 токенов (оценка)"
 
-
-def test_host_summary_reports_load_ram_disk(tmp_path):
-    line = host_summary(tmp_path)
-    assert "load" in line
-    assert "RAM" in line
-    assert "диск" in line
 
 
 async def test_jobs_lines_sorted_limited_labeled(tmp_path):
@@ -171,10 +163,6 @@ async def test_jobs_lines_collapses_multiline_labels(tmp_path):
     finally:
         await db.close()
 
-
-def test_host_summary_labels_disk_percentage_as_used(tmp_path):
-    line = host_summary(tmp_path)
-    assert re.search(r"диск: свободно \d+ ГБ \(занято \d+%\)", line)
 
 
 async def test_jobs_lines_without_scheduler_is_unavailable():

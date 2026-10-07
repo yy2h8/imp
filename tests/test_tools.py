@@ -8,7 +8,7 @@ from imp.adapters import FileSystemAdapter, HttpClient
 from imp.config import Config
 from imp.tools import Tool, ToolResult, build_tools, execute_call
 from imp.tools.ask import Ask
-from imp.tools.fs import ReadFile, StrReplace, WriteFile
+from imp.tools.fs import ListDir, ReadFile, StrReplace, WriteFile
 from imp.tools.shell import RunShell
 
 
@@ -103,6 +103,20 @@ def test_build_tools_default_set(config, fs):
     }
     assert expected <= set(registry)
     assert "web_search" not in registry
+
+
+class TestListDir:
+    async def test_level_clamped(self, config, fs):
+        deep = config.workspace
+        for i in range(1, 8):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        (deep / "leaf.txt").write_text("x")
+        tool = ListDir(config=config, fs=fs)
+        result = await tool.execute(path=".", level=100)
+        assert result.ok is True
+        assert "d1/d2/d3/d4/d5/" in result.content
+        assert "d6" not in result.content
 
 
 def test_build_tools_with_brave_key(config, fs):

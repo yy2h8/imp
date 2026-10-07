@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -21,6 +22,7 @@ from assistant.db import (
     memory_digest,
     memory_set,
     open_db,
+    prune_transcripts,
     queue_claim_next,
     queue_count_waiting,
     queue_finish,
@@ -346,3 +348,57 @@ async def test_turn_last_by_session_returns_newest_row(db):
     assert newest is not None
     assert newest["seconds"] == 42 and newest["tools"] == 1 and newest["ok"] == 1
     assert await turn_last_by_session(db, "unknown") is None
+
+
+async def test_prune_transcripts_tiers(db):
+    now = datetime.now(UTC)
+
+    def ts(days_ago: float) -> str:
+        return (now - timedelta(days=days_ago)).isoformat()
+
+    rows = [
+        # ancient session: past both tiers — deleted whole
+        ("ancient", 0, ts(30), '{"role": "user", "content": "old"}'),
+        # middle session: past the item tier only — keeps conversational rows
+        ("middle", 0, ts(10), '{"role": "user", "content": "q"}'),
+        ("middle", 1, ts(10), '{"type": "reasoning", "id": "r", "summary": []}'),
+        (
+            "middle",
+            2,
+            ts(10),
+            '{"type": "function_call", "call_id": "c", "name": "n", "arguments": "{}"}',
+        ),
+        (
+            "middle",
+            3,
+            ts(10),
+            '{"type": "function_call_output", "call_id": "c", "output": "x"}',
+        ),
+        ("middle", 4, ts(10), '{"role": "assistant", "content": "a"}'),
+        # fresh session: untouched, reasoning row survives
+        ("fresh", 0, ts(0), '{"type": "reasoning", "id": "r2", "summary": []}'),
+    ]
+    await db.executemany(
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    await db.commit()
+
+    deleted = await prune_transcripts(db, item_ttl_days=7, session_ttl_days=20)
+
+    assert deleted == 4  # ancient(1) + middle non-conversational(3)
+    remaining = await db.execute_fetchall(
+        "SELECT session_id, seq FROM transcripts ORDER BY session_id, seq"
+    )
+    assert remaining == [("fresh", 0), ("middle", 0), ("middle", 4)]
+
+
+async def test_prune_transcripts_noop_when_fresh(db):
+    await db.execute(
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, 0, ?, ?)",
+        ("s", datetime.now(UTC).isoformat(), "{}"),
+    )
+    await db.commit()
+    assert await prune_transcripts(db, item_ttl_days=7, session_ttl_days=90) == 0
+    count = (await db.execute_fetchall("SELECT COUNT(*) FROM transcripts"))[0][0]
+    assert count == 1

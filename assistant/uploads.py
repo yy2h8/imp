@@ -73,7 +73,7 @@ class Uploads:
                     await send_text(
                         self.bot,
                         self.chat_id,
-                        f"*error:* {transcript} — the audio is kept at {self._rel(path)}.",
+                        f"*ошибка:* {transcript} — аудио сохранено в {self._rel(path)}.",
                     )
                 else:
                     transcripts.append(transcript)
@@ -94,7 +94,7 @@ class Uploads:
                 await self._ack(saved[0][1])
             else:
                 names = ", ".join(self._rel(path) for _, path in saved)
-                await send_text(self.bot, self.chat_id, f"Saved {names}.")
+                await send_text(self.bot, self.chat_id, f"Сохранено: {names}.")
             return None
 
         details = ", ".join(self._rel(path) for _, path in saved)
@@ -128,7 +128,7 @@ class Uploads:
 
     async def _save(self, file_id: str | None, name: str) -> Path | None:
         if not file_id:
-            await send_text(self.bot, self.chat_id, "Could not save attachment: missing file id.")
+            await send_text(self.bot, self.chat_id, "Не удалось сохранить вложение: отсутствует file id.")
             return None
         try:
             while True:
@@ -140,7 +140,7 @@ class Uploads:
                     continue
         except Exception as exc:
             await send_text(
-                self.bot, self.chat_id, f"*error:* could not save the file: {exc}"
+                self.bot, self.chat_id, f"*ошибка:* не удалось сохранить файл: {exc}"
             )
             return None
 
@@ -159,5 +159,5 @@ class Uploads:
         await send_text(
             self.bot,
             self.chat_id,
-            f"Saved {self._rel(saved)} ({_size_text(saved.stat().st_size)}).",
+            f"Сохранён {self._rel(saved)} ({_size_text(saved.stat().st_size)}).",
         )

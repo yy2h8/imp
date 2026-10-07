@@ -42,8 +42,8 @@ HOME_DIRS = (
 )
 
 RESET_NOTICE = (
-    "Context was nearly full — started a fresh session. "
-    "The previous transcript is saved on disk."
+    "Контекст был почти заполнен — начата новая сессия. "
+    "Предыдущая переписка сохранена на диске."
 )
 
 

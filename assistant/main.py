@@ -17,7 +17,12 @@ from telegram import Message
 from imp.events import EventType
 
 from .adapters.telegram import TelegramBot, TelegramError, send_text
-from .adapters.ui import TelegramUIAdapter, tool_label, turn_summary
+from .adapters.ui import (
+    TelegramUIAdapter,
+    russian_error,
+    tool_label,
+    turn_summary,
+)
 from .app import RESET_NOTICE, AssistantApp, CurrentTurn, build_assistant, ensure_home
 from .bootstrap import (
     needs_tailoring,
@@ -28,6 +33,7 @@ from .bootstrap import (
 )
 from .config import AssistantConfig
 from .db import (
+    prune_transcripts,
     queue_claim_next,
     queue_finish,
     queue_finish_album,
@@ -102,8 +108,8 @@ class TurnRunner:
             name = self.app.reset()
             _LOG.info("command /new: fresh transcript %s", name)
             return (
-                "Started a fresh session. Previous transcript is saved. "
-                f"New transcript: `{name}`"
+                "Начата новая сессия. Предыдущая переписка сохранена. "
+                f"Новая сессия: `{name}`"
             )
         return None
 
@@ -192,6 +198,13 @@ class TurnRunner:
                 seconds=seconds,
                 ok=ok,
             )
+            deleted = await prune_transcripts(
+                self.app.db,
+                self.app.assistant.transcript_item_ttl_days,
+                self.app.assistant.transcript_ttl_days,
+            )
+            if deleted:
+                _LOG.info("pruned %d aged transcript rows", deleted)
         _LOG.info("turn finished: ok=%s tools=%d elapsed=%ds", ok, tools, seconds)
         if cancelled:
             _LOG.info("turn cancelled by owner: tools=%d elapsed=%ds", tools, seconds)
@@ -199,7 +212,9 @@ class TurnRunner:
             raise asyncio.CancelledError
         if error is not None:
             _LOG.warning("turn failed: %s", error)
-            await send_text(self.bot, self.app.chat_id, f"*error:* {error}")
+            await send_text(
+                self.bot, self.app.chat_id, f"*ошибка:* {russian_error(error)}"
+            )
             await ui.end_turn(turn_summary(tools, seconds, False, None))
             return
         await ui.end_turn(turn_summary(tools, seconds, True, cost))
@@ -383,7 +398,7 @@ class AssistantController:
                 except Exception:
                     _LOG.exception("queued request %s failed", row_id)
                     await send_text(
-                        self.app.bot, self.app.chat_id, "*error:* queued request failed"
+                        self.app.bot, self.app.chat_id, "*ошибка:* запрос из очереди не выполнен"
                     )
                     completed = True
                 finally:
@@ -443,9 +458,9 @@ async def _recover_interactive_requests(app: AssistantApp) -> None:
         await send_text(
             app.bot,
             app.chat_id,
-            "A request was interrupted by the previous shutdown. It may already "
-            "have performed actions, so I will not rerun it. Check the previous "
-            f"transcript before resubmitting it (queue item {row_id}).",
+            "Запрос был прерван перезапуском бота. Он мог уже выполнить "
+            "часть действий, поэтому повторно я его не выполняю. Проверьте "
+            f"предыдущую переписку перед повторной отправкой (элемент очереди {row_id}).",
         )
 
 
@@ -463,6 +478,14 @@ async def run_bot() -> None:
             chat_id,
         )
         prune_scratch(app.assistant.home, app.assistant.scratch_ttl_days)
+        if app.db is not None:
+            deleted = await prune_transcripts(
+                app.db,
+                app.assistant.transcript_item_ttl_days,
+                app.assistant.transcript_ttl_days,
+            )
+            if deleted:
+                _LOG.info("pruned %d aged transcript rows", deleted)
         await _recover_interactive_requests(app)
         if app.job_context is not None:
             await startup_recovery(app.job_context)
@@ -500,16 +523,16 @@ async def startup(assistant_config: AssistantConfig, chat_id: int, force: bool):
             await send_text(
                 app.bot,
                 chat_id,
-                "Manual tailoring failed. Continuing with the existing manual; "
-                "I will retry at the next startup.",
+                "Не удалось адаптировать инструкцию под эту машину. "
+                "Продолжаю с текущей; повторю попытку при следующем запуске.",
             )
             return result
         if result.changed and was_tailored:
             await send_text(
                 app.bot,
                 chat_id,
-                "The machine's environment changed — `AGENTS.md` was "
-                "regenerated from a fresh probe and re-tailored.",
+                "Окружение машины изменилось — `AGENTS.md` перегенерирован "
+                "по свежим данным и заново адаптирован.",
             )
     return result
 

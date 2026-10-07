@@ -170,6 +170,21 @@ class UIAdapter:
             args = Text(f" {self._format_args(event.tool_args)}")
             self.console.print(Text(f"[{event.tool_name}]", style="cyan"), args)
             self._fresh = False
+        elif event.type in (EventType.CONTEXT_COMPACTED, EventType.CONTEXT_TRIMMED):
+            self.stop_spinner()
+            used, maximum = event.token_usage
+            self.console.print(
+                f"♻ {event.quote} → {used:,}/{maximum:,} tokens",
+                style="yellow",
+            )
+            self._fresh = False
+        elif event.type is EventType.CONTEXT_WARNING:
+            used, maximum = event.token_usage
+            self.console.print(
+                f"⚠ {event.quote}: {used:,}/{maximum:,} tokens ({used / maximum:.0%})",
+                style="yellow",
+            )
+            self._fresh = False
         elif event.type is EventType.TOOL_RESULT and event.tool_result:
             result = event.tool_result
             quiet = event.tool_name in QUIET_TOOLS

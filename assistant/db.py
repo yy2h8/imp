@@ -293,6 +293,38 @@ def _format_memory_digest(entries: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+async def prune_transcripts(
+    conn: aiosqlite.Connection, item_ttl_days: int, session_ttl_days: int
+) -> int:
+    """Two-tier retention: drop non-conversational items (reasoning,
+    function_call, function_call_output) from sessions idle longer than
+    item_ttl_days; drop whole sessions idle longer than session_ttl_days
+    (user/assistant text survives tier 1 for search_transcripts recall).
+    Checkpoints the WAL when anything was deleted. Returns rows deleted."""
+    now = datetime.now(UTC)
+    item_cutoff = (now - timedelta(days=item_ttl_days)).isoformat()
+    session_cutoff = (now - timedelta(days=session_ttl_days)).isoformat()
+    items = await conn.execute(
+        "DELETE FROM transcripts WHERE ts < ? AND json_extract(message, '$.type')"
+        " IN ('reasoning', 'function_call', 'function_call_output')",
+        (item_cutoff,),
+    )
+    sessions = await conn.execute(
+        "DELETE FROM transcripts WHERE session_id IN ("
+        "SELECT session_id FROM transcripts GROUP BY session_id"
+        " HAVING MAX(ts) < ?)",
+        (session_cutoff,),
+    )
+    deleted = (items.rowcount or 0) + (sessions.rowcount or 0)
+    if deleted:
+        await conn.commit()
+        try:
+            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except aiosqlite.Error:
+            pass  # another connection holds the WAL; next prune retries
+    return deleted
+
+
 async def turn_insert(
     conn: aiosqlite.Connection,
     *,

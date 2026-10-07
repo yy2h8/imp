@@ -147,7 +147,7 @@ async def test_uncaptioned_document_is_saved_and_acknowledged(tmp_path):
     )
     assert prompt is None
     assert (tmp_path / "inbox" / "quiet.txt").exists()
-    assert bot.sent and "Saved inbox/quiet.txt" in bot.sent[0]
+    assert bot.sent and "Сохранён inbox/quiet.txt" in bot.sent[0]
 
 
 async def test_download_failure_is_reported_not_silently_dropped(tmp_path):
@@ -157,7 +157,7 @@ async def test_download_failure_is_reported_not_silently_dropped(tmp_path):
         caption="please inspect",
     )
     assert result is None
-    assert bot.sent and "could not save" in bot.sent[0]
+    assert bot.sent and "не удалось сохранить файл" in bot.sent[0]
 
 
 async def test_stream_limit_cleans_up_and_reports_error(tmp_path):

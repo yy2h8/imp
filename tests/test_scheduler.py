@@ -99,7 +99,7 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
         await asyncio.sleep(0.1)
 
         assert outbox.items[0].startswith("⏰ j1\n\nvaluable result\n\n")
-        assert "✓ done · 0 tools ·" in outbox.items[0]
+        assert "✓ готово · инструментов: 0" in outbox.items[0]
         assert "$0.0100" in outbox.items[0]
         meta = await jobs_meta_get(conn, "j1")
         assert meta["state"] == "done"  # one-shot: not rescheduled
@@ -185,7 +185,7 @@ async def test_startup_recovery_reports_interrupted_jobs(tmp_path):
     await startup_recovery(ctx)
     assert len(app.bot.sent) == 1
     assert "stuck" in app.bot.sent[0]
-    assert "nterrupted" in app.bot.sent[0]
+    assert "прервано" in app.bot.sent[0]
     assert await jobs_meta_running(conn) == []  # reported once
     meta = await jobs_meta_get(conn, "stuck")
     assert meta["state"] == "interrupted"

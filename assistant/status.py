@@ -9,11 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import shutil
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -25,7 +22,6 @@ _LOG = logging.getLogger(__name__)
 
 UNAVAILABLE = "недоступен"
 NO_JOBS = "нет активных заданий"
-_KIB = 1024 * 1024  # /proc/meminfo kB → GiB
 BALANCE_TIMEOUT_S = 10.0
 LABEL_LIMIT = 40
 JOBS_SHOWN = 3
@@ -36,26 +32,6 @@ def format_tokens(used: int, maximum: int) -> str:
     return f"~{used:,} / {maximum:,} токенов (оценка)".replace(",", " ")
 
 
-def host_summary(home: Path) -> str:
-    """Linux stdlib probes: load average, /proc/meminfo, statvfs."""
-    load1, _, _ = os.getloadavg()
-    info: dict[str, int] = {}
-    with open("/proc/meminfo", encoding="ascii") as fh:
-        for line in fh:
-            name, _, value = line.partition(":")
-            info[name] = int(value.strip().split()[0])  # kB
-            if "MemTotal" in info and "MemAvailable" in info:
-                break
-    total = info["MemTotal"] / _KIB
-    available = info["MemAvailable"] / _KIB
-    ram_pct = (total - available) / total * 100
-    disk = shutil.disk_usage(home)
-    disk_free = disk.free / 2**30
-    disk_pct = disk.used / disk.total * 100
-    return (
-        f"load {load1:.2f} · RAM {total - available:.1f}/{total:.1f} ГБ "
-        f"({ram_pct:.0f}%) · диск: свободно {disk_free:.0f} ГБ (занято {disk_pct:.0f}%)"
-    )
 
 
 async def _jobs_lines(
@@ -198,13 +174,6 @@ async def _collect(app, now: datetime | None) -> str:
         _LOG.warning("context section failed", exc_info=True)
         context = UNAVAILABLE
     lines.append(f"🧠 Контекст: {context}")
-    lines.append("")
-    try:
-        host = await asyncio.to_thread(host_summary, Path(app.assistant.home))
-    except Exception:
-        _LOG.warning("host section failed", exc_info=True)
-        host = UNAVAILABLE
-    lines.append(f"🖥 Хост: {host}")
     lines.append("")
     http = getattr(app, "http", None)
     try:

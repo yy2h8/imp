@@ -23,6 +23,7 @@ class ListDir(Tool):
     required: ClassVar[list[str]] = ["path"]
 
     async def execute(self, path: str, level: int = 3) -> ToolResult:
+        level = max(1, min(level, 5))
         entries = await asyncio.to_thread(self.fs.list_directory, path, level=level)
         return ToolResult(ok=True, content="\n".join(entries))
 

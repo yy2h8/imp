@@ -516,7 +516,7 @@ async def test_startup_retries_failed_tailoring_then_skips_success(
     await startup(config, 7, force=False)
     assert len(client.calls) == 1
     assert needs_tailoring(read_state(tmp_path))
-    assert any("failed" in notice.lower() for notice in notices)
+    assert any("Не удалось адаптировать" in notice for notice in notices)
     await startup(config, 7, force=False)
     assert read_state(tmp_path)["tailored"] is True
     await startup(config, 7, force=False)

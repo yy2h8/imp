@@ -8,6 +8,7 @@ from assistant.adapters.ui import (
     STATUS_LINES,
     StatusBuffer,
     TelegramUIAdapter,
+    russian_error,
     tool_label,
     tool_subject,
     turn_summary,
@@ -72,14 +73,19 @@ class TestStatusBuffer:
 
 class TestTurnSummary:
     def test_success_with_cost(self):
-        assert turn_summary(3, 47, True, 0.0134) == "✓ done · 3 tools · 47 s · $0.0134"
+        assert (
+            turn_summary(3, 47, True, 0.0134)
+            == "✓ готово · инструментов: 3 · 47 с · $0.0134"
+        )
 
     def test_success_without_cost(self):
-        assert turn_summary(1, 2, True, None) == "✓ done · 1 tools · 2 s"
+        assert turn_summary(1, 2, True, None) == "✓ готово · инструментов: 1 · 2 с"
 
     def test_failure(self):
-        assert turn_summary(3, 12, False, None) == "✗ failed · 3 tools · 12 s"
-        assert turn_summary(3, 12, False, 0.5) == "✗ failed · 3 tools · 12 s"
+        assert turn_summary(3, 12, False, None) == "✗ ошибка · инструментов: 3 · 12 с"
+
+    def test_failure_ignores_cost(self):
+        assert turn_summary(3, 12, False, 0.5) == "✗ ошибка · инструментов: 3 · 12 с"
 
 
 class TestToolSubject:
@@ -168,7 +174,7 @@ class TestTelegramUIAdapter:
         bot = FakeBot()
         ui = TelegramUIAdapter(bot, chat_id=1)
         await ui.begin()
-        assert bot.sent == [(1, "🧠 thinking…")]
+        assert bot.sent == [(1, "🧠 думаю…")]
         assert ui.status_message_id is not None
         await ui.begin()  # idempotent
         assert len(bot.sent) == 1
@@ -180,7 +186,7 @@ class TestTelegramUIAdapter:
         await ui.handle(tool_event("read_file", {"path": "imp/agent/model.py"}))
         await ui.flush(force=True)
         text = bot.edits[-1][2]
-        assert text.startswith("🧠 working\n```")
+        assert text.startswith("🧠 работаю\n```")
         assert "read" in text and "imp/agent/model.py" in text
         assert text.rstrip().endswith("```")
 
@@ -212,7 +218,45 @@ class TestTelegramUIAdapter:
         await ui.begin()
         await ui.handle(event(type=EventType.ERROR, error_message="model exploded"))
         await ui.flush(force=True)
-        assert "*error:* model exploded" in bot.edits[-1][2]
+        assert "*ошибка:* model exploded" in bot.edits[-1][2]
+
+    async def test_context_events_render_compaction_and_warning(self):
+        bot = FakeBot()
+        ui = TelegramUIAdapter(bot, chat_id=1, max_chars=500)
+        await ui.begin()
+        await ui.handle(
+            event(
+                type=EventType.CONTEXT_COMPACTED,
+                token_usage=(152_832, 1_000_000),
+                context_detail={"saved": 626_661},
+            )
+        )
+        await ui.handle(
+            event(
+                type=EventType.CONTEXT_WARNING,
+                token_usage=(900_000, 1_000_000),
+            )
+        )
+        await ui.handle(
+            event(
+                type=EventType.CONTEXT_TRIMMED,
+                token_usage=(120_000, 1_000_000),
+                context_detail={"dropped": 6},
+            )
+        )
+        await ui.flush(force=True)
+        text = bot.edits[-1][2]
+        assert "♻ контекст сжат (−626661 ток) → 152k/1000k ток" in text
+        assert "⚠ контекст близок к лимиту: 900k/1000k ток" in text
+        assert "♻ удалено старых сообщений: 6 → 120k/1000k ток" in text
+
+    def test_russian_error_maps_known_imp_errors(self):
+        assert (
+            russian_error("Context exceeds token limit after tool calls.")
+            == "Контекст превысил лимит токенов после вызовов инструментов."
+        )
+        assert russian_error("Model call failed: 500") == "Model call failed: 500"
+        assert russian_error(None) == ""
 
     async def test_end_turn_collapses_to_summary(self):
         bot = FakeBot()
@@ -254,7 +298,7 @@ class TestTelegramUIAdapter:
         await ui.end_turn("✓ done · 0 tools · 1 s")
         await ui.answer("Here is **the answer**.")
         assert bot.sent[-1][1] == "Here is **the answer**."
-        assert bot.sent[0][1] == "🧠 thinking…"
+        assert bot.sent[0][1] == "🧠 думаю…"
 
     async def test_status_text_fits_one_message(self):
         bot = FakeBot()

@@ -56,7 +56,7 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
   (prompt, elapsed time, tool count, current activity, latest model reply),
   a pending `ask`, running background jobs, queue depth, the latest chat
   response when idle, the three nearest scheduled jobs, the context-usage
-  estimate (marked `~ … (оценка)`), host load/RAM/disk, and the OpenRouter
+  estimate (marked `~ … (оценка)`), and the OpenRouter
   balance in USD (wallet via a management key, else the key's remaining
   limit). `/cancel` aborts the active interactive turn, kills its process
   group, records the turn as cancelled, and lets the queue continue;
@@ -77,7 +77,10 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
   FIFO order and resumes with received items after restart.
 - `jobs_meta` and APScheduler's job table: job metadata, results, schedule state.
 - `turns`: per-turn usage, cost, tools, duration, and outcome.
-- `transcripts`: ordered JSON message rows, replacing `sessions/*.jsonl`.
+- `transcripts`: ordered JSON message rows, replacing `sessions/*.json`.
+  Pruned on two TTL tiers — reasoning/tool rows drop after
+  `IMP_TRANSCRIPT_ITEM_TTL_DAYS` (7), whole idle sessions after
+  `IMP_TRANSCRIPT_TTL_DAYS` (90) — keeping user/assistant text searchable.
 - `memory`: durable agent memory.
 
 The agent still works with ordinary workspace files: `AGENTS.md`, skills,

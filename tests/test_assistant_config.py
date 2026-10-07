@@ -21,6 +21,8 @@ ASSISTANT_ENV_VARS = [
     "IMP_TG_STATUS_MAX_CHARS",
     "IMP_SESSION_RESET_THRESHOLD",
     "IMP_SCRATCH_TTL_DAYS",
+    "IMP_TRANSCRIPT_ITEM_TTL_DAYS",
+    "IMP_TRANSCRIPT_TTL_DAYS",
     "IMP_STT_MODEL",
     "IMP_TZ",
     "IMP_LOG_LEVEL",
@@ -116,6 +118,29 @@ def test_max_concurrent_jobs_must_be_positive(tmp_path, monkeypatch):
         make_config(tmp_path, monkeypatch, IMP_MAX_CONCURRENT_JOBS="0")
 
 
+def test_transcript_ttl_defaults(tmp_path, monkeypatch):
+    from assistant.config import (
+        DEFAULT_TRANSCRIPT_ITEM_TTL_DAYS,
+        DEFAULT_TRANSCRIPT_TTL_DAYS,
+    )
+
+    config = make_config(tmp_path, monkeypatch)
+    assert config.transcript_item_ttl_days == DEFAULT_TRANSCRIPT_ITEM_TTL_DAYS == 7
+    assert config.transcript_ttl_days == DEFAULT_TRANSCRIPT_TTL_DAYS == 90
+
+
+def test_transcript_ttl_overrides(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path,
+        monkeypatch,
+        IMP_TRANSCRIPT_ITEM_TTL_DAYS="3",
+        IMP_TRANSCRIPT_TTL_DAYS="30",
+    )
+    assert config.transcript_item_ttl_days == 3
+    assert config.transcript_ttl_days == 30
+
+
+
 def test_minimal_config_defaults(tmp_path, monkeypatch):
     config = make_config(tmp_path, monkeypatch)
     assert config.bot_token == "123456:TEST-TOKEN"
@@ -176,6 +201,8 @@ def test_raw_token_reads_only_the_token(tmp_path, monkeypatch):
         ("IMP_TG_STATUS_MAX_CHARS", "0"),
         ("IMP_TG_STATUS_MAX_CHARS", "4097"),
         ("IMP_SCRATCH_TTL_DAYS", "-1"),
+        ("IMP_TRANSCRIPT_ITEM_TTL_DAYS", "0"),
+        ("IMP_TRANSCRIPT_TTL_DAYS", "-5"),
     ],
 )
 def test_invalid_limits(tmp_path, monkeypatch, env, value):

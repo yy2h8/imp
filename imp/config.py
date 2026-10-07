@@ -17,10 +17,11 @@ REASONING_EFFORTS: tuple[str, ...] = (
 )
 DEFAULT_WORKSPACE: str = "."
 DEFAULT_MAX_ITERATIONS: int = 50
-DEFAULT_MAX_CONTEXT: int = 128_000
+DEFAULT_MAX_CONTEXT: int = 256_000
 DEFAULT_COMMAND_TIMEOUT: int = 180
 DEFAULT_NETWORK_TIMEOUT: int = 360
-DEFAULT_MAX_TOOL_OUTPUT: int = 100_000
+DEFAULT_MAX_TOOL_OUTPUT: int = 24_000
+DEFAULT_COMPACT_THRESHOLD: int = 128_000
 DEFAULT_MAX_TOOL_DISPLAY_LINES: int = 10
 DEFAULT_MAX_REASONING_DISPLAY_LINES: int = 10
 DEFAULT_MAX_HTTP_BYTES: int = 10_000_000
@@ -62,6 +63,7 @@ class Config:
     max_tool_display_lines: int = DEFAULT_MAX_TOOL_DISPLAY_LINES
     max_reasoning_display_lines: int = DEFAULT_MAX_REASONING_DISPLAY_LINES
     max_http_bytes: int = DEFAULT_MAX_HTTP_BYTES
+    compact_threshold: int = DEFAULT_COMPACT_THRESHOLD
     auto_approve: bool = False  # Can also be set to true via cli argument
     brave_api_key: str | None = None  # Optional Brave Search API key for web search
     reasoning_effort: str | None = (
@@ -107,6 +109,7 @@ class Config:
                 "IMP_MAX_REASONING_DISPLAY_LINES", DEFAULT_MAX_REASONING_DISPLAY_LINES
             ),
             max_http_bytes=_int("IMP_MAX_HTTP_BYTES", DEFAULT_MAX_HTTP_BYTES),
+            compact_threshold=_int("IMP_COMPACT_THRESHOLD", DEFAULT_COMPACT_THRESHOLD),
             auto_approve=auto_approve
             if auto_approve is not None
             else _truthy("IMP_AUTO_APPROVE"),

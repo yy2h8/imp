@@ -12,6 +12,8 @@ DEFAULT_EDIT_INTERVAL = 2.5
 DEFAULT_STATUS_MAX_CHARS = 3500
 DEFAULT_RESET_THRESHOLD = 0.85
 DEFAULT_SCRATCH_TTL_DAYS = 7
+DEFAULT_TRANSCRIPT_ITEM_TTL_DAYS = 7
+DEFAULT_TRANSCRIPT_TTL_DAYS = 90
 DEFAULT_TZ = "Asia/Almaty"  # the owner's timezone; IMP_TZ overrides
 DEFAULT_STT_MODEL = "openai/whisper-large-v3-turbo"  # OpenRouter's whisper turbo
 DEFAULT_MAX_CONCURRENT_JOBS = 1
@@ -32,6 +34,8 @@ class AssistantConfig:
     status_max_chars: int = DEFAULT_STATUS_MAX_CHARS
     reset_threshold: float = DEFAULT_RESET_THRESHOLD
     scratch_ttl_days: int = DEFAULT_SCRATCH_TTL_DAYS
+    transcript_item_ttl_days: int = DEFAULT_TRANSCRIPT_ITEM_TTL_DAYS
+    transcript_ttl_days: int = DEFAULT_TRANSCRIPT_TTL_DAYS
     stt_model: str = DEFAULT_STT_MODEL
     tz: str = DEFAULT_TZ
     log_level: str = DEFAULT_LOG_LEVEL
@@ -97,6 +101,13 @@ class AssistantConfig:
             os.getenv("IMP_TG_STATUS_MAX_CHARS") or DEFAULT_STATUS_MAX_CHARS
         )
         ttl = int(os.getenv("IMP_SCRATCH_TTL_DAYS") or DEFAULT_SCRATCH_TTL_DAYS)
+        item_ttl = int(
+            os.getenv("IMP_TRANSCRIPT_ITEM_TTL_DAYS")
+            or DEFAULT_TRANSCRIPT_ITEM_TTL_DAYS
+        )
+        session_ttl = int(
+            os.getenv("IMP_TRANSCRIPT_TTL_DAYS") or DEFAULT_TRANSCRIPT_TTL_DAYS
+        )
         try:
             max_jobs = int(
                 os.getenv("IMP_MAX_CONCURRENT_JOBS") or DEFAULT_MAX_CONCURRENT_JOBS
@@ -114,6 +125,10 @@ class AssistantConfig:
             raise ValueError("IMP_TG_STATUS_MAX_CHARS must be in 1..4096")
         if ttl <= 0:
             raise ValueError("IMP_SCRATCH_TTL_DAYS must be positive")
+        if item_ttl <= 0:
+            raise ValueError("IMP_TRANSCRIPT_ITEM_TTL_DAYS must be positive")
+        if session_ttl <= 0:
+            raise ValueError("IMP_TRANSCRIPT_TTL_DAYS must be positive")
         return cls(
             bot_token=token,
             allowed_user_ids=allowed,
@@ -124,6 +139,8 @@ class AssistantConfig:
                 "IMP_SESSION_RESET_THRESHOLD", DEFAULT_RESET_THRESHOLD
             ),
             scratch_ttl_days=ttl,
+            transcript_item_ttl_days=item_ttl,
+            transcript_ttl_days=session_ttl,
             stt_model=os.getenv("IMP_STT_MODEL") or DEFAULT_STT_MODEL,
             tz=tz,
             log_level=log_level,

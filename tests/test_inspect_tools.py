@@ -81,7 +81,7 @@ async def test_list_jobs_appends_last_run_summary_from_transcript(db, tmp_path):
         config=Config(api_key="k", workspace=tmp_path), db=db, scheduler=None
     ).execute()
     assert result.ok
-    assert "last run: ✓ done · 2 tools · 12 s · $0.0200" in result.content
+    assert "last run: ✓ готово · инструментов: 2 · 12 с · $0.0200" in result.content
 
 
 async def test_list_jobs_without_transcript_has_no_last_run(db, tmp_path):

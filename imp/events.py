@@ -14,6 +14,9 @@ class EventType(Enum):
     MODEL_RESPONSE = auto()
     TOOL_START = auto()
     TOOL_RESULT = auto()
+    CONTEXT_COMPACTED = auto()
+    CONTEXT_TRIMMED = auto()
+    CONTEXT_WARNING = auto()
     ERROR = auto()
 
 
@@ -38,3 +41,5 @@ class AgentEvent:
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     usage: Usage | None = None
+    # Structured payload for CONTEXT_* events: e.g. {"saved": 626661}, {"dropped": 6}
+    context_detail: dict[str, int] | None = None

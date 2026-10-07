@@ -9,9 +9,15 @@ from typing import Any, ClassVar
 import pytest
 
 from imp.agent import Agent, EventType
-from imp.agent.context import Context
+from imp.agent.context import COMPACT_TOOL_OUTPUT_CHARS, Context, _token_formula
 from imp.agent.executor import _truncate_tool_output, execute_tool_batch
-from imp.entities import ReasoningMessage, ToolCall, ToolMessage
+from imp.entities import (
+    AssistantMessage,
+    ReasoningMessage,
+    TextMessage,
+    ToolCall,
+    ToolMessage,
+)
 from imp.events import Usage
 from imp.tools import Tool, ToolResult
 from imp.tools.fs import WriteFile
@@ -660,4 +666,263 @@ async def test_consumer_close_preserves_completed_result_and_next_turn(config):
     assert events[-1].quote == "next answer"
     assert any(
         item.get("type") == "function_call_output" for item in client.calls[-1]["input"]
+    )
+
+
+class RecordingWriter:
+    """SessionWriter stand-in: records every persisted message."""
+
+    def __init__(self) -> None:
+        self.rows: list = []
+
+    def write(self, message) -> None:
+        self.rows.append(message)
+
+
+def test_token_formula_weights_non_ascii():
+    # Equal-length prose: Russian costs measurably more o200k tokens than
+    # English (272 vs 161 for these ~800-char samples).
+    english = TextMessage(
+        role="user",
+        content="The quick brown fox jumps over the lazy dog near the riverbank at dawn. "
+        * 10,
+    )
+    russian = TextMessage(
+        role="user",
+        content="Быстрая бурая лиса прыгает через ленивую собаку возле берега реки на рассвете. "
+        * 10,
+    )
+    assert _token_formula(russian) > _token_formula(english)
+
+
+
+
+def test_replace_system_prompt_writes_once(config):
+    writer = RecordingWriter()
+    context = Context(config, "one", writer=writer)
+    context.replace_system_prompt("two")
+    assert len(writer.rows) == 1
+
+
+def test_append_skips_contentless_reasoning(config):
+    writer = RecordingWriter()
+    context = Context(config, "sys", writer=writer)
+    context.append(
+        ReasoningMessage(
+            item={"type": "reasoning", "id": "rs_1", "summary": []}, content=None
+        )
+    )
+    assert len(writer.rows) == 1  # only the system row from __init__
+    context.append(
+        ReasoningMessage(
+            item={
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [],
+                "encrypted_content": "blob",
+            },
+            content=None,
+        )
+    )
+    assert len(writer.rows) == 2
+    context.append(
+        ReasoningMessage(
+            item={
+                "type": "reasoning",
+                "id": "rs_3",
+                "summary": [{"type": "summary_text", "text": "hmm"}],
+            },
+            content="hmm",
+        )
+    )
+    assert len(writer.rows) == 3
+
+
+def seeded_compact_context(config) -> Context:
+    """System + one completed prior turn + one in-flight current turn."""
+    context = Context(config, "sys")
+    context.append(TextMessage(role="user", content="first question"))
+    context.append(
+        ReasoningMessage(
+            item={
+                "type": "reasoning",
+                "id": "rs_old",
+                "summary": [],
+                "encrypted_content": "old-blob",
+            },
+            content=None,
+        )
+    )
+    context.append(
+        ToolCall(
+            call_id="c1",
+            function_name="fake",
+            arguments={},
+            item={
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "fake",
+                "arguments": "{}",
+            },
+        )
+    )
+    context.append(ToolMessage(call_id="c1", content="x" * 5_000))
+    context.append(
+        AssistantMessage(
+            content="first answer",
+            item={
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_1",
+                "content": [{"type": "output_text", "text": "first answer"}],
+            },
+        )
+    )
+    context.append(TextMessage(role="user", content="second question"))
+    context.append(
+        ReasoningMessage(
+            item={
+                "type": "reasoning",
+                "id": "rs_new",
+                "summary": [],
+                "encrypted_content": "new-blob",
+            },
+            content=None,
+        )
+    )
+    context.append(
+        ToolCall(
+            call_id="c2",
+            function_name="fake",
+            arguments={},
+            item={
+                "type": "function_call",
+                "call_id": "c2",
+                "name": "fake",
+                "arguments": "{}",
+            },
+        )
+    )
+    context.append(ToolMessage(call_id="c2", content="y" * 5_000))
+    return context
+
+
+def test_compact_stubs_prior_turn_only(config):
+    context = seeded_compact_context(config)
+    before = context.tokens
+    assert context.compact() > 0
+    assert context.tokens < before
+    old_reasoning = context.messages[2]
+    assert isinstance(old_reasoning, ReasoningMessage)
+    assert "encrypted_content" not in old_reasoning.item
+    new_reasoning = context.messages[7]
+    assert isinstance(new_reasoning, ReasoningMessage)
+    assert "encrypted_content" in new_reasoning.item
+    old_output = context.messages[4]
+    assert isinstance(old_output, ToolMessage)
+    assert old_output.content.startswith("x" * COMPACT_TOOL_OUTPUT_CHARS)
+    assert "older tool output compacted" in old_output.content
+    new_output = context.messages[9]
+    assert isinstance(new_output, ToolMessage)
+    assert new_output.content == "y" * 5_000
+    serialized = [m.serialize() for m in context.messages]
+    calls = [s for s in serialized if s.get("type") == "function_call"]
+    outputs = [s for s in serialized if s.get("type") == "function_call_output"]
+    assert len(calls) == len(outputs) == 2  # call/output pairing stays balanced
+    snapshot = [m.serialize() for m in context.messages]
+    assert context.compact() == 0
+    assert [m.serialize() for m in context.messages] == snapshot  # idempotent
+
+
+def test_trim_drops_oldest_whole_turns(config):
+    config.max_context = 5_000  # two ~4k-token turns overflow; one fits
+    context = Context(config, "sys")
+    for label in ("one", "two"):
+        content = " ".join(f"{label}{i}" for i in range(1_000))
+        context.append(TextMessage(role="user", content=content))
+        context.append(
+            AssistantMessage(
+                content=content,
+                item={
+                    "type": "message",
+                    "role": "assistant",
+                    "id": f"msg_{label}",
+                    "content": [{"type": "output_text", "text": content}],
+                },
+            )
+        )
+    context.append(TextMessage(role="user", content="hi"))
+    assert context.trim() == 2
+    assert [m.serialize().get("role") for m in context.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert context.messages[1].content.startswith("two0 two1")
+    assert context.messages[3].content == "hi"
+    assert context.is_within_token_limit()
+
+
+async def test_context_warning_emitted_once_when_approaching(config):
+    config.max_context = 14_000
+    config.max_tool_output = 100_000
+    tools = {"fake": FakeTool(ToolResult(ok=True, content="x" * 100_000))}
+    script = [
+        response([function_call_item("one", "fake", {})]),
+        response([message_item("done")]),
+    ]
+    agent, _client = make_agent(config, tools, script)
+    events = await collect(agent, "go")
+    warnings = [e for e in events if e.type is EventType.CONTEXT_WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].token_usage[0] > config.max_context * 0.85
+
+
+
+
+async def test_agent_recovers_over_limit_after_tools(config):
+    config.max_context = 20_000
+    config.max_tool_output = 100_000
+    tools = {"fake": FakeTool(ToolResult(ok=True, content="x" * 100_000))}
+    script = [
+        response([function_call_item("one", "fake", {})]),
+        response([message_item("done")]),
+        response([function_call_item("two", "fake", {})]),
+        response([message_item("recovered")]),
+    ]
+    agent, client = make_agent(config, tools, script)
+    await collect(agent, "first")
+    events = await collect(agent, "second")
+    assert not any(event.type is EventType.ERROR for event in events)
+    assert events[-1].quote == "recovered"
+    assert len(client.calls) == 4
+    assert any(event.type is EventType.CONTEXT_COMPACTED for event in events)
+    stubbed = [
+        m
+        for m in agent.context.messages
+        if isinstance(m, ToolMessage) and "older tool output compacted" in m.content
+    ]
+    assert [m.call_id for m in stubbed] == ["one"]
+
+
+async def test_agent_trims_fat_text_turns_when_compaction_insufficient(config):
+    config.max_context = 15_000
+    config.max_tool_output = 100_000
+    fat_prompt = "first " + " ".join(f"p{i}" for i in range(3_000))  # ~6k tokens
+    tools = {"fake": FakeTool(ToolResult(ok=True, content="x" * 100_000))}
+    script = [
+        response([message_item("done")]),  # fat turn stays text-only
+        response([function_call_item("two", "fake", {})]),
+        response([message_item("recovered")]),
+    ]
+    agent, _client = make_agent(config, tools, script)
+    await collect(agent, fat_prompt)
+    events = await collect(agent, "second")
+    assert not any(event.type is EventType.ERROR for event in events)
+    assert events[-1].quote == "recovered"
+    assert any(event.type is EventType.CONTEXT_TRIMMED for event in events)
+    assert not any(
+        isinstance(m, TextMessage) and m.content == fat_prompt
+        for m in agent.context.messages
     )

@@ -196,10 +196,13 @@ async def test_turn_summary_and_cost_are_recorded(app):
     )
     assert len(rows) == 1
     assert tuple(rows[0]) == ("interactive", 20, 8, 0.0042, 1)
-    assert "✓ done · 0 tools ·" in app.bot.edits[-1]
+    assert "✓ готово · инструментов: 0 ·" in app.bot.edits[-1]
     assert "$0.0042" in app.bot.edits[-1]
     assert app.bot.sent[-1] == "answer"
-    assert turn_summary(3, 47, True, 0.0134) == "✓ done · 3 tools · 47 s · $0.0134"
+    assert (
+        turn_summary(3, 47, True, 0.0134)
+        == "✓ готово · инструментов: 3 · 47 с · $0.0134"
+    )
 
 
 async def test_turn_prompt_refreshes_local_time_without_losing_history(app, monkeypatch):
@@ -326,7 +329,7 @@ async def test_command_status_and_new_are_direct_not_model_turns(app):
     previous = app.session.writer.name
     await controller.handle_message(owner_message("/new", message_id=22))
     await controller.wait_idle()
-    assert "Started a fresh session" in app.bot.sent[-1]
+    assert "Начата новая сессия" in app.bot.sent[-1]
     assert app.session.writer.name != previous
     rows = await app.db.execute_fetchall("SELECT COUNT(*) FROM turns")
     assert rows[0][0] == 0  # commands never reach the model

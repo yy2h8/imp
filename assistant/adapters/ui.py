@@ -15,8 +15,8 @@ from .telegram import TelegramError, send_text
 STATUS_LINES = 8  # tool lines kept in the live log
 MAX_SUBJECT_CHARS = 40
 
-HEADER_THINKING = "🧠 thinking…"
-HEADER_WORKING = "🧠 working"
+HEADER_THINKING = "🧠 думаю…"
+HEADER_WORKING = "🧠 работаю"
 
 _SHORT_NAMES = {
     "read_file": "read",
@@ -41,11 +41,44 @@ _SHORT_NAMES = {
 
 def turn_summary(tools: int, seconds: int, ok: bool, cost_usd: float | None) -> str:
     """The one-line status collapse at turn end."""
-    mark = "✓ done" if ok else "✗ failed"
-    text = f"{mark} · {tools} tools · {seconds} s"
+    mark = "✓ готово" if ok else "✗ ошибка"
+    text = f"{mark} · инструментов: {tools} · {seconds} с"
     if ok and cost_usd is not None:
         text += f" · ${cost_usd:.4f}"
     return text
+
+
+# imp emits English error text; these exact matches get a Russian rendering
+# for the owner, anything else passes through unchanged.
+_ERROR_TRANSLATIONS = {
+    "Context exceeds token limit.": "Контекст превысил лимит токенов.",
+    "Context exceeds token limit after tool calls.": (
+        "Контекст превысил лимит токенов после вызовов инструментов."
+    ),
+    "Maximum iteration limit reached.": "Достигнут предел числа итераций.",
+}
+
+
+def russian_error(message: str | None) -> str:
+    return _ERROR_TRANSLATIONS.get(message or "", message or "")
+
+
+def _tok(used: int, maximum: int) -> str:
+    return f"{used // 1000}k/{maximum // 1000}k ток"
+
+
+def context_line(event: AgentEvent) -> str:
+    """Russian one-liner for CONTEXT_* events, driven by the structured
+    payload (token_usage + context_detail), not imp's English quote."""
+    detail = event.context_detail or {}
+    used, maximum = event.token_usage
+    if event.type is EventType.CONTEXT_COMPACTED:
+        saved = detail.get("saved", 0)
+        return f"♻ контекст сжат (−{saved} ток) → {_tok(used, maximum)}"
+    if event.type is EventType.CONTEXT_TRIMMED:
+        dropped = detail.get("dropped", 0)
+        return f"♻ удалено старых сообщений: {dropped} → {_tok(used, maximum)}"
+    return f"⚠ контекст близок к лимиту: {_tok(used, maximum)}"
 
 
 def _clip(text: str, limit: int = MAX_SUBJECT_CHARS) -> str:
@@ -178,7 +211,13 @@ class TelegramUIAdapter:
             line = f"{short:<8}{tool_subject(event.tool_name or '', event.tool_args)}"
             self._add(line.rstrip())
         elif event.type is EventType.ERROR and event.error_message:
-            self._add(f"*error:* {event.error_message}")
+            self._add(f"*ошибка:* {russian_error(event.error_message)}")
+        elif event.type in (
+            EventType.CONTEXT_COMPACTED,
+            EventType.CONTEXT_TRIMMED,
+            EventType.CONTEXT_WARNING,
+        ):
+            self._add(context_line(event))
         # THINKING / REASONING / MODEL_RESPONSE never touch the status
 
     def _add(self, line: str) -> None:
