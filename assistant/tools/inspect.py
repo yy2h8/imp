@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -16,6 +15,7 @@ from ..db import (
     jobs_meta_list,
     queue_count_waiting,
     transcript_search,
+    turn_last_by_schedule,
     turn_last_by_session,
     turns_report,
 )
@@ -56,18 +56,27 @@ class ListJobs(Tool):
         lines = []
 
         async def _last_run(row: dict) -> str:
-            transcript = row.get("transcript") or ""
-            if not transcript:
-                return ""
-            turn = await turn_last_by_session(self.db, transcript)
+            turn = await turn_last_by_schedule(self.db, row.get("schedule_id", ""))
+            if turn is None and row.get("transcript"):
+                turn = await turn_last_by_session(self.db, row["transcript"])
             if turn is None:
-                return ""
-            return " · last run: " + turn_summary(
+                return " · доставка: unknown" if row.get("delivery") else ""
+            complete = (
+                None if turn["cost_complete"] is None else bool(turn["cost_complete"])
+            )
+            detail = " · last run: " + turn_summary(
                 int(turn["tools"]),
                 int(turn["seconds"]),
                 bool(turn["ok"]),
                 turn["cost_usd"],
+                complete,
             )
+            detail += f" · выполнение: {turn['status']} · доставка: {turn['delivery_state'] or 'unknown'}"
+            if turn["error_code"]:
+                detail += f" · причина: {turn['error_code']}"
+            if turn["delivery_error"]:
+                detail += " · " + " ".join(turn["delivery_error"].split())[:120]
+            return detail
 
         for job in scheduled:
             row = metadata.get(job.id, {})
@@ -106,9 +115,7 @@ class SearchTranscripts(Tool):
     }
     required: ClassVar[list[str]] = ["query"]
 
-    def __init__(
-        self, db: aiosqlite.Connection | None = None, **kwargs
-    ) -> None:
+    def __init__(self, db: aiosqlite.Connection | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.db = db
 
@@ -124,19 +131,9 @@ class SearchTranscripts(Tool):
         if not rows:
             return ToolResult(ok=True, content="No transcript matches.")
         lines = []
-        for session_id, raw in rows:
-            try:
-                message = json.loads(raw)
-                role = message.get("role", message.get("type", "message"))
-                content = message.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        str(item.get("text", item)) if isinstance(item, dict) else str(item)
-                        for item in content
-                    )
-                lines.append(f"{session_id} · {role}: {str(content)[:500]}")
-            except (ValueError, TypeError):
-                lines.append(f"{session_id}: {raw[:500]}")
+        for session_id, seq, ts, kind, tool, text in rows:
+            source = tool or kind
+            lines.append(f"{session_id}:{seq} · {ts} · {source}: {text}")
         return ToolResult(ok=True, content="\n".join(lines))
 
 
@@ -152,9 +149,7 @@ class CostReport(Tool):
     }
     required: ClassVar[list[str]] = []
 
-    def __init__(
-        self, db: aiosqlite.Connection | None = None, **kwargs
-    ) -> None:
+    def __init__(self, db: aiosqlite.Connection | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.db = db
 
@@ -168,7 +163,9 @@ class CostReport(Tool):
             return ToolResult(ok=False, content=str(exc))
         content = (
             f"turns {report['turns']} · in {_short(report['in_tokens'])}"
-            f" · out {_short(report['out_tokens'])} · ${report['cost_usd']:.4f}"
+            f" · out {_short(report['out_tokens'])} · known ${report['cost_usd']:.4f}"
+            f" · running {report['running']} · completed {report['completed']}"
+            f" · incomplete cost {report['incomplete_cost']} · unknown cost {report['unknown_cost']}"
         )
         return ToolResult(ok=True, content=content)
 

@@ -7,7 +7,6 @@ import json
 import logging
 import signal
 import sys
-import time
 from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,25 +24,24 @@ from .adapters.ui import (
 )
 from .app import RESET_NOTICE, AssistantApp, CurrentTurn, build_assistant, ensure_home
 from .bootstrap import (
-    needs_tailoring,
     prune_scratch,
-    read_state,
     run_bootstrap,
     tailor_manual,
 )
 from .config import AssistantConfig
 from .db import (
+    STATE_DB_NAME,
     prune_transcripts,
     queue_claim_next,
     queue_finish,
     queue_finish_album,
-    queue_interrupted,
     queue_resume_collecting,
-    turn_insert,
+    recover_runs,
 )
 from .intake import AlbumBuffer, Intake, route_message
-from .scheduler import set_context, startup_recovery
+from .scheduler import set_context, shutdown_jobs, startup_recovery
 from .status import collect_status
+from .turns import Run, error_detail
 
 _LOG = logging.getLogger(__name__)
 TYPING_INTERVAL_S = 4.0
@@ -64,7 +62,9 @@ _DIRECT_COMMANDS = frozenset({"/status", "/cancel", "/new"})
 class TurnRunner:
     """Run one queued owner request; own the interactive live status and log."""
 
-    def __init__(self, app: AssistantApp, bot, edit_interval: float, status_max_chars: int) -> None:
+    def __init__(
+        self, app: AssistantApp, bot, edit_interval: float, status_max_chars: int
+    ) -> None:
         self.app = app
         self.bot = bot
         self.edit_interval = edit_interval
@@ -83,18 +83,53 @@ class TurnRunner:
         finally:
             self.app.turn_state["active"] = previous
 
-    async def run(self, prompt: str) -> None:
+    async def run(
+        self, prompt: str, run: Run | None = None, cancellation_reason=None
+    ) -> None:
         async with self._turn_scope():
             command = await self._command(prompt)
             if command is not None:
                 await send_text(self.bot, self.app.chat_id, command)
                 return
-            _LOG.info("turn start: %s", _preview(prompt))
-            await asyncio.to_thread(self.app.refresh_prompt)
-            notice = await asyncio.to_thread(self._reset_if_needed)
-            if notice is not None:
-                await send_text(self.bot, self.app.chat_id, notice)
-            await self._agent_turn(prompt)
+            if run is None:
+                run = await Run.start(
+                    self.app.assistant.home / STATE_DB_NAME,
+                    kind="interactive",
+                    model=self.app.config.model,
+                    session_id=self.app.session.writer.name,
+                    secrets=(self.app.config.api_key, self.app.assistant.bot_token),
+                )
+            try:
+                if run.cancelled_during_start:
+                    raise asyncio.CancelledError
+                await asyncio.to_thread(self.app.refresh_prompt)
+                notice = await asyncio.to_thread(self._reset_if_needed)
+                if notice is not None:
+                    await send_text(self.bot, self.app.chat_id, notice)
+                run.session_id = self.app.session.writer.name
+                await self._agent_turn(prompt, run, cancellation_reason)
+            except asyncio.CancelledError:
+                status = cancellation_reason() if cancellation_reason else "interrupted"
+                await run.finish(
+                    status,
+                    self.app.chat_id,
+                    "Запрос отменён."
+                    if status == "cancelled"
+                    else "Запрос прерван остановкой бота.",
+                    code=status,
+                )
+                raise
+            except Exception as exc:
+                await run.finish(
+                    "failed",
+                    self.app.chat_id,
+                    "*ошибка:* " + error_detail(exc, run.secrets),
+                    code="runtime_error",
+                    error=exc,
+                )
+                if self.app.outbox:
+                    self.app.outbox.wake()
+                    await self.app.outbox.deliver_now(run.id)
 
     async def _command(self, prompt: str) -> str | None:
         if command_token(prompt) == "/status":
@@ -119,12 +154,12 @@ class TurnRunner:
             return f"{RESET_NOTICE} New transcript: `{name}`"
         return None
 
-    async def _agent_turn(self, prompt: str) -> None:
-        started = time.monotonic()
-        started_at = datetime.now(UTC).isoformat()
+    async def _agent_turn(
+        self, prompt: str, run: Run, cancellation_reason=None
+    ) -> None:
         self.app.current_turn = CurrentTurn(
             prompt=_preview(prompt, 100),
-            started_monotonic=started,
+            started_monotonic=run.started,
             started_at=datetime.now(UTC),
         )
         ui = TelegramUIAdapter(
@@ -133,93 +168,80 @@ class TurnRunner:
             edit_interval=self.edit_interval,
             max_chars=self.status_max_chars,
         )
-        await ui.begin()
-        typing = asyncio.create_task(self._keep_typing())
-        tools = 0
-        error: str | None = None
-        cancelled = False
+        typing = None
         reply = ""
-        in_tokens = out_tokens = 0
-        reported_cost = 0.0
-        saw_model_response = False
-        cost_complete = True
+        status = "completed"
         try:
+            await ui.begin()
+            typing = asyncio.create_task(self._keep_typing())
             async with aclosing(self.app.agent.run_turn(prompt)) as events:
                 async for event in events:
+                    await run.observe(event)
                     if event.type is EventType.TOOL_START:
-                        tools += 1
-                        self.app.current_turn.tools = tools
+                        self.app.current_turn.tools = run.tools
                         self.app.current_turn.activity = tool_label(
                             event.tool_name, event.tool_args
                         )
-                        _LOG.info("tool: %s", event.tool_name)
-                    elif event.type is EventType.ERROR:
-                        error = event.error_message or "Turn failed"
                     elif event.type is EventType.MODEL_RESPONSE:
                         reply = event.quote or ""
                         if reply:
                             self.app.current_turn.last_reply = _preview(reply, 100)
                             self.app.current_turn.last_reply_at = datetime.now(UTC)
-                        saw_model_response = True
-                        if event.usage is None:
-                            cost_complete = False
-                        else:
-                            in_tokens += event.usage.input_tokens
-                            out_tokens += event.usage.output_tokens
-                            if event.usage.cost_usd is None:
-                                cost_complete = False
-                            else:
-                                reported_cost += event.usage.cost_usd
                     await ui.handle(event)
                     await ui.flush()
+            if run.error:
+                status = "failed"
+            elif not reply.strip():
+                status = "failed"
+                run.error, run.error_code = (
+                    "Model returned no final answer",
+                    "empty_response",
+                )
         except asyncio.CancelledError:
-            cancelled = True
+            status = cancellation_reason() if cancellation_reason else "interrupted"
+            run.error, run.error_code = status, status
         except Exception as exc:
-            error = str(exc)
+            status = "failed"
+            run.error, run.error_code = error_detail(exc, run.secrets), "runtime_error"
         finally:
-            typing.cancel()
-            await asyncio.gather(typing, return_exceptions=True)
+            if typing:
+                typing.cancel()
+                await asyncio.gather(typing, return_exceptions=True)
             self.app.current_turn = None
-
-        seconds = int(time.monotonic() - started)
-        ok = error is None and not cancelled
-        cost = reported_cost if saw_model_response and cost_complete else None
-        if self.app.db is not None:
-            await turn_insert(
-                self.app.db,
-                ts=started_at,
-                kind="interactive",
-                session_id=self.app.session.writer.name,
-                model=self.app.config.model,
-                in_tokens=in_tokens,
-                out_tokens=out_tokens,
-                cost_usd=cost,
-                tools=tools,
-                seconds=seconds,
-                ok=ok,
+        text = (
+            reply if status == "completed" else "*ошибка:* " + russian_error(run.error)
+        )
+        if status in ("cancelled", "interrupted"):
+            text = (
+                "Запрос отменён."
+                if status == "cancelled"
+                else "Запрос прерван остановкой бота; действия повторно не выполняются."
             )
-            deleted = await prune_transcripts(
+        await run.finish(status, self.app.chat_id, text)
+        if self.app.outbox:
+            self.app.outbox.wake()
+            if status != "interrupted":
+                await self.app.outbox.deliver_now(run.id)
+        if status != "interrupted":
+            await ui.end_turn(
+                f"✋ отменён · {run.tools} tools · {int(run.seconds)} s"
+                if status == "cancelled"
+                else turn_summary(
+                    run.tools,
+                    int(run.seconds),
+                    status == "completed",
+                    run.cost,
+                    run.cost_complete,
+                )
+            )
+        if status in ("cancelled", "interrupted"):
+            raise asyncio.CancelledError
+        if self.app.db:
+            await prune_transcripts(
                 self.app.db,
                 self.app.assistant.transcript_item_ttl_days,
                 self.app.assistant.transcript_ttl_days,
             )
-            if deleted:
-                _LOG.info("pruned %d aged transcript rows", deleted)
-        _LOG.info("turn finished: ok=%s tools=%d elapsed=%ds", ok, tools, seconds)
-        if cancelled:
-            _LOG.info("turn cancelled by owner: tools=%d elapsed=%ds", tools, seconds)
-            await ui.end_turn(f"✋ отменён · {tools} tools · {seconds} s")
-            raise asyncio.CancelledError
-        if error is not None:
-            _LOG.warning("turn failed: %s", error)
-            await send_text(
-                self.bot, self.app.chat_id, f"*ошибка:* {russian_error(error)}"
-            )
-            await ui.end_turn(turn_summary(tools, seconds, False, None))
-            return
-        await ui.end_turn(turn_summary(tools, seconds, True, cost))
-        if reply:
-            await ui.answer(reply)
 
     async def _keep_typing(self) -> None:
         while True:
@@ -278,7 +300,9 @@ class AssistantController:
             return
         message_id = message.get("message_id")
         if routed.answer is not None:
-            if await self.intake.mark_seen(message_id) and not self.app.ask_router.deliver(routed.answer):
+            if await self.intake.mark_seen(
+                message_id
+            ) and not self.app.ask_router.deliver(routed.answer):
                 # The question ended during routing; preserve the message as work.
                 message["text"] = routed.answer
                 ack = await self.intake.accept_unseen(message)
@@ -374,7 +398,7 @@ class AssistantController:
                 self._working = True
                 try:
                     payload = json.loads(raw)
-                    row = asyncio.create_task(self._run_row(kind, payload))
+                    row = asyncio.create_task(self._run_row(kind, payload, row_id))
                     self._current_row = row
                     try:
                         await row
@@ -398,7 +422,9 @@ class AssistantController:
                 except Exception:
                     _LOG.exception("queued request %s failed", row_id)
                     await send_text(
-                        self.app.bot, self.app.chat_id, "*ошибка:* запрос из очереди не выполнен"
+                        self.app.bot,
+                        self.app.chat_id,
+                        "*ошибка:* запрос из очереди не выполнен",
                     )
                     completed = True
                 finally:
@@ -406,23 +432,72 @@ class AssistantController:
                         await queue_finish(self.app.db, row_id)
                     self._working = False
 
-    async def _run_row(self, kind: str, payload: dict) -> None:
+    async def _run_row(
+        self, kind: str, payload: dict, row_id: int | None = None
+    ) -> None:
         async with self._busy_scope():
-            if kind == "attachment":
-                prompt = await self.app.uploads.handle(
-                    payload.get("attachments", []),
-                    payload.get("caption", ""),
-                    payload.get("reply_context", ""),
+            run = None
+            reason = lambda: "cancelled" if self._cancel_requested else "interrupted"
+            if (
+                kind == "attachment"
+                or command_token(payload.get("text", "")) not in _DIRECT_COMMANDS
+            ):
+                run = await Run.start(
+                    self.app.assistant.home / STATE_DB_NAME,
+                    kind="interactive",
+                    model=self.app.config.model,
+                    session_id=self.app.session.writer.name,
+                    queue_id=row_id,
+                    secrets=(self.app.config.api_key, self.app.assistant.bot_token),
                 )
-            else:
-                prompt = payload.get("text", "")
-            if prompt:
-                await TurnRunner(
-                    self.app,
-                    self.app.bot,
-                    self.app.assistant.edit_interval,
-                    self.app.assistant.status_max_chars,
-                ).run(prompt)
+            try:
+                if run and run.cancelled_during_start:
+                    raise asyncio.CancelledError
+                if kind == "attachment":
+                    prompt = await self.app.uploads.handle(
+                        payload.get("attachments", []),
+                        payload.get("caption", ""),
+                        payload.get("reply_context", ""),
+                    )
+                else:
+                    prompt = payload.get("text", "")
+                if prompt:
+                    await TurnRunner(
+                        self.app,
+                        self.app.bot,
+                        self.app.assistant.edit_interval,
+                        self.app.assistant.status_max_chars,
+                    ).run(prompt, run, reason)
+                elif run:
+                    await run.finish(
+                        "failed",
+                        self.app.chat_id,
+                        "Запрос не содержит текста.",
+                        code="empty_response",
+                    )
+            except asyncio.CancelledError:
+                if run:
+                    await run.finish(
+                        reason(),
+                        self.app.chat_id,
+                        "Запрос отменён или прерван.",
+                        code=reason(),
+                    )
+                raise
+            except Exception as exc:
+                if run:
+                    await run.finish(
+                        "failed",
+                        self.app.chat_id,
+                        "*ошибка:* " + error_detail(exc, run.secrets),
+                        code="runtime_error",
+                        error=exc,
+                    )
+                else:
+                    raise
+            finally:
+                if self.app.outbox:
+                    self.app.outbox.wake()
 
 
 async def poll_updates(bot: TelegramBot, controller: AssistantController) -> None:
@@ -443,8 +518,12 @@ async def poll_updates(bot: TelegramBot, controller: AssistantController) -> Non
                     if message := update.get("message"):
                         await controller.handle_message(message)
                 except Exception as exc:
-                    _LOG.exception("Telegram intake failed; leaving update unacknowledged")
-                    await asyncio.sleep(exc.retry_after if isinstance(exc, TelegramError) else 5)
+                    _LOG.exception(
+                        "Telegram intake failed; leaving update unacknowledged"
+                    )
+                    await asyncio.sleep(
+                        exc.retry_after if isinstance(exc, TelegramError) else 5
+                    )
                     break
                 offset = update["update_id"] + 1
     finally:
@@ -454,14 +533,7 @@ async def poll_updates(bot: TelegramBot, controller: AssistantController) -> Non
 async def _recover_interactive_requests(app: AssistantApp) -> None:
     if app.db is None:
         return
-    for row_id, _kind, _payload in await queue_interrupted(app.db):
-        await send_text(
-            app.bot,
-            app.chat_id,
-            "Запрос был прерван перезапуском бота. Он мог уже выполнить "
-            "часть действий, поэтому повторно я его не выполняю. Проверьте "
-            f"предыдущую переписку перед повторной отправкой (элемент очереди {row_id}).",
-        )
+    await recover_runs(app.assistant.home / STATE_DB_NAME, app.chat_id)
 
 
 async def run_bot() -> None:
@@ -502,39 +574,48 @@ async def run_bot() -> None:
         finally:
             await controller.close()
             app.scheduler.shutdown(wait=False)
+            await shutdown_jobs()
             await app.outbox.stop()
             set_context(None)
 
 
 async def startup(assistant_config: AssistantConfig, chat_id: int, force: bool):
-    """Bootstrap: probe → manual → fingerprint, then optional tailoring turn."""
-    was_tailored = not needs_tailoring(read_state(assistant_config.home))
+    """Tailor only a missing manual or an explicitly requested refresh."""
     result = await asyncio.to_thread(
         run_bootstrap, assistant_config.home, _package_dir(), force=force
     )
-    if not result.changed and not needs_tailoring(read_state(assistant_config.home)):
+    if result.probe is None:
         return result
     async with build_assistant(assistant_config, chat_id) as app:
         prune_scratch(app.assistant.home, app.assistant.scratch_ttl_days)
         try:
             await tailor_manual(app, result.probe)
         except Exception as exc:
+            if force:
+                raise RuntimeError(f"Manual tailoring failed: {exc}") from exc
             print(f"Manual tailoring failed: {exc}", file=sys.stderr)
             await send_text(
                 app.bot,
                 chat_id,
                 "Не удалось адаптировать инструкцию под эту машину. "
-                "Продолжаю с текущей; повторю попытку при следующем запуске.",
+                "Продолжаю с текущей. Для повтора запустите `python -m assistant tailor`.",
             )
             return result
-        if result.changed and was_tailored:
+        if force:
             await send_text(
                 app.bot,
                 chat_id,
-                "Окружение машины изменилось — `AGENTS.md` перегенерирован "
-                "по свежим данным и заново адаптирован.",
+                "`AGENTS.md` обновлён по свежим данным и заново адаптирован.",
             )
     return result
+
+
+async def tailor() -> None:
+    """Explicit manual refresh; exits after tailoring, without starting polling."""
+    config = AssistantConfig.from_env()
+    logging.getLogger().setLevel(config.log_level.upper())
+    ensure_home(config.home)
+    await startup(config, next(iter(config.allowed_user_ids)), force=True)
 
 
 def _package_dir() -> Path:
@@ -594,22 +675,19 @@ def main(argv: list[str] | None = None) -> None:
     logging.getLogger("telegram").setLevel(logging.WARNING)
     args = sys.argv[1:] if argv is None else argv
     command = args[0] if args else ""
-    if command == "whoami":
-        try:
-            asyncio.run(whoami())
-        except KeyboardInterrupt:
-            pass
-        except ValueError as e:
-            raise SystemExit(f"Configuration error: {e}")
-        return
-    if command:
-        raise SystemExit(f"unknown command: {command!r} (use 'whoami' or none)")
+    commands = {"": run_bot, "whoami": whoami, "tailor": tailor}
+    if command not in commands:
+        raise SystemExit(
+            f"unknown command: {command!r} (use 'whoami', 'tailor' or none)"
+        )
     try:
-        asyncio.run(run_bot())
+        asyncio.run(commands[command]())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     except ValueError as e:
         raise SystemExit(f"Configuration error: {e}")
+    except RuntimeError as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":

@@ -37,8 +37,13 @@ class FakeScheduler:
 async def test_list_jobs_joins_next_fire_with_metadata(db, tmp_path):
     next_run = datetime(2026, 10, 1, 9, tzinfo=UTC)
     await jobs_meta_upsert(
-        db, schedule_id="daily", label="Daily report", prompt="p", tz="UTC",
-        state="scheduled", result="last result",
+        db,
+        schedule_id="daily",
+        label="Daily report",
+        prompt="p",
+        tz="UTC",
+        state="scheduled",
+        result="last result",
     )
     scheduler = FakeScheduler(
         SimpleNamespace(id="daily", next_run_time=next_run),
@@ -51,7 +56,6 @@ async def test_list_jobs_joins_next_fire_with_metadata(db, tmp_path):
     assert "daily" in result.content and "Daily report" in result.content
     assert "2026-10-01" in result.content and "last result" in result.content
     assert "orphan" in result.content
-
 
 
 async def test_list_jobs_appends_last_run_summary_from_transcript(db, tmp_path):
@@ -103,7 +107,12 @@ async def test_list_jobs_without_transcript_has_no_last_run(db, tmp_path):
 async def test_search_transcripts_finds_and_misses(db, tmp_path):
     await db.execute(
         "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
-        ("s1", 0, "2026-01-01T00:00:00+00:00", json.dumps({"role": "user", "content": "armbian box"})),
+        (
+            "s1",
+            0,
+            "2026-01-01T00:00:00+00:00",
+            json.dumps({"role": "user", "content": "armbian box"}),
+        ),
     )
     await db.commit()
     tool = SearchTranscripts(config=Config(api_key="k", workspace=tmp_path), db=db)
@@ -115,9 +124,17 @@ async def test_search_transcripts_finds_and_misses(db, tmp_path):
 
 async def test_cost_report_aggregates_period(db, tmp_path):
     await turn_insert(
-        db, ts=datetime.now(UTC).isoformat(), kind="interactive", session_id="s",
-        model="m", in_tokens=45000, out_tokens=8000, cost_usd=0.42,
-        tools=3, seconds=10, ok=True,
+        db,
+        ts=datetime.now(UTC).isoformat(),
+        kind="interactive",
+        session_id="s",
+        model="m",
+        in_tokens=45000,
+        out_tokens=8000,
+        cost_usd=0.42,
+        tools=3,
+        seconds=10,
+        ok=True,
     )
     result = await CostReport(
         config=Config(api_key="k", workspace=tmp_path), db=db
@@ -132,7 +149,44 @@ async def test_queue_status_reports_waiting_depth_and_active_turn(db, tmp_path):
     await queue_push(db, "text", "one")
     await queue_push(db, "text", "two")
     result = await QueueStatus(
-        config=Config(api_key="k", workspace=tmp_path), db=db,
+        config=Config(api_key="k", workspace=tmp_path),
+        db=db,
         is_turn_active=lambda: True,
     ).execute()
-    assert result.ok and "2 waiting" in result.content and "turn active" in result.content
+    assert (
+        result.ok and "2 waiting" in result.content and "turn active" in result.content
+    )
+
+
+async def test_list_jobs_separates_execution_and_delivery(db, tmp_path):
+    from assistant.db import delivery_claim, delivery_retry, turn_finish, turn_start
+
+    path = tmp_path / STATE_DB_NAME
+    await jobs_meta_upsert(
+        db, schedule_id="daily", label="Daily", prompt="p", tz="UTC", state="scheduled"
+    )
+    run = await turn_start(
+        path, kind="job", model="m", session_id="s", schedule_id="daily"
+    )
+    await turn_finish(
+        path,
+        run,
+        status="completed",
+        error_code=None,
+        error_message=None,
+        chat_id=7,
+        text="answer",
+        job_state="scheduled",
+    )
+    delivery = await delivery_claim(path, datetime.now(UTC).isoformat())
+    await delivery_retry(
+        path, delivery["id"], error="offline", next_attempt_at="2099-01-01"
+    )
+    result = await ListJobs(
+        config=Config(api_key="k", workspace=tmp_path), db=db
+    ).execute()
+    assert (
+        "completed" in result.content
+        and "pending" in result.content
+        and "offline" in result.content
+    )

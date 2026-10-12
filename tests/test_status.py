@@ -98,7 +98,6 @@ def test_format_tokens_marks_estimate():
     assert format_tokens(12_345, 128_000) == "~12 345 / 128 000 токенов (оценка)"
 
 
-
 async def test_jobs_lines_sorted_limited_labeled(tmp_path):
     db = await open_db(tmp_path / "state.db")
     try:
@@ -162,7 +161,6 @@ async def test_jobs_lines_collapses_multiline_labels(tmp_path):
         assert lines == [f"• строка один строка два — {local:%d.%m %H:%M}"]
     finally:
         await db.close()
-
 
 
 async def test_jobs_lines_without_scheduler_is_unavailable():
@@ -243,8 +241,6 @@ async def test_collect_status_never_leaks_the_api_key(tmp_path):
     assert "sk-test-secret" not in summary
 
 
-
-
 async def test_turn_lines_running_turn_with_activity(tmp_path):
     current = CurrentTurn(
         prompt="очень длинный запрос " * 20,
@@ -284,7 +280,6 @@ async def test_turn_lines_waiting_for_model_answer(tmp_path):
 async def test_turn_lines_idle_shows_last_reply_in_owner_tz(tmp_path):
     import json
 
-
     db = await open_db(tmp_path / "state.db")
     await db.execute(
         "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
@@ -312,8 +307,6 @@ async def test_turn_lines_idle_shows_last_reply_in_owner_tz(tmp_path):
     assert lines == ["💬 Последний ответ 01.01 10:00: «done»"]
 
 
-
-
 async def test_turn_lines_running_job_and_queue_depth(tmp_path):
     db = await open_db(tmp_path / "state.db")
     await jobs_meta_upsert(
@@ -328,8 +321,7 @@ async def test_turn_lines_running_job_and_queue_depth(tmp_path):
     await queue_push(db, "text", "two")
     lines = await _turn_lines(fake_app(tmp_path, db=db), TZ)
     assert any(
-        line.startswith("⏳ Фоновое задание: ") and " — идёт " in line
-        for line in lines
+        line.startswith("⏳ Фоновое задание: ") and " — идёт " in line for line in lines
     )
     await db.close()
 
@@ -340,3 +332,35 @@ async def test_turn_lines_idle_without_db_or_history_is_empty(tmp_path):
         session=SimpleNamespace(writer=SimpleNamespace(session_id="fresh", name="f")),
     )
     assert await _turn_lines(app, TZ) == []
+
+
+async def test_status_shows_pending_delivery_and_error(tmp_path):
+    from assistant.db import (
+        STATE_DB_NAME,
+        delivery_claim,
+        delivery_retry,
+        turn_finish,
+        turn_start,
+    )
+
+    path = tmp_path / STATE_DB_NAME
+    db = await open_db(path)
+    try:
+        run = await turn_start(path, kind="job", model="m", session_id="s")
+        await turn_finish(
+            path,
+            run,
+            status="completed",
+            error_code=None,
+            error_message=None,
+            chat_id=7,
+            text="answer",
+        )
+        delivery = await delivery_claim(path, datetime.now(UTC).isoformat())
+        await delivery_retry(
+            path, delivery["id"], error="offline", next_attempt_at="2099-01-01"
+        )
+        text = await collect_status(fake_app(tmp_path, db=db))
+        assert "Доставка" in text and "offline" in text
+    finally:
+        await db.close()

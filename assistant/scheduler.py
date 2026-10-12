@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from contextlib import aclosing
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,11 +25,11 @@ from sqlalchemy import URL
 from imp.agent import Agent, Context, EventType
 from imp.tools.ask import Ask
 
-from .adapters.telegram import send_text
 from .adapters.ui import turn_summary
-from .db import STATE_DB_NAME, jobs_meta_running, jobs_meta_update, turn_insert
+from .db import STATE_DB_NAME, recover_runs
 from .outbox import Outbox
 from .transcripts import DbSessionWriter
+from .turns import Run, error_detail
 
 _LOG = logging.getLogger(__name__)
 
@@ -55,6 +53,7 @@ class JobContext:
 
 
 _CONTEXT: JobContext | None = None
+_RUNNING: set[asyncio.Task] = set()
 
 
 def set_context(ctx: JobContext | None) -> None:
@@ -81,121 +80,121 @@ def build_scheduler(home: Path, tz: str) -> AsyncIOScheduler:
 
 def _recurring(scheduler: AsyncIOScheduler, schedule_id: str) -> bool:
     job = scheduler.get_job(schedule_id)
-    return isinstance(
-        getattr(job, "trigger", None), (IntervalTrigger, CronTrigger)
-    )
+    return isinstance(getattr(job, "trigger", None), (IntervalTrigger, CronTrigger))
 
 
 async def run_scheduled_job(schedule_id: str, prompt: str) -> None:
-    """Module-level APSerializer target: runs one due job in a fresh session
-    and queues the result for delivery between interactive turns."""
     ctx = _CONTEXT
-    if ctx is None:  # stale persisted schedule (e.g. after a refactor)
-        _LOG.error(
-            "job %s cannot run: no JobContext registered; remove the schedule",
-            schedule_id,
-        )
+    if ctx is None:
+        _LOG.error("job %s cannot run: no JobContext", schedule_id)
         return
-    async with ctx.semaphore:
-        await jobs_meta_update(ctx.db, schedule_id, state="running")
-        _LOG.info("job %s started", schedule_id)
-        try:
-            result, session_id, summary = await _execute(ctx, schedule_id, prompt)
-        except Exception as exc:
-            _LOG.warning("job %s failed: %s", schedule_id, exc)
-            result = f"Задание {schedule_id} завершилось с ошибкой: {exc}"
-            await jobs_meta_update(
-                ctx.db, schedule_id, state="error", result=result
-            )
-            await ctx.outbox.submit(f"⏰ {schedule_id}\n\n{result}")
-        else:
-            state = (
-                "scheduled" if _recurring(ctx.scheduler, schedule_id) else "done"
-            )
-            await jobs_meta_update(
-                ctx.db,
-                schedule_id,
-                state=state,
-                result=result,
-                transcript=session_id,
-            )
-            await ctx.outbox.submit(f"⏰ {schedule_id}\n\n{result}\n\n{summary}")
-        await jobs_meta_update(ctx.db, schedule_id, delivery="queued")
-        _LOG.info("job %s finished; result queued for delivery", schedule_id)
-
-
-async def _execute(ctx: JobContext, schedule_id: str, prompt: str) -> tuple[str, str, str]:
-    """Fresh context, no interactive questions; records the turns row.
-    Returns (answer, session_id, run summary)."""
-    started = time.monotonic()
-    system_prompt = ctx.app.build_prompt() + NON_INTERACTIVE_SUFFIX
-    writer = DbSessionWriter(ctx.db_path)
-    writer.__enter__()
-    answer = ""
-    in_tokens = out_tokens = 0
-    cost: float | None = None
-    tools = 0
-    ok = True
+    task = asyncio.current_task()
+    _RUNNING.add(task)
     try:
-        context = Context(
-            config=ctx.app.config, system_prompt=system_prompt, writer=writer
-        )
-        agent = Agent(
-            config=ctx.app.config,
-            tools={
-                name: tool
-                for name, tool in ctx.app.agent.tools.items()
-                if name != Ask.name
-            },
-            client=ctx.app.agent.client,
-            context=context,
-        )
-        try:
-            async with aclosing(agent.run_turn(prompt)) as events:
-                async for event in events:
-                    if event.type is EventType.MODEL_RESPONSE:
-                        answer = event.quote or ""
-                        if event.usage is not None:
-                            in_tokens += event.usage.input_tokens
-                            out_tokens += event.usage.output_tokens
-                            if event.usage.cost_usd is not None:
-                                cost = (cost or 0.0) + event.usage.cost_usd
-                    elif event.type is EventType.TOOL_START:
-                        tools += 1
-                    elif event.type is EventType.ERROR and event.error_message:
-                        raise RuntimeError(event.error_message)
-        except Exception:
-            ok = False
-            raise
-        return answer, writer.session_id, turn_summary(
-            tools, int(time.monotonic() - started), True, cost
-        )
+        async with ctx.semaphore:
+            writer = DbSessionWriter(ctx.db_path)
+            secrets = (
+                ctx.app.config.api_key,
+                getattr(getattr(ctx.app, "assistant", None), "bot_token", ""),
+            )
+            run = await Run.start(
+                ctx.db_path,
+                kind="job",
+                model=ctx.app.config.model,
+                session_id=writer.session_id,
+                schedule_id=schedule_id,
+                secrets=secrets,
+            )
+            status = "completed"
+            answer = ""
+            try:
+                if run.cancelled_during_start:
+                    raise asyncio.CancelledError
+                await asyncio.to_thread(writer.__enter__)
+                answer = await _execute(ctx, run, prompt, writer)
+                if run.error:
+                    status = "failed"
+                elif not answer.strip():
+                    status = "failed"
+                    run.error, run.error_code = (
+                        "Model returned no final answer",
+                        "empty_response",
+                    )
+            except asyncio.CancelledError:
+                status = "interrupted"
+                run.error, run.error_code = (
+                    "Process stopped before completion",
+                    "interrupted",
+                )
+            except Exception as exc:
+                status = "failed"
+                run.error, run.error_code = error_detail(exc, secrets), "runtime_error"
+            finally:
+                await asyncio.to_thread(writer.__exit__, None, None, None)
+            text = (
+                answer
+                if status == "completed"
+                else f"Задание {schedule_id} завершилось с ошибкой: {run.error}"
+            )
+            summary = turn_summary(
+                run.tools,
+                int(run.seconds),
+                status == "completed",
+                run.cost,
+                run.cost_complete,
+            )
+            state = (
+                ("scheduled" if _recurring(ctx.scheduler, schedule_id) else "done")
+                if status == "completed"
+                else ("interrupted" if status == "interrupted" else "error")
+            )
+            await run.finish(
+                status,
+                ctx.app.chat_id,
+                f"⏰ {schedule_id}\n\n{text}\n\n{summary}",
+                job_state=state,
+                job_result=text,
+            )
+            ctx.outbox.wake()
+            if status == "interrupted":
+                raise asyncio.CancelledError
     finally:
-        await turn_insert(
-            ctx.db,
-            ts=datetime.now(UTC).isoformat(),
-            kind="job",
-            session_id=writer.session_id,
-            model=str(ctx.app.config.model),
-            in_tokens=in_tokens,
-            out_tokens=out_tokens,
-            cost_usd=cost,
-            tools=tools,
-            seconds=time.monotonic() - started,
-            ok=ok,
-        )
-        writer.__exit__(None, None, None)
+        _RUNNING.discard(task)
+
+
+async def _execute(
+    ctx: JobContext, run: Run, prompt: str, writer: DbSessionWriter
+) -> str:
+    system_prompt = await asyncio.to_thread(ctx.app.build_prompt)
+    context = Context(
+        config=ctx.app.config,
+        system_prompt=system_prompt + NON_INTERACTIVE_SUFFIX,
+        writer=writer,
+    )
+    agent = Agent(
+        config=ctx.app.config,
+        tools={
+            name: tool for name, tool in ctx.app.agent.tools.items() if name != Ask.name
+        },
+        client=ctx.app.agent.client,
+        context=context,
+    )
+    answer = ""
+    async with aclosing(agent.run_turn(prompt)) as events:
+        async for event in events:
+            await run.observe(event)
+            if event.type is EventType.MODEL_RESPONSE:
+                answer = event.quote or ""
+    return answer
 
 
 async def startup_recovery(ctx: JobContext) -> None:
-    """Jobs stuck 'running' from a crashed process: report once, directly
-    (not through the outbox — no turn may ever run them again)."""
-    for row in await jobs_meta_running(ctx.db):
-        notice = (
-            f"⏰ {row['schedule_id']}\n\nЗадание прервано перезапуском бота; "
-            "часть действий могла уже выполниться. Запланируйте заново вручную."
-        )
-        try:
-            await send_text(ctx.app.bot, ctx.app.chat_id, notice)
-        except Exception as exc:  # a failing notice must not block the rest
-            _LOG.error("interrupted-job notice failed: %s", exc)
+    await recover_runs(ctx.db_path, ctx.app.chat_id)
+    ctx.outbox.wake()
+
+
+async def shutdown_jobs() -> None:
+    tasks = list(_RUNNING)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

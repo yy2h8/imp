@@ -58,7 +58,7 @@ async def app(tmp_path):
     client = StubClient([])
     agent = Agent(config=config, tools={}, client=client, context=session.context)
     bot = FakeBot()
-    outbox = Outbox(bot.send_text)
+    outbox = Outbox(tmp_path / STATE_DB_NAME, bot.send_text)
     instance = AssistantApp(
         config=config,
         assistant=assistant_config,
@@ -205,7 +205,9 @@ async def test_turn_summary_and_cost_are_recorded(app):
     )
 
 
-async def test_turn_prompt_refreshes_local_time_without_losing_history(app, monkeypatch):
+async def test_turn_prompt_refreshes_local_time_without_losing_history(
+    app, monkeypatch
+):
     now = datetime(2026, 10, 4, 14, 59, tzinfo=UTC)
 
     class Clock(datetime):
@@ -215,10 +217,12 @@ async def test_turn_prompt_refreshes_local_time_without_losing_history(app, monk
 
     monkeypatch.setattr("imp.agent.prompt.datetime", Clock)
     app.assistant.tz = "Asia/Tokyo"
-    app.agent.client = StubClient([
-        response([message_item("first answer")]),
-        response([message_item("second answer")]),
-    ])
+    app.agent.client = StubClient(
+        [
+            response([message_item("first answer")]),
+            response([message_item("second answer")]),
+        ]
+    )
     runner = TurnRunner(app, app.bot, 0, 3500)
     await runner.run("first request")
     now = datetime(2026, 10, 4, 15, 1, tzinfo=UTC)
@@ -229,7 +233,9 @@ async def test_turn_prompt_refreshes_local_time_without_losing_history(app, monk
     assert "2026-10-05T00:01:00+09:00" in second["input"][0]["content"]
     assert "Asia/Tokyo" in second["input"][0]["content"]
     assert [item["content"] for item in second["input"][1:]] == [
-        "first request", [{"type": "output_text", "text": "first answer"}], "second request"
+        "first request",
+        [{"type": "output_text", "text": "first answer"}],
+        "second request",
     ]
 
 
@@ -334,3 +340,116 @@ async def test_command_status_and_new_are_direct_not_model_turns(app):
     rows = await app.db.execute_fetchall("SELECT COUNT(*) FROM turns")
     assert rows[0][0] == 0  # commands never reach the model
     await controller.close()
+
+
+async def test_final_delivery_failure_preserves_completed_run(app):
+    from assistant.main import TurnRunner
+
+    app.agent.client = StubClient(
+        [response([message_item("saved answer")], usage=usage_ns(12, 3, 15, 0.01))]
+    )
+
+    async def fail(chat, text):
+        raise RuntimeError("network unavailable")
+
+    app.outbox.sender = fail
+    await TurnRunner(app, app.bot, 0, 2000).run("hello")
+    rows = await app.db.execute_fetchall("SELECT status,ok,error_code FROM turns")
+    assert [tuple(r) for r in rows] == [("completed", 1, None)]
+    rows = await app.db.execute_fetchall("SELECT text,state,last_error FROM deliveries")
+    assert [tuple(r) for r in rows] == [
+        ("saved answer", "pending", "network unavailable")
+    ]
+
+
+async def test_model_failure_keeps_partial_cost_and_reason(app):
+    from test_agent import function_call_item
+
+    from assistant.main import TurnRunner
+
+    app.agent.client = StubClient(
+        [
+            response(
+                [function_call_item("x", "missing", {})],
+                usage=usage_ns(12, 3, 15, 0.01),
+            ),
+            RuntimeError("provider offline"),
+        ]
+    )
+    await TurnRunner(app, app.bot, 0, 2000).run("hello")
+    rows = await app.db.execute_fetchall(
+        "SELECT status,error_code,cost_usd,cost_complete FROM turns"
+    )
+    assert [tuple(r) for r in rows] == [("failed", "model_error", 0.01, 0)]
+
+
+async def test_shutdown_records_interruption_without_replaying_tools(app):
+    from assistant.main import _recover_interactive_requests
+
+    gate = asyncio.Event()
+    app.agent.client = GatedClient([], gate)
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("active request", message_id=701))
+    await wait_for_turn(app)
+    await controller.close()
+    rows = await app.db.execute_fetchall(
+        "SELECT status,error_code,cost_complete FROM turns"
+    )
+    assert [tuple(r) for r in rows] == [("interrupted", "interrupted", 0)]
+    assert await queue_rows(app) == 0
+    await _recover_interactive_requests(app)
+    await _recover_interactive_requests(app)
+    assert len(await app.db.execute_fetchall("SELECT id FROM turns")) == 1
+    assert len(await app.db.execute_fetchall("SELECT id FROM deliveries")) == 1
+
+
+async def test_preparation_failure_is_recorded(app, monkeypatch):
+    from assistant.main import TurnRunner
+
+    def broken():
+        raise RuntimeError("manual unavailable")
+
+    monkeypatch.setattr(type(app), "refresh_prompt", lambda self: broken())
+    await TurnRunner(app, app.bot, 0, 2000).run("hello")
+    rows = await app.db.execute_fetchall(
+        "SELECT status,error_code,error_message FROM turns"
+    )
+    assert [tuple(r) for r in rows] == [
+        ("failed", "runtime_error", "manual unavailable")
+    ]
+
+
+async def test_empty_final_response_is_a_recorded_failure(app):
+    from assistant.main import TurnRunner
+
+    app.agent.client = StubClient([response([], usage=usage_ns(10, 0, 10, 0.01))])
+    await TurnRunner(app, app.bot, 0, 2000).run("hello")
+    rows = await app.db.execute_fetchall("SELECT status,error_code,cost_usd FROM turns")
+    assert [tuple(r) for r in rows] == [("failed", "empty_response", 0.01)]
+
+
+async def test_cancel_during_run_creation_records_cancelled(app, monkeypatch):
+    from assistant import turns
+
+    real_start = turns.turn_start
+    created, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(*args, **kwargs):
+        run_id = await real_start(*args, **kwargs)
+        created.set()
+        await release.wait()
+        return run_id
+
+    monkeypatch.setattr(turns, "turn_start", delayed)
+    controller = AssistantController(app)
+    await controller.handle_message(owner_message("hello", message_id=702))
+    await asyncio.wait_for(created.wait(), 1)
+    await controller.handle_message(owner_message("/cancel", message_id=703))
+    release.set()
+    await asyncio.wait_for(controller.wait_idle(), 1)
+    try:
+        rows = await app.db.execute_fetchall("SELECT status,error_code FROM turns")
+        assert [tuple(r) for r in rows] == [("cancelled", "cancelled")]
+        assert len(await app.db.execute_fetchall("SELECT id FROM deliveries")) == 1
+    finally:
+        await controller.close()

@@ -565,7 +565,19 @@ def test_truncate_tool_output_allocates_only_for_retained_prefix():
 
 @pytest.mark.parametrize(
     "separator",
-    ["\n", "\r\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    [
+        "\n",
+        "\r\n",
+        "\r",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    ],
 )
 def test_truncate_tool_output_preserves_splitlines_boundaries(separator):
     first = "a" + separator
@@ -693,8 +705,6 @@ def test_token_formula_weights_non_ascii():
         * 10,
     )
     assert _token_formula(russian) > _token_formula(english)
-
-
 
 
 def test_replace_system_prompt_writes_once(config):
@@ -859,8 +869,7 @@ async def test_agent_replays_skill_on_next_turn(config, fs, skills_dir):
         outputs = [
             item["output"]
             for item in request["input"]
-            if item.get("type") == "function_call_output"
-            and item["call_id"] == "skill"
+            if item.get("type") == "function_call_output" and item["call_id"] == "skill"
         ]
         assert outputs == [expected]
 
@@ -910,8 +919,6 @@ async def test_context_warning_emitted_once_when_approaching(config):
     assert warnings[0].token_usage[0] > config.max_context * 0.85
 
 
-
-
 async def test_agent_recovers_over_limit_after_tools(config):
     config.max_context = 20_000
     config.max_tool_output = 100_000
@@ -957,3 +964,15 @@ async def test_agent_trims_fat_text_turns_when_compaction_insufficient(config):
         isinstance(m, TextMessage) and m.content == fat_prompt
         for m in agent.context.messages
     )
+
+
+async def test_incomplete_response_keeps_usage_and_reason(config):
+    raw = response([], usage=usage_ns(20, 4, 24, 0.01))
+    raw.status = "incomplete"
+    raw.incomplete_details = {"reason": "max_output_tokens"}
+    agent = Agent(config, {}, StubClient([raw]), Context(config, "sys"))
+    events = [event async for event in agent.run_turn("hello")]
+    error = next(event for event in events if event.type is EventType.ERROR)
+    assert error.error_code == "invalid_response"
+    assert error.usage.input_tokens == 20
+    assert error.usage.cost_usd == 0.01

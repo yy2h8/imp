@@ -11,7 +11,7 @@ from ..events import AgentEvent, EventType
 from ..tools import Tool
 from .context import Context
 from .executor import execute_tool_batch
-from .model import call_model
+from .model import ModelResponseError, call_model
 
 
 class Agent:
@@ -56,6 +56,7 @@ class Agent:
             yield AgentEvent(
                 type=EventType.ERROR,
                 error_message="Context exceeds token limit.",
+                error_code="context_limit",
                 token_usage=self.context.get_usage(),
             )
             return
@@ -84,10 +85,20 @@ class Agent:
                 yield AgentEvent(
                     type=EventType.ERROR,
                     error_message=f"Model call failed: {e}",
+                    error_code="invalid_response"
+                    if isinstance(e, ModelResponseError)
+                    else "model_error",
+                    usage=getattr(e, "usage", None),
                     token_usage=self.context.get_usage(),
                 )
                 return
 
+            if reply.usage is not None:
+                yield AgentEvent(
+                    type=EventType.MODEL_USAGE,
+                    token_usage=self.context.get_usage(),
+                    usage=reply.usage,
+                )
             for message in reply.messages:
                 self.context.append(message)
                 if isinstance(message, ReasoningMessage) and message.content:
@@ -119,6 +130,7 @@ class Agent:
                     yield AgentEvent(
                         type=EventType.ERROR,
                         error_message="Context exceeds token limit after tool calls.",
+                        error_code="context_limit",
                         token_usage=self.context.get_usage(),
                     )
                     return
@@ -126,6 +138,7 @@ class Agent:
         yield AgentEvent(
             type=EventType.ERROR,
             error_message="Maximum iteration limit reached.",
+            error_code="iteration_limit",
             token_usage=self.context.get_usage(),
         )
 

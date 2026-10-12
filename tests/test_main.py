@@ -180,6 +180,35 @@ async def test_polling_retries_failed_intake_without_acknowledging(monkeypatch):
     assert accepted == [1]
 
 
+def test_main_tailor_runs_forced_startup_without_polling(monkeypatch, tmp_path):
+    config = SimpleNamespace(allowed_user_ids={42}, home=tmp_path, log_level="INFO")
+    calls = []
+
+    async def startup(assistant_config, chat_id, force):
+        calls.append((assistant_config, chat_id, force))
+
+    monkeypatch.setattr(entry.AssistantConfig, "from_env", lambda: config)
+    monkeypatch.setattr(entry, "startup", startup)
+
+    entry.main(["tailor"])
+
+    assert calls == [(config, 42, True)]
+    assert (tmp_path / "skills").is_dir()
+
+
+def test_main_tailor_reports_failure(monkeypatch, tmp_path):
+    config = SimpleNamespace(allowed_user_ids={42}, home=tmp_path, log_level="INFO")
+
+    async def startup(*_args, **_kwargs):
+        raise RuntimeError("Manual tailoring failed: provider down")
+
+    monkeypatch.setattr(entry.AssistantConfig, "from_env", lambda: config)
+    monkeypatch.setattr(entry, "startup", startup)
+
+    with pytest.raises(SystemExit, match="Manual tailoring failed: provider down"):
+        entry.main(["tailor"])
+
+
 def test_debug_logging_does_not_expose_bot_token(monkeypatch, caplog):
     import logging
 

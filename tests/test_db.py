@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from assistant.db import (
+    _SCHEMA_V1,
+    SCHEMA_VERSION,
     STATE_DB_NAME,
     jobs_meta_get,
     jobs_meta_list,
@@ -80,22 +82,24 @@ async def test_open_db_migrations_idempotent(tmp_path):
     await conn.close()
     conn = await open_db(path)  # second open: same version, no error
     version_again = (await conn.execute_fetchall("PRAGMA user_version"))[0][0]
-    assert version == version_again == 2
+    assert version == version_again == SCHEMA_VERSION
     await conn.close()
 
 
-async def test_v2_migration_recovers_when_column_exists_but_version_did_not_advance(tmp_path):
+async def test_v2_migration_recovers_when_column_exists_but_version_did_not_advance(
+    tmp_path,
+):
     path = tmp_path / STATE_DB_NAME
-    conn = await open_db(path)
-    await conn.close()
     raw = sqlite3.connect(path)
+    raw.executescript(_SCHEMA_V1)
+    raw.execute("ALTER TABLE queue ADD COLUMN album_id TEXT")
     raw.execute("PRAGMA user_version=1")  # simulate crash after ALTER TABLE
     raw.commit()
     raw.close()
     conn = await open_db(path)
     version = (await conn.execute_fetchall("PRAGMA user_version"))[0][0]
     columns = await conn.execute_fetchall("PRAGMA table_info(queue)")
-    assert version == 2
+    assert version == SCHEMA_VERSION
     assert "album_id" in {row[1] for row in columns}
     await conn.close()
 
@@ -182,18 +186,41 @@ async def test_turn_insert_and_report_periods(db):
     now = datetime.now(UTC)
     old = now - timedelta(days=40)
     await turn_insert(
-        db, ts=old.isoformat(), kind="interactive", session_id="s1",
-        model="m", in_tokens=100, out_tokens=50, cost_usd=0.5,
-        tools=2, seconds=10.0, ok=True,
+        db,
+        ts=old.isoformat(),
+        kind="interactive",
+        session_id="s1",
+        model="m",
+        in_tokens=100,
+        out_tokens=50,
+        cost_usd=0.5,
+        tools=2,
+        seconds=10.0,
+        ok=True,
     )
     await turn_insert(
-        db, ts=now.isoformat(), kind="job", session_id="s2",
-        model="m", in_tokens=10, out_tokens=5, cost_usd=0.01,
-        tools=1, seconds=2.0, ok=False,
+        db,
+        ts=now.isoformat(),
+        kind="job",
+        session_id="s2",
+        model="m",
+        in_tokens=10,
+        out_tokens=5,
+        cost_usd=0.01,
+        tools=1,
+        seconds=2.0,
+        ok=False,
     )
     report = await turns_report(db, "all")
     assert report == {
-        "turns": 2, "in_tokens": 110, "out_tokens": 55, "cost_usd": 0.51
+        "turns": 2,
+        "in_tokens": 110,
+        "out_tokens": 55,
+        "cost_usd": 0.51,
+        "running": 0,
+        "completed": 0,
+        "incomplete_cost": 0,
+        "unknown_cost": 2,
     }
     day = await turns_report(db, "day")
     assert day["turns"] == 1 and day["cost_usd"] == 0.01
@@ -205,8 +232,12 @@ async def test_turn_insert_and_report_periods(db):
 
 async def test_jobs_meta_cycle(db):
     await jobs_meta_upsert(
-        db, schedule_id="daily", label="Daily report", prompt="report",
-        tz="Asia/Almaty", state="scheduled",
+        db,
+        schedule_id="daily",
+        label="Daily report",
+        prompt="report",
+        tz="Asia/Almaty",
+        state="scheduled",
     )
     stored = await jobs_meta_get(db, "daily")
     assert stored["label"] == "Daily report"
@@ -229,46 +260,50 @@ async def test_transcript_search(db):
 
     db.row_factory = None
     await db.execute(
-        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES "
-        "(?, ?, ?, ?)",
-        ("s1", 0, "2026-01-01T00:00:00+00:00",
-         json.dumps({"role": "user", "content": "deploy the armbian box"})),
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+        (
+            "s1",
+            0,
+            "2026-01-01T00:00:00+00:00",
+            json.dumps({"role": "user", "content": "deploy the armbian box"}),
+        ),
     )
     await db.execute(
-        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES "
-        "(?, ?, ?, ?)",
-        ("s2", 0, "2026-01-02T00:00:00+00:00",
-         json.dumps({"role": "user", "content": "unrelated note"})),
+        "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+        (
+            "s2",
+            0,
+            "2026-01-02T00:00:00+00:00",
+            json.dumps({"role": "user", "content": "unrelated note"}),
+        ),
     )
     await db.commit()
     hits = await transcript_search(db, "armbian")
     assert len(hits) == 1 and hits[0][0] == "s1"
-    assert "armbian" in hits[0][1]
+    assert "armbian" in hits[0][5]
     assert await transcript_search(db, "absent") == []
     for i in range(15):
         await db.execute(
-            "INSERT INTO transcripts(session_id, seq, ts, message) VALUES "
-            "(?, ?, ?, ?)",
-            (f"n{i}", 0, "2026-01-03T00:00:00+00:00",
-             json.dumps({"role": "user", "content": f"armbian {i}"})),
+            "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
+            (
+                f"n{i}",
+                0,
+                "2026-01-03T00:00:00+00:00",
+                json.dumps({"role": "user", "content": f"armbian {i}"}),
+            ),
         )
     await db.commit()
     assert len(await transcript_search(db, "armbian")) == 10  # default limit
 
 
-
-
 async def test_transcript_last_reply_returns_latest_assistant_text(db):
     import json
 
-
     async def insert(session: str, seq: int, message: dict, ts: str) -> None:
         await db.execute(
-            "INSERT INTO transcripts(session_id, seq, ts, message) VALUES "
-            "(?, ?, ?, ?)",
+            "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
             (session, seq, ts, json.dumps(message)),
         )
-
 
     await insert(
         "s1", 0, {"role": "user", "content": "deploy it"}, "2026-01-01T00:00:00+00:00"
@@ -305,7 +340,6 @@ async def test_transcript_last_reply_returns_latest_assistant_text(db):
 async def test_transcript_last_reply_skips_empty_and_missing(db):
     import json
 
-
     await db.execute(
         "INSERT INTO transcripts(session_id, seq, ts, message) VALUES (?, ?, ?, ?)",
         (
@@ -328,7 +362,6 @@ async def test_transcript_last_reply_skips_empty_and_missing(db):
 
 async def test_turn_last_by_session_returns_newest_row(db):
     from datetime import UTC, datetime
-
 
     for i, seconds in enumerate((11, 42)):
         await turn_insert(
@@ -402,3 +435,115 @@ async def test_prune_transcripts_noop_when_fresh(db):
     assert await prune_transcripts(db, item_ttl_days=7, session_ttl_days=90) == 0
     count = (await db.execute_fetchall("SELECT COUNT(*) FROM transcripts"))[0][0]
     assert count == 1
+
+
+@pytest.mark.parametrize("stale", [False, True])
+async def test_prune_releases_writer_lock(db, tmp_path, stale):
+    import json
+
+    stamp = datetime.now(UTC) - timedelta(days=10 if stale else 0)
+    await db.execute(
+        "INSERT INTO transcripts VALUES (?, ?, ?, ?)",
+        ("probe", 0, stamp.isoformat(), json.dumps({"type": "reasoning"})),
+    )
+    await db.commit()
+    assert await prune_transcripts(db, 7, 90) == int(stale)
+    assert not db.in_transaction
+
+    def write():
+        with sqlite3.connect(tmp_path / STATE_DB_NAME, timeout=0.1) as other:
+            other.execute("INSERT INTO kv VALUES ('probe', 'ok')")
+
+    await asyncio.to_thread(write)
+
+
+async def test_search_filters_noise_and_reads_tool_text(db):
+    import json
+
+    messages = [
+        {"role": "user", "content": "Температура платы 55 C"},
+        {
+            "type": "function_call",
+            "name": "run_shell",
+            "call_id": "shell",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "shell",
+            "output": "x" * 600 + " Температура 60 C",
+        },
+        {
+            "type": "function_call",
+            "name": "search_transcripts",
+            "call_id": "search",
+            "arguments": '{"query":"Температура"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "search",
+            "output": "Температура search echo",
+        },
+        {"role": "system", "content": "Температура system"},
+    ]
+    for seq, message in enumerate(messages):
+        await db.execute(
+            "INSERT INTO transcripts VALUES (?, ?, ?, ?)",
+            ("s", seq, datetime.now(UTC).isoformat(), json.dumps(message)),
+        )
+    await db.commit()
+    hits = await transcript_search(db, "температура", 2)
+    assert [r[1] for r in hits] == [2, 0]
+    assert hits[0][4] == "run_shell"
+    assert "Температура 60 C" in hits[0][5]
+    assert len(hits[0][5]) <= 500
+
+
+async def test_search_literal_and_malformed_rows(db):
+    import json
+
+    for seq, message in enumerate(
+        [
+            "not json",
+            json.dumps({"role": "user", "content": "100%_complete"}),
+            json.dumps(
+                {
+                    "type": "function_call_output",
+                    "call_id": "orphan",
+                    "output": "100%_done",
+                }
+            ),
+        ]
+    ):
+        await db.execute(
+            "INSERT INTO transcripts VALUES (?, ?, ?, ?)",
+            ("s", seq, datetime.now(UTC).isoformat(), message),
+        )
+    await db.commit()
+    assert len(await transcript_search(db, "%_")) == 2
+    assert await transcript_search(db, "100X") == []
+
+
+async def test_prune_failure_rolls_back_even_with_concurrent_writer(db, tmp_path):
+    import json
+
+    old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+    for seq, data in enumerate(
+        [{"type": "reasoning"}, {"role": "user", "content": "preserve me"}]
+    ):
+        await db.execute(
+            "INSERT INTO transcripts VALUES (?,?,?,?)",
+            ("old", seq, old, json.dumps(data)),
+        )
+    await db.execute(
+        "CREATE TRIGGER fail_session_prune BEFORE DELETE ON transcripts WHEN OLD.seq=1 BEGIN SELECT RAISE(ABORT,'probe'); END"
+    )
+    await db.commit()
+    result = await asyncio.gather(
+        prune_transcripts(db, 7, 90),
+        queue_push(db, "text", "{}"),
+        return_exceptions=True,
+    )
+    assert any(isinstance(r, sqlite3.IntegrityError) for r in result)
+    assert (await db.execute_fetchall("SELECT count(*) FROM transcripts"))[0][0] == 2
+    assert not db.in_transaction

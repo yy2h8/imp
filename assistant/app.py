@@ -115,6 +115,7 @@ class CurrentTurn:
     last_reply: str = ""  # latest model text (preview)
     last_reply_at: datetime | None = None  # UTC
 
+
 @dataclass(slots=True)
 class AssistantApp:
     """imp's Agent plus the assistant home concerns: session lifecycle,
@@ -200,10 +201,14 @@ async def build_assistant(assistant_config: AssistantConfig, chat_id: int):
     ask_router = AskRouter()
     turn_state = {"active": False}
 
-    async def deliver_job_result(text: str) -> None:
-        await send_text(bot, chat_id, text)
+    async def deliver_job_result(destination: int, text: str) -> list[int]:
+        return await send_text(bot, destination, text)
 
-    outbox = Outbox(deliver_job_result)
+    outbox = Outbox(
+        assistant_config.home / STATE_DB_NAME,
+        deliver_job_result,
+        secrets=(imp_config.api_key, assistant_config.bot_token),
+    )
     scheduler = build_scheduler(assistant_config.home, assistant_config.tz)
     jobs_semaphore = asyncio.Semaphore(assistant_config.max_concurrent_jobs)
 

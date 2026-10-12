@@ -1,4 +1,4 @@
-"""Bootstrap: probe the machine, render AGENTS.md, fingerprint in state.db.
+"""Bootstrap: create a missing AGENTS.md or refresh it on explicit request.
 
 Environment facts are pure code, never model-guessed ; the model only
 adapts the Operating Manual in one tailoring turn afterwards.
@@ -6,7 +6,6 @@ adapts the Operating Manual in one tailoring turn afterwards.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -37,8 +36,8 @@ ENV_END = "<!-- ENVIRONMENT:END -->"
 MINIMAL_TEMPLATE = """# AGENTS.md
 
 The assistant's operating manual. The packaged template was unreadable, so this
-minimal manual was generated instead; delete the `fingerprint` key in
-state.db and restart to retry.
+minimal manual was generated instead; run `python -m assistant tailor`
+for an explicit refresh.
 
 <!-- ENVIRONMENT:BEGIN -->
 <!-- ENVIRONMENT:END -->
@@ -94,7 +93,7 @@ def _network() -> str:
 
 @dataclass(slots=True, frozen=True)
 class Probe:
-    """Environment facts; also the fingerprint input."""
+    """Environment facts for manual creation and explicit tailoring."""
 
     os_name: str
     arch: str
@@ -149,23 +148,6 @@ class Probe:
             network=_network(),
             probed_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
-
-    def fingerprint(self) -> str:
-        """Stable identity of the machine (timestamps and free-space noise
-        excluded): a change means the manual's environment block is stale."""
-        payload = json.dumps(
-            {
-                "os": self.os_name,
-                "arch": self.arch,
-                "release": self.os_release,
-                "kernel": self.kernel,
-                "python": self.python_version,
-                "tools": self.tools,
-                "ram": self.ram,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()
 
     def render(self) -> str:
         tools = " · ".join(f"`{name}`: {value}" for name, value in self.tools.items())
@@ -281,8 +263,8 @@ def write_state(home: Path, updates: dict) -> dict:
 class BootstrapResult:
     """What a bootstrap run decided; drives the tailoring turn."""
 
-    probe: Probe
-    changed: bool  # manual written (first run, forced, or fingerprint mismatch)
+    probe: Probe | None  # None when the existing manual needs no tailoring
+    changed: bool  # manual written (first run or explicit refresh)
 
 
 def install_default_skills(home: Path, package_dir: Path) -> int:
@@ -334,22 +316,16 @@ def run_bootstrap(
     probe: Probe | None = None,
     force: bool = False,
 ) -> BootstrapResult:
-    """Probe → fingerprint check → render manual → record fingerprint .
+    """Probe and render only when the manual is missing or force is set.
 
-    A mismatch means the stored manual describes a machine that no longer
-    exists; the manual is rewritten with fresh facts (hand-edited manual text
-    outside the ENVIRONMENT block survives via render_manual). A template
-    failure degrades to a minimal manual rather than blocking startup.
+    Hand-edited text outside the ENVIRONMENT block survives a refresh. A
+    template failure degrades to a minimal manual rather than blocking startup.
     """
-    probe = probe or Probe.take(home)
     install_default_skills(home, package_dir)
     path = home / "AGENTS.md"
-    changed = (
-        force
-        or not path.exists()
-        or probe.fingerprint() != read_state(home).get("fingerprint")
-    )
+    changed = force or not path.exists()
     if changed:
+        probe = probe or Probe.take(home)
         _LOG.info(
             "bootstrap: environment manual (re)generated from a fresh probe"
         )
@@ -362,7 +338,9 @@ def run_bootstrap(
                 template = MINIMAL_TEMPLATE
         manual = render_manual(template, probe.render())
         path.write_text(manual, encoding="utf-8")
-        write_state(home, {"fingerprint": probe.fingerprint(), "tailored": False})
+        write_state(home, {"tailored": False})
+    else:
+        probe = None
     manual = path.read_text(encoding="utf-8")
     updated = _upgrade_manual(manual)
     if updated != manual:
@@ -392,11 +370,6 @@ def prune_scratch(home: Path, ttl_days: float) -> int:
         except OSError:
             continue  # pruning is best-effort
     return removed
-
-
-def needs_tailoring(state: dict) -> bool:
-    """True when the Operating Manual still needs its one tailoring turn."""
-    return not state.get("tailored")
 
 
 async def tailor_manual(app, probe: Probe) -> None:

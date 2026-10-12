@@ -12,6 +12,7 @@ class EventType(Enum):
     THINKING = auto()
     REASONING = auto()
     MODEL_RESPONSE = auto()
+    MODEL_USAGE = auto()
     TOOL_START = auto()
     TOOL_RESULT = auto()
     CONTEXT_COMPACTED = auto()
@@ -38,6 +39,7 @@ class AgentEvent:
     quote: str | None = None
     tool_result: ToolResult | None = None
     error_message: str | None = None
+    error_code: str | None = None
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     usage: Usage | None = None

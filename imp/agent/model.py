@@ -27,6 +27,12 @@ class ModelReply:
     usage: Usage | None = None
 
 
+class ModelResponseError(ValueError):
+    def __init__(self, message: str, usage: Usage | None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 def _parse_usage(raw: Any) -> Usage | None:
     if raw is None:
         return None
@@ -91,21 +97,19 @@ async def call_model(
             "summary": "auto",
         }
     response = await client.responses.create(**request)
-    status = getattr(response, "status", None)
-    if status not in (None, "completed"):
-        raise ValueError(
-            f"Model response {status}: {getattr(response, 'incomplete_details', None) or getattr(response, 'error', None)}"
-        )
-    reply = _parse_output(response.output)
-    reply = ModelReply(
-        messages=reply.messages,
-        tool_calls=reply.tool_calls,
-        text=reply.text,
-        usage=_parse_usage(getattr(response, "usage", None)),
-    )
-    seen = {item.call_id for item in messages if isinstance(item, ToolCall)}
-    for call in reply.tool_calls:
-        if not call.call_id or call.call_id in seen:
-            raise ValueError("Duplicate or empty tool call id")
-        seen.add(call.call_id)
-    return reply
+    usage = _parse_usage(getattr(response, "usage", None))
+    try:
+        status = getattr(response, "status", None)
+        if status not in (None, "completed"):
+            raise ValueError(
+                f"Model response {status}: {getattr(response, 'incomplete_details', None) or getattr(response, 'error', None)}"
+            )
+        reply = _parse_output(response.output)
+        seen = {item.call_id for item in messages if isinstance(item, ToolCall)}
+        for call in reply.tool_calls:
+            if not call.call_id or call.call_id in seen:
+                raise ValueError("Duplicate or empty tool call id")
+            seen.add(call.call_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ModelResponseError(str(exc), usage) from exc
+    return ModelReply(reply.messages, reply.tool_calls, reply.text, usage)

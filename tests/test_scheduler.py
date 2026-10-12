@@ -7,6 +7,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from apscheduler.triggers.date import DateTrigger
 from test_agent import StubClient, message_item, response, usage_ns
 
@@ -17,6 +18,7 @@ from assistant.db import (
     jobs_meta_upsert,
     open_db,
 )
+from assistant.outbox import Outbox
 from assistant.scheduler import (
     JobContext,
     build_scheduler,
@@ -25,14 +27,6 @@ from assistant.scheduler import (
     startup_recovery,
 )
 from imp.config import Config
-
-
-class FakeOutbox:
-    def __init__(self) -> None:
-        self.items: list[str] = []
-
-    async def submit(self, text: str) -> None:
-        self.items.append(text)
 
 
 class FakeBot:
@@ -68,7 +62,8 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
         tmp_path,
         [response([message_item("valuable result")], usage=usage_ns(10, 5, 15, 0.01))],
     )
-    outbox = FakeOutbox()
+    outbox = Outbox(db_path, app.bot.send_text)
+    await outbox.start()
     scheduler = build_scheduler(tmp_path, "UTC")
     scheduler.start()
     ctx = JobContext(
@@ -82,8 +77,12 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
     set_context(ctx)
     try:
         await jobs_meta_upsert(
-            conn, schedule_id="j1", label="job one", prompt="prompt…",
-            tz="UTC", state="scheduled",
+            conn,
+            schedule_id="j1",
+            label="job one",
+            prompt="prompt…",
+            tz="UTC",
+            state="scheduled",
         )
         scheduler.add_job(
             run_scheduled_job,
@@ -93,14 +92,14 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
             replace_existing=True,
         )
         for _ in range(100):
-            if outbox.items:
+            if app.bot.sent:
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
 
-        assert outbox.items[0].startswith("⏰ j1\n\nvaluable result\n\n")
-        assert "✓ готово · инструментов: 0" in outbox.items[0]
-        assert "$0.0100" in outbox.items[0]
+        assert app.bot.sent[0].startswith("⏰ j1\n\nvaluable result\n\n")
+        assert "✓ готово · инструментов: 0" in app.bot.sent[0]
+        assert "$0.0100" in app.bot.sent[0]
         meta = await jobs_meta_get(conn, "j1")
         assert meta["state"] == "done"  # one-shot: not rescheduled
         assert meta["result"] == "valuable result"
@@ -115,6 +114,7 @@ async def test_date_job_fires_records_and_delivers(tmp_path):
     finally:
         set_context(None)
         scheduler.shutdown(wait=False)
+        await outbox.stop()
         await conn.close()
 
 
@@ -122,7 +122,8 @@ async def test_failing_job_marks_error_and_notifies(tmp_path):
     db_path = tmp_path / STATE_DB_NAME
     conn = await open_db(db_path)
     app = FakeApp(tmp_path, [RuntimeError("model exploded")])
-    outbox = FakeOutbox()
+    outbox = Outbox(db_path, app.bot.send_text)
+    await outbox.start()
     scheduler = build_scheduler(tmp_path, "UTC")
     scheduler.start()
     ctx = JobContext(
@@ -136,8 +137,12 @@ async def test_failing_job_marks_error_and_notifies(tmp_path):
     set_context(ctx)
     try:
         await jobs_meta_upsert(
-            conn, schedule_id="j2", label="job two", prompt="prompt…",
-            tz="UTC", state="scheduled",
+            conn,
+            schedule_id="j2",
+            label="job two",
+            prompt="prompt…",
+            tz="UTC",
+            state="scheduled",
         )
         scheduler.add_job(
             run_scheduled_job,
@@ -147,7 +152,7 @@ async def test_failing_job_marks_error_and_notifies(tmp_path):
             replace_existing=True,
         )
         for _ in range(100):
-            if outbox.items:
+            if app.bot.sent:
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
@@ -155,12 +160,13 @@ async def test_failing_job_marks_error_and_notifies(tmp_path):
         meta = await jobs_meta_get(conn, "j2")
         assert meta["state"] == "error"
         assert "failed" in meta["result"]
-        assert outbox.items and outbox.items[0].startswith("⏰ j2")
+        assert app.bot.sent and app.bot.sent[0].startswith("⏰ j2")
         rows = await conn.execute_fetchall("SELECT ok FROM turns")
         assert rows[0][0] == 0
     finally:
         set_context(None)
         scheduler.shutdown(wait=False)
+        await outbox.stop()
         await conn.close()
 
 
@@ -168,7 +174,8 @@ async def test_startup_recovery_reports_interrupted_jobs(tmp_path):
     db_path = tmp_path / STATE_DB_NAME
     conn = await open_db(db_path)
     app = FakeApp(tmp_path, [])
-    outbox = FakeOutbox()
+    outbox = Outbox(db_path, app.bot.send_text)
+    await outbox.start()
     scheduler = build_scheduler(tmp_path, "UTC")
     ctx = JobContext(
         app=app,
@@ -179,14 +186,60 @@ async def test_startup_recovery_reports_interrupted_jobs(tmp_path):
         scheduler=scheduler,
     )
     await jobs_meta_upsert(
-        conn, schedule_id="stuck", label="l", prompt="p", tz="UTC",
+        conn,
+        schedule_id="stuck",
+        label="l",
+        prompt="p",
+        tz="UTC",
         state="running",
     )
     await startup_recovery(ctx)
+    for _ in range(100):
+        if app.bot.sent:
+            break
+        await asyncio.sleep(0.01)
     assert len(app.bot.sent) == 1
     assert "stuck" in app.bot.sent[0]
-    assert "прервано" in app.bot.sent[0]
+    assert "прерван" in app.bot.sent[0]
     assert await jobs_meta_running(conn) == []  # reported once
     meta = await jobs_meta_get(conn, "stuck")
     assert meta["state"] == "interrupted"
+    await outbox.stop()
     await conn.close()
+
+
+async def test_cancelled_job_keeps_run_and_pending_result(tmp_path):
+    from types import SimpleNamespace
+
+    entered = asyncio.Event()
+
+    async def blocked(**kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    path = tmp_path / STATE_DB_NAME
+    db = await open_db(path)
+    app = FakeApp(tmp_path, [])
+    app.agent.client = SimpleNamespace(responses=SimpleNamespace(create=blocked))
+    outbox = Outbox(path, app.bot.send_text)
+    scheduler = build_scheduler(tmp_path, "UTC")
+    set_context(JobContext(app, outbox, asyncio.Semaphore(1), db, path, scheduler))
+    task = asyncio.create_task(run_scheduled_job("j", "prompt"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        rows = await db.execute_fetchall("SELECT status,cost_complete FROM turns")
+        assert rows == [("running", 0)]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await db.execute_fetchall("SELECT status,error_code FROM turns") == [
+            ("interrupted", "interrupted")
+        ]
+        assert await db.execute_fetchall("SELECT state FROM deliveries") == [
+            ("pending",)
+        ]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        set_context(None)
+        await db.close()

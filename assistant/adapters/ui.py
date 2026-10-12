@@ -39,12 +39,22 @@ _SHORT_NAMES = {
 }
 
 
-def turn_summary(tools: int, seconds: int, ok: bool, cost_usd: float | None) -> str:
+def turn_summary(
+    tools: int,
+    seconds: int,
+    ok: bool,
+    cost_usd: float | None,
+    cost_complete: bool | None = True,
+) -> str:
     """The one-line status collapse at turn end."""
     mark = "✓ готово" if ok else "✗ ошибка"
     text = f"{mark} · инструментов: {tools} · {seconds} с"
-    if ok and cost_usd is not None:
-        text += f" · ${cost_usd:.4f}"
+    if cost_usd is not None:
+        text += f" · ${cost_usd:.4f}" + (
+            " (неполные данные)" if cost_complete is not True else ""
+        )
+    elif cost_complete is not True:
+        text += " · расход неизвестен"
     return text
 
 

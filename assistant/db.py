@@ -8,6 +8,7 @@ by ``PRAGMA user_version``: each version's DDL is idempotent, applied once.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,8 @@ _PERIODS: dict[str, timedelta | None] = {
 # WAL plus this timeout so three writer families never raise "database is
 # locked" against each other.
 BUSY_TIMEOUT_MS = 30000
+SCHEMA_VERSION = 3
+ERROR_DETAIL_CHARS = 2000
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS kv (
@@ -87,7 +90,34 @@ CREATE TABLE IF NOT EXISTS jobs_meta (
 );
 """
 
-_MIGRATIONS: dict[int, str] = {1: _SCHEMA_V1}
+_SCHEMA_V3 = """
+ALTER TABLE turns ADD COLUMN status TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE turns ADD COLUMN error_code TEXT;
+ALTER TABLE turns ADD COLUMN error_message TEXT;
+ALTER TABLE turns ADD COLUMN finished_at TEXT;
+ALTER TABLE turns ADD COLUMN updated_at TEXT;
+ALTER TABLE turns ADD COLUMN queue_id INTEGER;
+ALTER TABLE turns ADD COLUMN schedule_id TEXT;
+ALTER TABLE turns ADD COLUMN cost_complete INTEGER;
+CREATE UNIQUE INDEX idx_turns_queue ON turns(queue_id) WHERE queue_id IS NOT NULL;
+CREATE INDEX idx_turns_schedule ON turns(schedule_id, id);
+CREATE TABLE deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id INTEGER NOT NULL UNIQUE REFERENCES turns(id),
+    chat_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    message_ids TEXT
+);
+CREATE INDEX idx_deliveries_due ON deliveries(state, next_attempt_at, id);
+"""
+
+_MIGRATIONS: dict[int, str] = {1: _SCHEMA_V1, 3: _SCHEMA_V3}
 
 
 async def open_db(path: Path) -> aiosqlite.Connection:
@@ -98,11 +128,11 @@ async def open_db(path: Path) -> aiosqlite.Connection:
         await conn.execute("PRAGMA journal_mode=WAL")
         rows = await conn.execute_fetchall("PRAGMA user_version")
         version = rows[0][0] if rows else 0
-        for target in (1, 2):
+        for target in range(1, SCHEMA_VERSION + 1):
             if target <= version:
                 continue
-            if target == 1:
-                await conn.executescript(_MIGRATIONS[target])
+            if target in (1, 3):
+                await conn.executescript("BEGIN;\n" + _MIGRATIONS[target])
             elif target == 2:
                 columns = await conn.execute_fetchall("PRAGMA table_info(queue)")
                 if "album_id" not in {row[1] for row in columns}:
@@ -226,9 +256,7 @@ async def memory_set(conn: aiosqlite.Connection, key: str, value: str) -> None:
     await conn.commit()
 
 
-async def kv_row_exists(
-    conn: aiosqlite.Connection, table: str, key: str
-) -> bool:
+async def kv_row_exists(conn: aiosqlite.Connection, table: str, key: str) -> bool:
     async with conn.execute(
         f"SELECT 1 FROM {table} WHERE key = ?",  # table name fixed by caller
         (key,),
@@ -297,32 +325,41 @@ async def prune_transcripts(
     conn: aiosqlite.Connection, item_ttl_days: int, session_ttl_days: int
 ) -> int:
     """Two-tier retention: drop non-conversational items (reasoning,
-    function_call, function_call_output) from sessions idle longer than
+    function_call, function_call_output) whose individual age exceeds
     item_ttl_days; drop whole sessions idle longer than session_ttl_days
     (user/assistant text survives tier 1 for search_transcripts recall).
     Checkpoints the WAL when anything was deleted. Returns rows deleted."""
     now = datetime.now(UTC)
     item_cutoff = (now - timedelta(days=item_ttl_days)).isoformat()
     session_cutoff = (now - timedelta(days=session_ttl_days)).isoformat()
-    items = await conn.execute(
-        "DELETE FROM transcripts WHERE ts < ? AND json_extract(message, '$.type')"
-        " IN ('reasoning', 'function_call', 'function_call_output')",
-        (item_cutoff,),
-    )
-    sessions = await conn.execute(
-        "DELETE FROM transcripts WHERE session_id IN ("
-        "SELECT session_id FROM transcripts GROUP BY session_id"
-        " HAVING MAX(ts) < ?)",
-        (session_cutoff,),
-    )
-    deleted = (items.rowcount or 0) + (sessions.rowcount or 0)
-    if deleted:
-        await conn.commit()
-        try:
-            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except aiosqlite.Error:
-            pass  # another connection holds the WAL; next prune retries
-    return deleted
+
+    def prune(raw):
+        items = raw.execute(
+            "DELETE FROM transcripts WHERE ts<? AND json_valid(message) "
+            "AND json_extract(message,'$.type') IN ('reasoning','function_call','function_call_output')",
+            (item_cutoff,),
+        )
+        sessions = raw.execute(
+            "DELETE FROM transcripts WHERE session_id IN (SELECT session_id FROM transcripts "
+            "GROUP BY session_id HAVING MAX(ts)<?)",
+            (session_cutoff,),
+        )
+        raw.execute(
+            "UPDATE deliveries SET text='' WHERE state='sent' AND sent_at<?",
+            (session_cutoff,),
+        )
+        deleted = items.rowcount + sessions.rowcount
+        raw.commit()
+        if deleted:
+            try:
+                raw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass  # a busy reader can defer checkpointing, not transaction release
+        return deleted
+
+    databases = await conn.execute_fetchall("PRAGMA database_list")
+    path = next(Path(row[2]) for row in databases if row[1] == "main")
+    return await asyncio.to_thread(_run_transaction, path, prune)
 
 
 async def turn_insert(
@@ -343,8 +380,18 @@ async def turn_insert(
         "INSERT INTO turns(ts, kind, session_id, model, in_tokens, "
         "out_tokens, cost_usd, tools, seconds, ok) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ts, kind, session_id, model, in_tokens, out_tokens, cost_usd,
-         tools, seconds, int(ok)),
+        (
+            ts,
+            kind,
+            session_id,
+            model,
+            in_tokens,
+            out_tokens,
+            cost_usd,
+            tools,
+            seconds,
+            int(ok),
+        ),
     )
     await conn.commit()
 
@@ -360,18 +407,28 @@ async def turns_report(conn: aiosqlite.Connection, period: str) -> dict:
         else datetime.min.replace(tzinfo=UTC)
     )
     async with conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(in_tokens), 0), "
-        "COALESCE(SUM(out_tokens), 0), COALESCE(SUM(cost_usd), 0.0) "
-        "FROM turns WHERE ts >= ?",
+        "SELECT COUNT(*), COALESCE(SUM(in_tokens),0), COALESCE(SUM(out_tokens),0), "
+        "COALESCE(SUM(cost_usd),0), COALESCE(SUM(status='running'),0), "
+        "COALESCE(SUM(status='completed'),0), COALESCE(SUM(cost_complete=0),0), "
+        "COALESCE(SUM(cost_complete IS NULL OR cost_usd IS NULL),0) FROM turns WHERE ts>=?",
         (since.isoformat(),),
     ) as cur:
-        turns, in_tokens, out_tokens, cost = await cur.fetchone()
-    return {
-        "turns": turns,
-        "in_tokens": in_tokens,
-        "out_tokens": out_tokens,
-        "cost_usd": cost,
-    }
+        values = await cur.fetchone()
+    return dict(
+        zip(
+            (
+                "turns",
+                "in_tokens",
+                "out_tokens",
+                "cost_usd",
+                "running",
+                "completed",
+                "incomplete_cost",
+                "unknown_cost",
+            ),
+            values,
+        )
+    )
 
 
 async def turn_last_by_session(
@@ -380,8 +437,8 @@ async def turn_last_by_session(
     """Newest turns row for a session (jobs_meta.transcript holds the id)."""
     conn.row_factory = aiosqlite.Row
     async with conn.execute(
-        "SELECT ts, cost_usd, tools, seconds, ok FROM turns "
-        "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT t.*,d.state AS delivery_state,d.last_error AS delivery_error FROM turns t "
+        "LEFT JOIN deliveries d ON d.turn_id=t.id WHERE t.session_id=? ORDER BY t.id DESC LIMIT 1",
         (session_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -409,15 +466,22 @@ async def jobs_meta_upsert(
         "result = excluded.result, delivery = excluded.delivery, "
         "transcript = excluded.transcript, "
         "updated_at = excluded.updated_at",
-        (schedule_id, label, prompt, tz, state, result, delivery, transcript,
-         datetime.now(UTC).isoformat()),
+        (
+            schedule_id,
+            label,
+            prompt,
+            tz,
+            state,
+            result,
+            delivery,
+            transcript,
+            datetime.now(UTC).isoformat(),
+        ),
     )
     await conn.commit()
 
 
-async def jobs_meta_get(
-    conn: aiosqlite.Connection, schedule_id: str
-) -> dict | None:
+async def jobs_meta_get(conn: aiosqlite.Connection, schedule_id: str) -> dict | None:
     conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM jobs_meta WHERE schedule_id = ?", (schedule_id,)
@@ -428,9 +492,7 @@ async def jobs_meta_get(
 
 async def jobs_meta_list(conn: aiosqlite.Connection) -> list[dict]:
     conn.row_factory = aiosqlite.Row
-    async with conn.execute(
-        "SELECT * FROM jobs_meta ORDER BY schedule_id"
-    ) as cur:
+    async with conn.execute("SELECT * FROM jobs_meta ORDER BY schedule_id") as cur:
         return [dict(row) for row in await cur.fetchall()]
 
 
@@ -468,16 +530,61 @@ async def jobs_meta_running(conn: aiosqlite.Connection) -> list[dict]:
 
 async def transcript_search(
     conn: aiosqlite.Connection, query: str, limit: int = 10
-) -> list[tuple[str, str]]:
-    """(session_id, message JSON) rows containing query, newest first.
-    LIKE '%q%' cannot use an index — a deliberate scan at personal scale."""
+) -> list[tuple[str, int, str, str, str | None, str]]:
+    """Newest meaningful literal matches; scan at personal scale."""
+    calls = {}
     async with conn.execute(
         "SELECT session_id, message FROM transcripts "
-        "WHERE message LIKE '%' || ? || '%' "
-        "ORDER BY ts DESC, session_id DESC, seq DESC LIMIT ?",
-        (query, limit),
+        "WHERE json_valid(message) AND json_extract(message, '$.type') = 'function_call'"
     ) as cur:
-        return [(row[0], row[1]) for row in await cur.fetchall()]
+        async for session_id, raw in cur:
+            data = json.loads(raw)
+            if isinstance(data.get("call_id"), str) and isinstance(
+                data.get("name"), str
+            ):
+                calls[session_id, data["call_id"]] = data["name"]
+    hits = []
+    needle = query.casefold()
+    async with conn.execute(
+        "SELECT session_id, seq, ts, message FROM transcripts "
+        "ORDER BY ts DESC, session_id DESC, seq DESC"
+    ) as cur:
+        async for session_id, seq, ts, raw in cur:
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                kind = data.get("role", data.get("type"))
+                tool = None
+                if kind in ("user", "assistant"):
+                    text = _assistant_text(data)
+                elif kind == "function_call_output":
+                    tool = calls.get((session_id, data.get("call_id")))
+                    if tool == "search_transcripts":
+                        continue
+                    text = data.get("output", "")
+                else:
+                    continue
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                pos = text.casefold().find(needle)
+                if pos < 0:
+                    continue
+                # Translate the folded offset: e.g. ß folds to two characters.
+                offset = 0
+                for index, char in enumerate(text):
+                    if offset >= pos:
+                        break
+                    offset += len(char.casefold())
+                start = max(0, index - 200)
+                hits.append(
+                    (session_id, seq, ts, kind, tool, text[start : start + 500])
+                )
+                if len(hits) >= limit:
+                    break
+            except (ValueError, TypeError, AttributeError):
+                continue
+    return hits
 
 
 def _assistant_text(data: dict) -> str:
@@ -485,9 +592,9 @@ def _assistant_text(data: dict) -> str:
     if isinstance(content, str):
         return content
     return "".join(
-        part.get("text", "")
+        part.get("text", part.get("refusal", ""))
         for part in content or []
-        if part.get("type") == "output_text"
+        if isinstance(part, dict) and part.get("type") in ("output_text", "refusal")
     )
 
 
@@ -507,3 +614,294 @@ async def transcript_last_reply(
             if text.strip():
                 return ts, text
     return None
+
+
+def _run_transaction(path: Path, operation):
+    """One worker owns the entire transaction; no await under a write lock."""
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return operation(conn)
+    finally:
+        conn.close()
+
+
+async def turn_start(
+    db_path: Path,
+    *,
+    kind: str,
+    model: str,
+    session_id: str,
+    queue_id: int | None = None,
+    schedule_id: str | None = None,
+) -> int:
+    def write(conn):
+        now = datetime.now(UTC).isoformat()
+        row = conn.execute(
+            "INSERT INTO turns(ts,kind,session_id,model,in_tokens,out_tokens,cost_usd,tools,seconds,ok,"
+            "status,updated_at,queue_id,schedule_id,cost_complete) VALUES (?,?,?,?,0,0,NULL,0,0,0,'running',?,?,?,1)",
+            (now, kind, session_id, model, now, queue_id, schedule_id),
+        )
+        if schedule_id:
+            conn.execute(
+                "UPDATE jobs_meta SET state='running',updated_at=? WHERE schedule_id=?",
+                (now, schedule_id),
+            )
+        return row.lastrowid
+
+    return await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+async def turn_checkpoint(
+    db_path: Path,
+    turn_id: int,
+    *,
+    session_id: str,
+    in_tokens: int,
+    out_tokens: int,
+    cost_usd: float | None,
+    cost_complete: bool,
+    tools: int,
+    seconds: float,
+) -> None:
+    def write(conn):
+        conn.execute(
+            "UPDATE turns SET session_id=?,in_tokens=?,out_tokens=?,cost_usd=?,cost_complete=?,"
+            "tools=?,seconds=?,updated_at=? WHERE id=? AND status='running'",
+            (
+                session_id,
+                in_tokens,
+                out_tokens,
+                cost_usd,
+                int(cost_complete),
+                tools,
+                seconds,
+                datetime.now(UTC).isoformat(),
+                turn_id,
+            ),
+        )
+
+    await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+def _finish_run(
+    conn,
+    turn_id,
+    status,
+    error_code,
+    error_message,
+    chat_id,
+    text,
+    job_state,
+    job_result=None,
+):
+    row = conn.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
+    if row is None or row["status"] != "running":
+        return
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "UPDATE turns SET status=?,ok=?,error_code=?,error_message=?,finished_at=?,updated_at=? WHERE id=?",
+        (
+            status,
+            int(status == "completed"),
+            error_code,
+            error_message,
+            now,
+            now,
+            turn_id,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO deliveries(turn_id,chat_id,text,next_attempt_at,created_at) VALUES (?,?,?,?,?)",
+        (turn_id, chat_id, text, now, now),
+    )
+    if row["queue_id"] is not None:
+        conn.execute("DELETE FROM queue WHERE id=?", (row["queue_id"],))
+    if row["schedule_id"]:
+        conn.execute(
+            "UPDATE jobs_meta SET state=?,result=?,transcript=?,delivery='queued',updated_at=? WHERE schedule_id=?",
+            (
+                job_state or ("interrupted" if status == "interrupted" else "error"),
+                job_result if job_result is not None else text,
+                row["session_id"],
+                now,
+                row["schedule_id"],
+            ),
+        )
+
+
+async def turn_finish(
+    db_path: Path,
+    turn_id: int,
+    *,
+    status: str,
+    error_code: str | None,
+    error_message: str | None,
+    chat_id: int,
+    text: str,
+    job_state: str | None = None,
+    job_result: str | None = None,
+) -> None:
+    if (
+        status not in ("completed", "failed", "cancelled", "interrupted")
+        or not text.strip()
+    ):
+        raise ValueError("A terminal status and nonempty delivery text are required")
+    await asyncio.to_thread(
+        _run_transaction,
+        db_path,
+        lambda conn: _finish_run(
+            conn,
+            turn_id,
+            status,
+            error_code,
+            error_message,
+            chat_id,
+            text,
+            job_state,
+            job_result,
+        ),
+    )
+
+
+async def recover_runs(db_path: Path, chat_id: int) -> None:
+    def write(conn):
+        for row in conn.execute(
+            "SELECT * FROM turns WHERE status='running'"
+        ).fetchall():
+            _finish_run(
+                conn,
+                row["id"],
+                "interrupted",
+                "interrupted",
+                "Process stopped before completion",
+                chat_id,
+                (f"⏰ {row['schedule_id']}\n\n" if row["schedule_id"] else "")
+                + "Запрос прерван перезапуском бота. Часть действий могла выполниться; проверьте состояние перед повтором.",
+                "interrupted",
+            )
+        # Old active requests have no run record. Consume their markers once.
+        sources = [
+            ("interactive", row["id"], None)
+            for row in conn.execute("SELECT id FROM queue WHERE state='active'")
+        ]
+        sources += [
+            ("job", None, row["schedule_id"])
+            for row in conn.execute(
+                "SELECT schedule_id FROM jobs_meta WHERE state='running'"
+            )
+        ]
+        for kind, queue_id, schedule_id in sources:
+            now = datetime.now(UTC).isoformat()
+            cur = conn.execute(
+                "INSERT INTO turns(ts,kind,session_id,model,in_tokens,out_tokens,tools,seconds,ok,status,queue_id,schedule_id,cost_complete) "
+                "VALUES (?,?,'','',0,0,0,0,0,'running',?,?,0)",
+                (now, kind, queue_id, schedule_id),
+            )
+            _finish_run(
+                conn,
+                cur.lastrowid,
+                "interrupted",
+                "interrupted",
+                "Legacy interruption; usage and timing unknown",
+                chat_id,
+                (f"⏰ {schedule_id}\n\n" if schedule_id else "")
+                + "Запрос прерван предыдущим перезапуском; действия повторно не выполнялись. Исторические расходы неизвестны.",
+                "interrupted",
+            )
+
+    await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+async def delivery_claim(
+    db_path: Path, now: str, turn_id: int | None = None
+) -> dict | None:
+    def write(conn):
+        sql = "SELECT * FROM deliveries WHERE state='pending' AND next_attempt_at<=?"
+        args = [now]
+        if turn_id is not None:
+            sql += " AND turn_id=?"
+            args.append(turn_id)
+        row = conn.execute(sql + " ORDER BY id LIMIT 1", args).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE deliveries SET state='sending',attempts=attempts+1 WHERE id=?",
+            (row["id"],),
+        )
+        return dict(row) | {"attempts": row["attempts"] + 1}
+
+    return await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+async def delivery_sent(
+    db_path: Path, delivery_id: int, message_ids: list[int]
+) -> None:
+    def write(conn):
+        conn.execute(
+            "UPDATE deliveries SET state='sent',sent_at=?,message_ids=?,last_error=NULL WHERE id=?",
+            (datetime.now(UTC).isoformat(), json.dumps(message_ids), delivery_id),
+        )
+
+    await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+async def delivery_retry(
+    db_path: Path, delivery_id: int, *, error: str, next_attempt_at: str
+) -> None:
+    def write(conn):
+        conn.execute(
+            "UPDATE deliveries SET state='pending',last_error=?,next_attempt_at=? WHERE id=? AND state='sending'",
+            (error[:ERROR_DETAIL_CHARS], next_attempt_at, delivery_id),
+        )
+
+    await asyncio.to_thread(_run_transaction, db_path, write)
+
+
+async def delivery_recover(db_path: Path) -> None:
+    await asyncio.to_thread(
+        _run_transaction,
+        db_path,
+        lambda conn: (
+            conn.execute(
+                "UPDATE deliveries SET state='pending' WHERE state='sending'"
+            ).rowcount
+        ),
+    )
+
+
+async def delivery_next_due(db_path: Path) -> str | None:
+    return await asyncio.to_thread(
+        _run_transaction,
+        db_path,
+        lambda conn: conn.execute(
+            "SELECT MIN(next_attempt_at) FROM deliveries WHERE state='pending'"
+        ).fetchone()[0],
+    )
+
+
+async def turn_last_by_schedule(
+    conn: aiosqlite.Connection, schedule_id: str
+) -> dict | None:
+    async with conn.execute(
+        "SELECT t.*,d.state AS delivery_state,d.last_error AS delivery_error FROM turns t "
+        "LEFT JOIN deliveries d ON d.turn_id=t.id WHERE t.schedule_id=? ORDER BY t.id DESC LIMIT 1",
+        (schedule_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(zip([d[0] for d in cur.description], row)) if row else None
+
+
+async def delivery_status(conn: aiosqlite.Connection) -> dict:
+    async with conn.execute(
+        "SELECT COUNT(*),MIN(created_at) FROM deliveries WHERE state!='sent'"
+    ) as cur:
+        count, oldest = await cur.fetchone()
+    async with conn.execute(
+        "SELECT last_error FROM deliveries WHERE state!='sent' AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ) as cur:
+        row = await cur.fetchone()
+    return {"pending": count, "oldest": oldest, "last_error": row[0] if row else None}

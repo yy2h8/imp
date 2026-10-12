@@ -17,7 +17,6 @@ from assistant.bootstrap import (
     Probe,
     install_default_skills,
     load_template,
-    needs_tailoring,
     prune_scratch,
     read_state,
     render_manual,
@@ -91,23 +90,6 @@ class TestProbe:
             "BRAVE_API_KEY=no",
         ):
             assert needle in text
-
-    def test_fingerprint_is_stable_for_identical_facts(self):
-        assert make_probe().fingerprint() == make_probe().fingerprint()
-
-    def test_fingerprint_ignores_probed_at(self):
-        a = make_probe(probed_at="2026-01-01T00:00:00+00:00")
-        b = make_probe(probed_at="2027-01-01T00:00:00+00:00")
-        assert a.fingerprint() == b.fingerprint()
-
-    def test_fingerprint_ignores_free_disk(self):
-        a = make_probe(disk="9.9 GB free of 8.0 GB")
-        b = make_probe(disk="1.0 GB free of 8.0 GB")
-        assert a.fingerprint() == b.fingerprint()
-
-    def test_fingerprint_changes_when_a_tool_appears(self):
-        b = make_probe(tools={"uv": "uv 1.0"})
-        assert make_probe().fingerprint() != b.fingerprint()
 
 
 class TestRenderManual:
@@ -193,9 +175,9 @@ class TestRunBootstrap:
         assert result.probe is probe
         assert "512 MB" in (home / "AGENTS.md").read_text()
         state = read_state(home)
-        assert state["fingerprint"] == probe.fingerprint()
+        assert state["tailored"] is False
 
-    def test_mismatch_rewrites_manual(self, tmp_path, package_dir):
+    def test_changed_environment_does_not_rewrite_manual(self, tmp_path, package_dir):
         home = tmp_path / "home"
         home.mkdir()
         run_bootstrap(home, package_dir, probe=make_probe())
@@ -204,22 +186,22 @@ class TestRunBootstrap:
         # the machine changed underneath the stored manual
         result = run_bootstrap(home, package_dir, probe=make_probe(ram="256 MB"))
 
-        assert result.changed is True
+        assert result.changed is False
+        assert result.probe is None
         manual_after = (home / "AGENTS.md").read_text()
-        assert manual_after != manual_before
-        assert "256 MB" in manual_after
-        state = read_state(home)
-        assert state["fingerprint"] == make_probe(ram="256 MB").fingerprint()
+        assert manual_after == manual_before
 
-    def test_no_op_when_fingerprint_matches(self, tmp_path, package_dir):
+    def test_existing_manual_skips_probe(self, tmp_path, package_dir, monkeypatch):
         home = tmp_path / "home"
         home.mkdir()
         run_bootstrap(home, package_dir, probe=make_probe())
         (home / "AGENTS.md").write_text("hand-edited manual")
 
-        result = run_bootstrap(home, package_dir, probe=make_probe())
+        monkeypatch.setattr(Probe, "take", lambda _: pytest.fail("Unexpected probe"))
+        result = run_bootstrap(home, package_dir)
 
         assert result.changed is False
+        assert result.probe is None
         assert (home / "AGENTS.md").read_text() == "hand-edited manual"
 
     @pytest.mark.parametrize("force", [False, True])
@@ -256,9 +238,8 @@ class TestRunBootstrap:
         run_bootstrap(tmp_path, package_dir, probe=probe)
         assert manual.read_text() == updated
 
-    @pytest.mark.parametrize("force", [False, True])
     def test_refresh_preserves_owner_edits_and_requires_tailoring(
-        self, tmp_path, package_dir, force
+        self, tmp_path, package_dir
     ):
         run_bootstrap(tmp_path, package_dir, probe=make_probe())
         manual = tmp_path / "AGENTS.md"
@@ -266,24 +247,24 @@ class TestRunBootstrap:
         write_state(tmp_path, {"tailored": True, "offset": 42})
 
         result = run_bootstrap(
-            tmp_path, package_dir, probe=make_probe(ram="256 MB"), force=force
+            tmp_path, package_dir, probe=make_probe(ram="256 MB"), force=True
         )
 
         assert result.changed
         assert "OWNER INSTRUCTION" in manual.read_text()
         assert "256 MB" in manual.read_text()
-        assert needs_tailoring(read_state(tmp_path))
+        assert read_state(tmp_path)["tailored"] is False
         assert read_state(tmp_path)["offset"] == 42
 
-    def test_missing_manual_is_recreated_with_matching_fingerprint(
+    def test_missing_manual_is_recreated_despite_legacy_state(
         self, tmp_path, package_dir
     ):
         probe = make_probe()
-        write_state(tmp_path, {"fingerprint": probe.fingerprint(), "tailored": True})
+        write_state(tmp_path, {"fingerprint": "legacy", "tailored": True})
 
         assert run_bootstrap(tmp_path, package_dir, probe=probe).changed
         assert "512 MB" in (tmp_path / "AGENTS.md").read_text()
-        assert needs_tailoring(read_state(tmp_path))
+        assert read_state(tmp_path)["tailored"] is False
 
     def test_installs_bundled_skills_additively(self, tmp_path):
         home = tmp_path / "home"
@@ -334,7 +315,7 @@ class TestRunBootstrap:
         installed = home / "skills" / "brainstorming" / "SKILL.md"
         assert installed.read_text() == "bundled skill"
 
-        # Even when the fingerprint matches, a missing default is restored.
+        # Even when the manual exists, a missing default is restored.
         installed.unlink()
         result = run_bootstrap(home, package_dir, probe=probe)
         assert result.changed is False
@@ -387,11 +368,6 @@ class TestPruneScratch:
         assert prune_scratch(tmp_path, ttl_days=7) == 0
 
 
-def test_needs_tailoring():
-    assert needs_tailoring({}) is True
-    assert needs_tailoring({"tailored": True}) is False
-
-
 @pytest.fixture
 def tailoring_app(tmp_path):
     config = Config(api_key="k", workspace=tmp_path, auto_approve=True)
@@ -441,14 +417,14 @@ async def test_tailor_manual_edits_file_and_marks_success(tailoring_app, tmp_pat
 
 
 @pytest.mark.parametrize("reply", [RuntimeError("provider down"), response([])])
-async def test_failed_tailoring_remains_pending(tailoring_app, tmp_path, reply):
+async def test_failed_tailoring_records_failure(tailoring_app, tmp_path, reply):
     write_state(tmp_path, {"tailored": True})
     tailoring_app.agent.client.script = [reply]
 
     with pytest.raises(RuntimeError):
         await tailor_manual(tailoring_app, make_probe())
 
-    assert needs_tailoring(read_state(tmp_path))
+    assert read_state(tmp_path)["tailored"] is False
 
 
 async def test_tailoring_cannot_ask_before_polling_starts(tailoring_app):
@@ -476,19 +452,30 @@ async def test_tailoring_cannot_ask_before_polling_starts(tailoring_app):
     assert tailoring_app.agent.tools[Ask.name] is ask
 
 
-async def test_startup_retries_failed_tailoring_then_skips_success(
-    tailoring_app, tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "initial_reply, tailored",
+    [(RuntimeError("provider down"), False), (response([message_item("Adapted.")]), True)],
+)
+async def test_startup_tailors_missing_manual_then_only_on_command(
+    tailoring_app, tmp_path, monkeypatch, initial_reply, tailored
 ):
     probe = make_probe()
-    monkeypatch.setattr(Probe, "take", lambda workspace: probe)
-    write_state(tmp_path, {"fingerprint": probe.fingerprint(), "tailored": False})
+    probes = []
+
+    def take(workspace):
+        probes.append(workspace)
+        return probe
+
+    monkeypatch.setattr(Probe, "take", take)
+    (tmp_path / "AGENTS.md").unlink()
+    write_state(tmp_path, {"fingerprint": "legacy", "tailored": True})
     config = AssistantConfig(
         bot_token="fake", allowed_user_ids=frozenset({7}), home=tmp_path
     )
     tailoring_app.assistant = config
     client = tailoring_app.agent.client
     client.script = [
-        RuntimeError("provider down"),
+        initial_reply,
         response([message_item("Adapted.")]),
     ]
     notices = []
@@ -515,10 +502,40 @@ async def test_startup_retries_failed_tailoring_then_skips_success(
 
     await startup(config, 7, force=False)
     assert len(client.calls) == 1
-    assert needs_tailoring(read_state(tmp_path))
-    assert any("Не удалось адаптировать" in notice for notice in notices)
+    assert read_state(tmp_path)["tailored"] is tailored
+    if not tailored:
+        assert any("Не удалось адаптировать" in notice for notice in notices)
     await startup(config, 7, force=False)
+    assert len(client.calls) == 1
+    assert probes == [tmp_path]
+    await startup(config, 7, force=True)
     assert read_state(tmp_path)["tailored"] is True
     await startup(config, 7, force=False)
     assert len(client.calls) == 2
     assert builds == [7, 7]
+    assert probes == [tmp_path, tmp_path]
+
+    client.script = [RuntimeError("provider down")]
+    with pytest.raises(RuntimeError, match="Manual tailoring failed.*provider down"):
+        await startup(config, 7, force=True)
+    assert read_state(tmp_path)["tailored"] is False
+    await startup(config, 7, force=False)
+    assert len(client.calls) == 3
+    assert probes == [tmp_path, tmp_path, tmp_path]
+
+
+@pytest.mark.parametrize("state", [{}, {"fingerprint": "legacy", "tailored": False}])
+async def test_startup_existing_manual_ignores_legacy_state(
+    tailoring_app, tmp_path, monkeypatch, state
+):
+    write_state(tmp_path, state)
+    monkeypatch.setattr(Probe, "take", lambda _: pytest.fail("Unexpected probe"))
+    config = AssistantConfig(
+        bot_token="fake", allowed_user_ids=frozenset({7}), home=tmp_path
+    )
+
+    result = await startup(config, 7, force=False)
+
+    assert result.changed is False
+    assert result.probe is None
+    assert (tmp_path / "AGENTS.md").read_text() == MINIMAL_TEMPLATE

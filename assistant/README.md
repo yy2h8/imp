@@ -32,8 +32,11 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 - **Self-configuring.** On first start it probes the machine and writes
   `<IMP_HOME>/AGENTS.md`, which shapes how it organises work (`scratch/`,
   `scripts/`, `projects/`, `outbox/`, `inbox/`). A model turn tailors the manual
-  without asking questions. Owner edits survive refresh; startup corrects exact
-  matches of obsolete default scheduling and plain-text reply guidance.
+  without asking questions. Existing manuals skip the environment probe and
+  tailoring on ordinary restarts. `python -m assistant tailor` explicitly
+  refreshes the facts and reruns tailoring. Owner edits survive refresh;
+  startup corrects exact matches of obsolete default scheduling and plain-text
+  reply guidance.
 - **Scheduled jobs.** `schedule_job` supports one-shot `at`/`at_local`, interval
   `every`, and five-field `cron` in `IMP_TZ`. APScheduler persists schedules in
   `state.db`. Each job gets a fresh context and cannot use `ask`. Jobs can run
@@ -48,8 +51,16 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 - **Telegram replies.** Replying to a prior message adds that message's text or
   caption as context to the new request. Replying while `ask` is pending answers
   that question directly.
-- **Turn costs.** Each turn's API-reported tokens, USD cost, tool count,
-  duration, and outcome are recorded in the database.
+- **Turn records.** Each run is recorded before preparation or model/tool work.
+  Usage and tool counts are checkpointed as it runs. Execution status, a failure
+  reason, timing, and result delivery are recorded separately. Known API costs
+  survive later failures; incomplete or historical accounting is labeled.
+- **Durable delivery.** Final interactive replies, job results, and their error
+  notices are saved in SQLite before sending. Failed sends retry automatically
+  with backoff, honoring Telegram rate limits. Pending results survive restart;
+  only delivery is retried, never agent actions. An ambiguous send or partially
+  sent long reply can produce duplicates. Progress edits, command replies, and
+  explicit `send_file` transfers retain their existing delivery behavior.
 - **Commands.** `/new` starts a fresh conversation (the transcript remains in
   the database) and is refused while a turn is active. `/status` answers
   immediately, even mid-turn: local time in `IMP_TZ`, the running turn
@@ -69,14 +80,18 @@ uses python-telegram-bot for Telegram transport and OpenRouter for model calls.
 
 `<IMP_HOME>/state.db` is the assistant's single state artifact (SQLite WAL):
 
-- `kv`: bootstrap fingerprint and tailoring state, plus Telegram redelivery
+- `kv`: tailoring state, plus Telegram redelivery
   deduplication. Polling advances the Telegram offset after intake completes,
   so accepted requests reach SQLite before Telegram acknowledges them.
 - `queue`: waiting and active owner requests, plus a durable `collecting` row
   while an album is still arriving. That row blocks later requests to preserve
   FIFO order and resumes with received items after restart.
 - `jobs_meta` and APScheduler's job table: job metadata, results, schedule state.
-- `turns`: per-turn usage, cost, tools, duration, and outcome.
+- `turns`: run identity, preparation/execution lifecycle, usage checkpoints,
+  known costs and completeness, failure reason, duration, and queue/job links.
+- `deliveries`: one saved result per run, destination, retry state/time, last
+  send error, and confirmed Telegram message IDs. Sent payload text expires
+  after the transcript session TTL; pending results are retained.
 - `transcripts`: ordered JSON message rows, replacing `sessions/*.json`.
   Pruned on two TTL tiers — reasoning/tool rows drop after
   `IMP_TRANSCRIPT_ITEM_TTL_DAYS` (7), whole idle sessions after
@@ -92,7 +107,11 @@ or workspace content.
 
 The v2 assistant starts fresh. Existing v1 `state.json` and `jobs/*.json` are
 left untouched and not imported; recreate any schedules with `schedule_job`.
-To back up state, stop the bot and copy `state.db`.
+To back up state, stop the bot and copy `state.db`. Before upgrading to schema
+v3, make this backup. Existing rows retain their values and get historical
+unknown lifecycle/accounting details. Old `jobs_meta.delivery=queued` entries
+are not resent: they may already have been delivered. Rollback requires restoring
+the matching code and database backup.
 
 ## Manual updates and recovery
 
@@ -103,15 +122,26 @@ not replaced wholesale; merge the compact `AGENTS.md.template` manually if desir
 preserving owner instructions and the generated environment block.
 
 Bootstrap corrects known old scheduling and reply-format wording on the next
-startup, including when the machine fingerprint has not changed. Customized
+startup, including when the existing manual needs no tailoring. Customized
 wording is left alone. Installed skills are also preserved; the bundled skill
 edits apply to new installations or missing skill files.
 
-If bootstrap tailoring failed, it retries at the next startup. To force a fresh
-environment probe and tailoring pass, stop the bot, back up `state.db` and
-`AGENTS.md`, delete only the `fingerprint` row from the `kv` table in `state.db`,
-and restart. This preserves manual content outside the generated block; it does
-not replace the manual with a new template.
+Tailoring runs automatically only when `AGENTS.md` is missing. Changes to the
+machine and old fingerprint/tailoring state do not trigger it. If tailoring
+fails after creating the manual, ordinary restarts keep that manual without
+retrying.
+
+To refresh the environment facts or retry tailoring, stop the bot, back up
+`AGENTS.md`, and run with the same environment variables and `IMP_HOME`:
+
+```bash
+uv run python -m assistant tailor
+```
+
+The command exits after tailoring and reports failure with a nonzero exit code;
+it does not start polling. It preserves manual content outside the generated
+block and does not replace the manual with a new template. Restart the bot
+afterwards. No edits to `state.db` are needed.
 
 ## Running it
 
@@ -213,5 +243,14 @@ Before deploying, verify with an approved test owner/chat and provider budget:
 10. Restart during a harmless job: it is marked interrupted and never replayed.
 
 No exactly-once external-action guarantee, persistent conversation resume, or
-automatic retry of interrupted actions. Uploaded images/PDFs are saved as files;
+automatic retry of interrupted actions. Startup records unfinished runs as
+interrupted and saves a notice once; repeated startup does not duplicate the
+notice record. Graceful shutdown waits for cancelled jobs before closing their
+resources and leaves unsent results saved.
+
+`/status` shows pending delivery count, oldest age, and the latest send error;
+`list_jobs` separates execution outcome from result delivery. `cost_report`
+sums known recorded-turn costs and reports incomplete/unknown accounting and
+running/completed counts. It does not include bootstrap tailoring, STT, or
+provider calls inside scripts; charges for unreturned requests are unknown. Uploaded images/PDFs are saved as files;
 they are not passed as native multimodal model input.

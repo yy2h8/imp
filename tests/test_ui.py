@@ -85,7 +85,10 @@ class TestTurnSummary:
         assert turn_summary(3, 12, False, None) == "✗ ошибка · инструментов: 3 · 12 с"
 
     def test_failure_ignores_cost(self):
-        assert turn_summary(3, 12, False, 0.5) == "✗ ошибка · инструментов: 3 · 12 с"
+        assert (
+            turn_summary(3, 12, False, 0.5, False)
+            == "✗ ошибка · инструментов: 3 · 12 с · $0.5000 (неполные данные)"
+        )
 
 
 class TestToolSubject:
@@ -121,7 +124,6 @@ class TestToolSubject:
         assert tool_subject("memory_set", {"key": "server"}) == "server"
         assert tool_subject("cost_report", {"period": "week"}) == "week"
         assert tool_subject("unknown_tool", None) == ""
-
 
 
 class TestToolLabel:
@@ -164,9 +166,7 @@ class FakeBot:
 
 
 def tool_event(name: str, args: dict | None = None) -> AgentEvent:
-    return event(
-        type=EventType.TOOL_START, tool_name=name, tool_args=args or {}
-    )
+    return event(type=EventType.TOOL_START, tool_name=name, tool_args=args or {})
 
 
 class TestTelegramUIAdapter:

@@ -16,7 +16,12 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 
 from .config import OPENROUTER_BASE_URL
-from .db import jobs_meta_list, queue_count_waiting, transcript_last_reply
+from .db import (
+    delivery_status,
+    jobs_meta_list,
+    queue_count_waiting,
+    transcript_last_reply,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -30,8 +35,6 @@ PREVIEW = 80
 
 def format_tokens(used: int, maximum: int) -> str:
     return f"~{used:,} / {maximum:,} токенов (оценка)".replace(",", " ")
-
-
 
 
 async def _jobs_lines(
@@ -92,7 +95,9 @@ async def _turn_lines(app, tz: ZoneInfo) -> list[str]:
             f"сейчас: {current.activity or 'ожидание ответа модели'}"
         )
         if current.last_reply:
-            stamp = current.last_reply_at.astimezone(tz) if current.last_reply_at else None
+            stamp = (
+                current.last_reply_at.astimezone(tz) if current.last_reply_at else None
+            )
             when = f"{stamp:%H:%M} " if stamp else ""
             lines.append(f"ответ модели {when}«{_clip(current.last_reply)}»")
     ask_router = getattr(app, "ask_router", None)
@@ -173,6 +178,21 @@ async def _collect(app, now: datetime | None) -> str:
     except Exception:
         _LOG.warning("context section failed", exc_info=True)
         context = UNAVAILABLE
+    if app.db is not None:
+        try:
+            deliveries = await delivery_status(app.db)
+            if deliveries["pending"]:
+                oldest = datetime.fromisoformat(deliveries["oldest"])
+                age = max(0, (datetime.now(UTC) - oldest).total_seconds())
+                lines.append(
+                    f"📤 Доставка: ожидают {deliveries['pending']} · старейшая {_elapsed(age)}"
+                )
+                if deliveries["last_error"]:
+                    lines.append(
+                        f"повтор после ошибки: {_clip(deliveries['last_error'])}"
+                    )
+        except Exception:
+            lines.append(f"📤 Доставка: {UNAVAILABLE}")
     lines.append(f"🧠 Контекст: {context}")
     lines.append(f"🤖 Модель: {app.config.model}")
     lines.append("")
@@ -186,7 +206,9 @@ async def _collect(app, now: datetime | None) -> str:
     return "\n".join(lines)
 
 
-async def openrouter_balance(http, api_key: str, timeout: float = BALANCE_TIMEOUT_S) -> float | None:
+async def openrouter_balance(
+    http, api_key: str, timeout: float = BALANCE_TIMEOUT_S
+) -> float | None:
     """Wallet balance in USD: /credits (management key), falling back to the
     inference key's remaining limit. None when undeterminable."""
     headers = {"Authorization": f"Bearer {api_key}"}
