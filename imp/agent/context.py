@@ -16,7 +16,7 @@ from ..entities import (
     ToolMessage,
 )
 
-# Older tool outputs are stubbed to this length once their turn completes.
+# Older tool outputs are stubbed to this length under context pressure.
 COMPACT_TOOL_OUTPUT_CHARS = 500
 COMPACT_MARKER = "older tool output compacted"
 
@@ -85,12 +85,23 @@ class Context:
                 return i
         return 1
 
-    def compact(self) -> int:
+    def compact(self, *, preserve_recent_turn: bool = False) -> int:
         """Shrink replay cost of completed prior turns: drop their encrypted
         reasoning and stub oversized old tool outputs except SKILL.md reads.
+        Optionally also keep the latest completed turn intact.
         Call/output pairing and the current turn are never touched; idempotent.
         Full outputs remain in the persisted session transcript. Returns tokens saved."""
         start = self._current_turn_start()
+        if preserve_recent_turn:
+            start = next(
+                (
+                    i
+                    for i in range(start - 1, 0, -1)
+                    if isinstance(self.messages[i], TextMessage)
+                    and self.messages[i].role == "user"
+                ),
+                1,
+            )
         skill_reads = {
             m.call_id
             for m in self.messages[1:start]

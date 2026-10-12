@@ -157,7 +157,8 @@ Environment only (see `.env.example`); no config files to parse.
 | `BRAVE_API_KEY` | unset | Enables the `web_search` tool. |
 | `IMP_WORKSPACE` | `.` | Sandbox root (absolute or relative). |
 | `IMP_MAX_ITERATIONS` | `50` | Max ReAct iterations per turn. |
-| `IMP_MAX_CONTEXT` | `128000` | Estimated context budget in tokens. |
+| `IMP_MAX_CONTEXT` | `256000` | Estimated context budget in tokens. |
+| `IMP_COMPACT_THRESHOLD` | `128000` | Estimated tokens above which older completed turns are compacted. |
 | `IMP_COMMAND_TIMEOUT` | `180` | Shell command timeout (s). |
 | `IMP_NETWORK_TIMEOUT` | `360` | HTTP/model timeout (s). |
 | `IMP_MAX_TOOL_OUTPUT` | `100000` | Tool output cap in chars before truncation. |
@@ -165,6 +166,16 @@ Environment only (see `.env.example`); no config files to parse.
 | `IMP_MAX_REASONING_DISPLAY_LINES` | `10` | Max reasoning lines shown (last lines kept; `...` marks a crop). |
 | `IMP_MAX_HTTP_BYTES` | `10000000` | Byte cap for HTTP, selected file reads, replacement and transfers. |
 | `IMP_AUTO_APPROVE` | unset | Skip approvals (`1/true/yes/on/y`). Same as `-y`. |
+
+Routine compaction starts only when context exceeds `IMP_COMPACT_THRESHOLD`.
+Until then, tool results remain available in full across follow-up turns.
+Compaction shortens older tool results to 500
+characters and drops their encrypted reasoning, keeping the latest completed
+turn and the current turn intact. `SKILL.md` reads are preserved. If context
+still exceeds 95% of `IMP_MAX_CONTEXT`, the latest completed turn is also
+compacted before whole old turns are dropped. The current turn stays intact;
+full tool results remain in the saved transcript. The 95% ceiling applies even
+when `IMP_COMPACT_THRESHOLD` is configured above it.
 
 ## Extending
 

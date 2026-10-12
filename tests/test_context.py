@@ -8,7 +8,7 @@ from imp.agent.context import (
     Context,
     _estimate_context_tokens,
 )
-from imp.entities import TextMessage, ToolCall, ToolMessage
+from imp.entities import ReasoningMessage, TextMessage, ToolCall, ToolMessage
 
 
 def test_usage_tracks_messages(config):
@@ -32,6 +32,51 @@ def test_exceeds_limit_above_buffer(config):
     context = Context(config=config, system_prompt="s")
     context.append(TextMessage(role="user", content="x" * 10_000))
     assert context.is_within_token_limit() is False
+
+
+@pytest.mark.parametrize("turns", [0, 1, 2, 3])
+def test_compact_can_preserve_most_recent_completed_turn(config, turns):
+    context = Context(config, "sys")
+    content = "evidence\n" * COMPACT_TOOL_OUTPUT_CHARS
+    for turn in range(turns):
+        context.append(TextMessage(role="user", content=f"question {turn}"))
+        context.append(
+            ReasoningMessage(
+                item={"type": "reasoning", "encrypted_content": f"reasoning {turn}"},
+                content=None,
+            )
+        )
+        for name, path in (("read_file", "notes.txt"), ("read_file", "SKILL.md")):
+            call_id = f"{turn}-{path}"
+            context.append(
+                ToolCall.parse(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": {"path": path},
+                    }
+                )
+            )
+            context.append(ToolMessage(call_id=call_id, content=content))
+    snapshot = list(context.messages)
+
+    saved = context.compact(preserve_recent_turn=True)
+
+    assert (saved > 0) == (turns == 3)
+    for before, after in zip(snapshot, context.messages):
+        if turns < 3 or before in snapshot[-12:] or (
+            isinstance(before, ToolMessage) and before.call_id.endswith("SKILL.md")
+        ):
+            assert after == before
+        elif isinstance(before, ToolMessage):
+            assert COMPACT_MARKER in after.content
+        elif isinstance(before, ReasoningMessage):
+            assert "encrypted_content" not in after.item
+    assert context.tokens == _estimate_context_tokens(context.messages)
+    assert context.compact(preserve_recent_turn=True) == 0
+    if turns >= 2:
+        assert context.compact() > 0  # emergency cleanup can compact the recent turn
 
 
 @pytest.mark.parametrize(

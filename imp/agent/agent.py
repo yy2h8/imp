@@ -143,7 +143,11 @@ class Agent:
         )
 
     async def _compact_and_trim(self) -> AsyncIterator[AgentEvent]:
-        saved = self.context.compact()
+        saved = 0
+        if self.context.tokens > self.config.compact_threshold:
+            saved = self.context.compact(preserve_recent_turn=True)
+        if not self.context.is_within_token_limit():
+            saved += self.context.compact()
         if saved > 0:
             yield AgentEvent(
                 type=EventType.CONTEXT_COMPACTED,

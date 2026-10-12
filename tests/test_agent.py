@@ -874,6 +874,88 @@ async def test_agent_replays_skill_on_next_turn(config, fs, skills_dir):
         assert outputs == [expected]
 
 
+@pytest.mark.parametrize("threshold_offset", [0, 1])
+async def test_agent_retains_followup_evidence_at_or_below_threshold(
+    config, threshold_offset
+):
+    content = "evidence " * COMPACT_TOOL_OUTPUT_CHARS
+    tools = {"fake": FakeTool(ToolResult(ok=True, content=content))}
+    script = [
+        response([function_call_item("evidence", "fake", {})]),
+        response([message_item("loaded")]),
+        response([function_call_item("recent", "fake", {})]),
+        response([message_item("loaded again")]),
+        response([message_item("followup")]),
+    ]
+    agent, client = make_agent(config, tools, script)
+    await collect(agent, "first")
+    await collect(agent, "second")
+    followup = "compare those"
+    config.compact_threshold = (
+        agent.context.tokens
+        + _token_formula(TextMessage(role="user", content=followup))
+        + threshold_offset
+    )
+
+    events = await collect(agent, followup)
+
+    outputs = [
+        item["output"]
+        for item in client.calls[-1]["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert outputs == [content, content]
+    assert not any(e.type is EventType.CONTEXT_COMPACTED for e in events)
+
+
+async def test_agent_compacts_older_evidence_above_threshold(config):
+    config.compact_threshold = 1
+    context = seeded_compact_context(config)
+    recent = list(context.messages[6:])
+    context.append(TextMessage(role="user", content="third question"))
+    agent = Agent(config, {}, StubClient([]), context)
+    events = [e async for e in agent._compact_and_trim()]
+
+    assert context.messages[6:-1] == recent
+    assert "older tool output compacted" in context.messages[4].content
+    assert len(events) == 1
+    assert events[0].type is EventType.CONTEXT_COMPACTED
+    assert [e async for e in agent._compact_and_trim()] == []
+
+
+async def test_agent_keeps_recent_turn_even_above_soft_threshold(config):
+    config.compact_threshold = 1
+    context = seeded_compact_context(config)
+    snapshot = list(context.messages)
+    agent = Agent(config, {}, StubClient([]), context)
+
+    assert [e async for e in agent._compact_and_trim()] == []
+    assert context.messages == snapshot
+    assert context.tokens > config.compact_threshold
+    assert context.is_within_token_limit()
+
+
+@pytest.mark.parametrize("threshold_above_ceiling", [False, True])
+async def test_agent_emergency_compacts_recent_turn_before_eviction(
+    config, threshold_above_ceiling
+):
+    context = seeded_compact_context(config)
+    before = context.tokens
+    config.max_context = int(before / Context.MAX_CONTEXT_TOKEN_BUFFER) - 1
+    config.compact_threshold = before + 1 if threshold_above_ceiling else 1
+    assert not context.is_within_token_limit()
+    agent = Agent(config, {}, StubClient([]), context)
+
+    events = [e async for e in agent._compact_and_trim()]
+
+    assert context.is_within_token_limit()
+    assert len(context.messages) == 10  # compact before evicting entire turns
+    assert "older tool output compacted" in context.messages[4].content
+    assert context.messages[9].content == "y" * 5_000
+    assert [e.type for e in events] == [EventType.CONTEXT_COMPACTED]
+    assert events[0].context_detail == {"saved": before - context.tokens}
+
+
 def test_trim_drops_oldest_whole_turns(config):
     config.max_context = 5_000  # two ~4k-token turns overflow; one fits
     context = Context(config, "sys")
